@@ -784,10 +784,12 @@ async function addMedia(
     },
   );
 
-  const config = appConfig.getAll();
-  const uploadOptions = config.biliUpload;
   for (const part of videos) {
-    const uploader = new WebVideoUploader(part, client.auth, formatMediaOptions(uploadOptions));
+    const createUploader = () => {
+      const uploadOptions = appConfig.getAll().biliUpload;
+      return new WebVideoUploader(part, client.auth, formatMediaOptions(uploadOptions));
+    };
+    const uploader = createUploader();
 
     const task = new BiliPartVideoTask(
       uploader,
@@ -798,6 +800,9 @@ async function addMedia(
         uid: pTask.uid,
       },
       {},
+      {
+        commandFactory: createUploader,
+      },
     );
 
     taskQueue.addTask(task, false);
@@ -892,10 +897,12 @@ export async function editMedia(
     },
   );
 
-  const config = appConfig.getAll();
-  const uploadOptions = config.biliUpload;
   for (const part of videos) {
-    const uploader = new WebVideoUploader(part, client.auth, formatMediaOptions(uploadOptions));
+    const createUploader = () => {
+      const uploadOptions = appConfig.getAll().biliUpload;
+      return new WebVideoUploader(part, client.auth, formatMediaOptions(uploadOptions));
+    };
+    const uploader = createUploader();
 
     const task = new BiliPartVideoTask(
       uploader,
@@ -906,6 +913,9 @@ export async function editMedia(
         uid: pTask.uid,
       },
       {},
+      {
+        commandFactory: createUploader,
+      },
     );
 
     taskQueue.addTask(task, false);
@@ -927,14 +937,16 @@ export function addExtraVideoTask(pTaskId: string, filePath: string, partName: s
   if (pTask.type !== "bili") {
     throw new Error("不支持的任务类型");
   }
-  const config = appConfig.getAll();
-  const uploadOptions = config.biliUpload;
   const part = {
     path: filePath,
     title: partName,
   };
   const client = createClient(pTask.uid);
-  const uploader = new WebVideoUploader(part, client.auth, formatMediaOptions(uploadOptions));
+  const createUploader = () => {
+    const uploadOptions = appConfig.getAll().biliUpload;
+    return new WebVideoUploader(part, client.auth, formatMediaOptions(uploadOptions));
+  };
+  const uploader = createUploader();
 
   const task = new BiliPartVideoTask(
     uploader,
@@ -945,6 +957,9 @@ export function addExtraVideoTask(pTaskId: string, filePath: string, partName: s
       uid: pTask.uid,
     },
     {},
+    {
+      commandFactory: createUploader,
+    },
   );
 
   taskQueue.addTask(task, false);

@@ -7,7 +7,13 @@ import * as ntsuspend from "ntsuspend";
 import kill from "tree-kill";
 import { DownloaderHelper as RangeDownloader } from "node-downloader-helper";
 
-import { isWin32, calculateFileQuickHash, retryWithAxiosError } from "../utils/index.js";
+import {
+  isWin32,
+  calculateFileQuickHash,
+  retryWithAxiosError,
+  pathExists,
+  trashItem,
+} from "../utils/index.js";
 import log from "../utils/log.js";
 import { addMediaApi, editMediaApi } from "./bili.js";
 import { TaskType } from "../enum.js";
@@ -29,6 +35,28 @@ import type { FlvCommand } from "./flvRepair.js";
 
 // 重新导出 AbstractTask 以保持向后兼容
 export { AbstractTask } from "./core/index.js";
+
+type RestartOptions = {
+  removeOutput?: boolean;
+};
+
+type FFmpegTaskCallback = {
+  onStart?: () => void;
+  onEnd?: (output: string) => void;
+  onError?: (err: string) => void;
+  onProgress?: (progress: Progress) => any;
+};
+
+type FFmpegCommandFactory = () => ffmpeg.FfmpegCommand | Promise<ffmpeg.FfmpegCommand>;
+
+type BiliPartVideoTaskCallback = {
+  onStart?: () => void;
+  onEnd?: (output: { cid: number; filename: string; title: string }) => void;
+  onError?: (err: string) => void;
+  onProgress?: (progress: number) => number;
+};
+
+type BiliUploaderFactory = () => WebVideoUploader;
 
 export class DanmuTask extends AbstractTask {
   danmu: DanmakuFactory;
@@ -116,6 +144,8 @@ export class FFmpegTask extends AbstractTask {
   command: ffmpeg.FfmpegCommand;
   type = TaskType.ffmpeg;
   isInterrupted: boolean = false;
+  private callback: FFmpegTaskCallback;
+  private commandFactory?: FFmpegCommandFactory;
 
   constructor(
     command: ffmpeg.FfmpegCommand,
@@ -124,18 +154,18 @@ export class FFmpegTask extends AbstractTask {
       name: string;
       limitTime?: [] | [string, string];
     },
-    callback: {
-      onStart?: () => void;
-      onEnd?: (output: string) => void;
-      onError?: (err: string) => void;
-      onProgress?: (progress: Progress) => any;
-    },
+    callback: FFmpegTaskCallback,
+    restartOptions: {
+      commandFactory?: FFmpegCommandFactory;
+    } = {},
   ) {
     super();
     this.command = command;
+    this.callback = callback;
+    this.commandFactory = restartOptions.commandFactory;
     this.output = options.output;
     this.progress = 0;
-    this.action = ["kill", "pause", "interrupt"];
+    this.action = ["kill", "pause", "interrupt", "restart"];
     this.limitTime = options.limitTime;
     if (options.name) {
       this.name = options.name;
@@ -145,12 +175,16 @@ export class FFmpegTask extends AbstractTask {
       `ffmpeg task ${this.taskId} has been added, command: ${command._getArguments().join(" ")}`,
     );
 
+    this.bindCommandEvents(command);
+  }
+
+  private bindCommandEvents(command: ffmpeg.FfmpegCommand) {
     command.on("start", (commandLine: string) => {
       this.progress = 0;
       log.info(`task ${this.taskId} start, command: ${commandLine}`);
       this.status = "running";
 
-      callback.onStart && callback.onStart();
+      this.callback.onStart && this.callback.onStart();
       this.emitter.emit("task-start", { taskId: this.taskId });
 
       this.startTime = Date.now();
@@ -162,7 +196,7 @@ export class FFmpegTask extends AbstractTask {
         log.error(msg);
         this.status = "error";
 
-        callback.onError && callback.onError(msg);
+        this.callback.onError && this.callback.onError(msg);
         this.error = msg;
         this.emitter.emit("task-error", { taskId: this.taskId, error: msg });
       } else {
@@ -170,7 +204,7 @@ export class FFmpegTask extends AbstractTask {
         this.status = "completed";
         this.progress = 100;
 
-        callback.onEnd && callback.onEnd(options.output);
+        this.callback.onEnd && this.callback.onEnd(this.output as string);
         this.emitter.emit("task-end", { taskId: this.taskId });
       }
       this.endTime = Date.now();
@@ -179,7 +213,7 @@ export class FFmpegTask extends AbstractTask {
       log.error(`task ${this.taskId} error: ${err}`);
       this.status = "error";
 
-      callback.onError && callback.onError(String(err));
+      this.callback.onError && this.callback.onError(String(err));
       this.error = String(err);
       this.emitter.emit("task-error", { taskId: this.taskId, error: String(err) });
       this.endTime = Date.now();
@@ -188,9 +222,9 @@ export class FFmpegTask extends AbstractTask {
       // @ts-ignore
       progress.percentage = progress.percent;
       // console.log("progress", progress);
-      if (callback.onProgress) {
+      if (this.callback.onProgress) {
         // @ts-ignore
-        progress = callback.onProgress(progress);
+        progress = this.callback.onProgress(progress);
       }
       // @ts-ignore
       this.custsomProgressMsg = `比特率: ${progress.currentKbps}kbits/s   速率: ${progress.speed}`;
@@ -257,6 +291,32 @@ export class FFmpegTask extends AbstractTask {
     this.status = "error";
     return true;
   }
+  async restart(options: RestartOptions = {}) {
+    if (this.status !== "error" && this.status !== "canceled") return;
+    if (!this.commandFactory) {
+      throw new Error("该压制任务缺少重试信息，无法重试");
+    }
+    if (this.output && (await pathExists(this.output))) {
+      if (!options.removeOutput) {
+        throw new Error("输出文件已存在，请确认删除后再重试");
+      }
+      await trashItem(this.output);
+    }
+
+    this.isInterrupted = false;
+    this.progress = 0;
+    this.custsomProgressMsg = "";
+    this.error = undefined;
+    this.startTime = 0;
+    this.endTime = undefined;
+    this.status = "pending";
+    this.command = await this.commandFactory();
+    log.info(
+      `ffmpeg task ${this.taskId} restart, command: ${this.command._getArguments().join(" ")}`,
+    );
+    this.bindCommandEvents(this.command);
+    this.exec();
+  }
 }
 
 type WithoutPromise<T> = T extends Promise<infer U> ? U : T;
@@ -267,12 +327,8 @@ type WithoutPromise<T> = T extends Promise<infer U> ? U : T;
 export class BiliPartVideoTask extends AbstractTask {
   command: WebVideoUploader;
   type = TaskType.biliUpload;
-  callback: {
-    onStart?: () => void;
-    onEnd?: (output: { cid: number; filename: string; title: string; filePath: string }) => void;
-    onError?: (err: string) => void;
-    onProgress?: (progress: number) => number;
-  };
+  callback: BiliPartVideoTaskCallback;
+  private commandFactory?: BiliUploaderFactory;
   useUploadPartPersistence: boolean;
   completedPart: { cid: number; filename: string; title: string; filePath: string } | null = null;
   private speedCalculator: SpeedCalculator;
@@ -285,19 +341,18 @@ export class BiliPartVideoTask extends AbstractTask {
       limitTime: [] | [string, string];
       uid: number;
     },
-    callback: {
-      onStart?: () => void;
-      onEnd?: (output: { cid: number; filename: string; title: string }) => void;
-      onError?: (err: string) => void;
-      onProgress?: (progress: number) => number;
-    },
+    callback: BiliPartVideoTaskCallback,
+    restartOptions: {
+      commandFactory?: BiliUploaderFactory;
+    } = {},
   ) {
     super();
     this.command = command;
     this.progress = 0;
-    this.action = ["kill", "pause"];
+    this.action = ["kill", "pause", "restart"];
     this.limitTime = options.limitTime;
     this.callback = callback;
+    this.commandFactory = restartOptions.commandFactory;
     this.speedCalculator = new SpeedCalculator(3000); // 3秒时间窗口
     this.uid = options.uid;
     if (options.name) {
@@ -309,6 +364,10 @@ export class BiliPartVideoTask extends AbstractTask {
     };
     this.useUploadPartPersistence = appConfig.get("biliUpload")?.useUploadPartPersistence;
 
+    this.bindCommandEvents(command);
+  }
+
+  private bindCommandEvents(command: WebVideoUploader) {
     command.emitter.on(
       "completed",
       async (data: { cid: number; filename: string; title: string }) => {
@@ -339,7 +398,7 @@ export class BiliPartVideoTask extends AbstractTask {
         this.endTime = Date.now();
         // 重置进度追踪
         this.speedCalculator.reset();
-        callback.onEnd && callback.onEnd(this.completedPart);
+        this.callback.onEnd && this.callback.onEnd(this.completedPart);
         this.emitter.emit("task-end", { taskId: this.taskId });
       },
     );
@@ -350,7 +409,7 @@ export class BiliPartVideoTask extends AbstractTask {
 
       // 重置进度追踪
       this.speedCalculator.reset();
-      callback.onError && callback.onError(this.error);
+      this.callback.onError && this.callback.onError(this.error);
       this.emitter.emit("task-error", { taskId: this.taskId, error: this.error });
       this.endTime = Date.now();
     });
@@ -366,7 +425,7 @@ export class BiliPartVideoTask extends AbstractTask {
         this.custsomProgressMsg = `速度: ${speed}`;
       }
 
-      callback.onProgress && callback.onProgress(progress);
+      this.callback.onProgress && this.callback.onProgress(progress);
       this.emitter.emit("task-progress", { taskId: this.taskId });
     });
   }
@@ -441,6 +500,21 @@ export class BiliPartVideoTask extends AbstractTask {
     this.endTime = Date.now();
     return true;
   }
+  async restart() {
+    if (this.status !== "error" && this.status !== "canceled") return;
+    if (this.commandFactory) {
+      this.command = this.commandFactory();
+      this.bindCommandEvents(this.command);
+    }
+    this.progress = 0;
+    this.custsomProgressMsg = "";
+    this.error = undefined;
+    this.endTime = undefined;
+    this.completedPart = null;
+    this.status = "pending";
+    this.speedCalculator.reset();
+    await this.exec();
+  }
 }
 
 /**
@@ -473,7 +547,7 @@ export class BiliVideoTask extends AbstractTask {
   ) {
     super();
     this.progress = 0;
-    this.action = ["kill"];
+    this.action = ["kill", "restart"];
     if (options.name) {
       this.name = options.name;
       this.rawName = options.name;
@@ -550,6 +624,26 @@ export class BiliVideoTask extends AbstractTask {
       const task = this.taskList.find((task) => task.taskId === taskId);
       if (task) {
         task.kill(false);
+      }
+    }
+  }
+  async restart() {
+    if (this.status !== "error" && this.status !== "canceled") return;
+    this.status = "running";
+    this.error = undefined;
+    this.endTime = undefined;
+    this.startTime = Date.now();
+    this.emitter.emit("task-start", { taskId: this.taskId });
+
+    const unfinishedTasks = this.taskList.filter((task) => task.status !== "completed");
+    if (unfinishedTasks.length === 0) {
+      this.emit("completed");
+      return;
+    }
+
+    for (const task of unfinishedTasks) {
+      if (task.action.includes("restart")) {
+        await task.restart();
       }
     }
   }

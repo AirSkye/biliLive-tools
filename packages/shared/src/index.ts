@@ -54,6 +54,7 @@ const init = async (config: GlobalConfig) => {
   });
 
   initDB(config.userDataPath);
+  taskQueue.initPersistence(config.userDataPath);
 
   container.register({
     appConfig: asValue(appConfig),

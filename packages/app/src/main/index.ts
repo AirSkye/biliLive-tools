@@ -559,6 +559,7 @@ const quit = async () => {
 
     const canQuited = await canQuit();
     if (canQuited) {
+      container.resolve("taskQueue").flushPersistence();
       mainWin.destroy();
       app.quit();
     }
@@ -581,6 +582,7 @@ export const relaunch = async () => {
     );
 
     WindowState.set("winBounds", windowConfig); // saves window's properties using electron-store
+    container.resolve("taskQueue").flushPersistence();
     app.relaunch();
     app.exit(0);
   }

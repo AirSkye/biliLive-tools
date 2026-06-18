@@ -189,9 +189,13 @@ export const convertImage2Video = async (
   },
 ) => {
   await setFfmpegPath();
-  const command = ffmpeg(join(inputDir, "%4d.png"))
-    .inputOption("-r", `1/${options.interval || 30}`)
-    .output(output);
+  const createCommand = async () => {
+    await setFfmpegPath();
+    return ffmpeg(join(inputDir, "%4d.png"))
+      .inputOption("-r", `1/${options.interval || 30}`)
+      .output(output);
+  };
+  const command = await createCommand();
   const task = new FFmpegTask(
     command,
     {
@@ -211,6 +215,9 @@ export const convertImage2Video = async (
           fs.rm(inputDir, { recursive: true, force: true });
         }
       },
+    },
+    {
+      commandFactory: createCommand,
     },
   );
 
@@ -1034,14 +1041,18 @@ export const mergeAssMp4 = async (
 
   const assFile = files.assFilePath;
   const startTimestamp = options.startTimestamp || 0;
-  log.debug("genMergeAssMp4Command start", startTimestamp);
-  const command = await genMergeAssMp4Command(files, ffmpegOptions, {
-    startTimestamp: startTimestamp,
-    timestampFont: options.timestampFont,
-  });
-  log.debug("mergrAssMp4, command");
+  const createCommand = async () => {
+    log.debug("genMergeAssMp4Command start", startTimestamp);
+    const command = await genMergeAssMp4Command(files, ffmpegOptions, {
+      startTimestamp: startTimestamp,
+      timestampFont: options.timestampFont,
+    });
+    log.debug("mergrAssMp4, command");
+    await setFfmpegPath();
+    return command;
+  };
 
-  await setFfmpegPath();
+  const command = await createCommand();
   const task = new FFmpegTask(
     command,
     {
@@ -1080,11 +1091,11 @@ export const mergeAssMp4 = async (
         }
       },
       onError: async () => {
-        if (files.hotProgressFilePath) {
-          log.info("mergrAssMp4, remove hot progress origin file", assFile);
-          await fs.unlink(files.hotProgressFilePath);
-        }
+        log.info("mergrAssMp4, keep temporary inputs for retry");
       },
+    },
+    {
+      commandFactory: createCommand,
     },
   );
   log.debug("mergeAssMp4 start task", task.taskId);
@@ -1280,15 +1291,21 @@ export const mergeVideos = async (
   }
   await setFfmpegPath();
 
-  const fileTxtPath = join(getTempPath(), `${uuid()}.txt`);
   const fileTxtContent = inputFiles.map((videoFile) => `file '${videoFile}'`).join("\n");
-  await fs.writeFile(fileTxtPath, fileTxtContent);
+  let fileTxtPath = "";
+  const createCommand = async () => {
+    await setFfmpegPath();
+    fileTxtPath = join(getTempPath(), `${uuid()}.txt`);
+    await fs.writeFile(fileTxtPath, fileTxtContent);
 
-  const command = ffmpeg(fileTxtPath).inputOptions("-f concat").inputOptions("-safe 0");
-  if (options.keepFirstVideoMeta) {
-    command.input(inputFiles[0]).outputOptions("-map 0").outputOptions(`-map_metadata 1`);
-  }
-  command.outputOptions("-c copy").output(outputFile);
+    const command = ffmpeg(fileTxtPath).inputOptions("-f concat").inputOptions("-safe 0");
+    if (options.keepFirstVideoMeta) {
+      command.input(inputFiles[0]).outputOptions("-map 0").outputOptions(`-map_metadata 1`);
+    }
+    command.outputOptions("-c copy").output(outputFile);
+    return command;
+  };
+  const command = await createCommand();
 
   let duration = 1;
   let videoMetas: Awaited<ReturnType<typeof readVideoMeta>>[] = [];
@@ -1325,6 +1342,9 @@ export const mergeVideos = async (
       onError: async () => {
         fs.remove(fileTxtPath);
       },
+    },
+    {
+      commandFactory: createCommand,
     },
   );
 
@@ -1505,26 +1525,30 @@ export const addExtractAudioTask = async (
   );
   let savePath = await parseSavePath(videoFilePath, opts);
   const output = path.join(savePath, outputFilePath);
-  const command = ffmpeg(videoFilePath)
-    .outputOptions("-vn")
-    .outputOptions(`-acodec ${opts.format}`)
-    .outputOptions("-ac 1")
-    .output(output);
-  if (opts.audioBitrate) {
-    command.outputOptions(`-ab ${opts.audioBitrate}`);
-  }
-  if (opts.sampleRate) {
-    command.outputOptions(`-ar ${opts.sampleRate}`);
-  }
-  if (opts.startTime) {
-    command.inputOptions(`-ss ${opts.startTime}`);
-  }
-  if (opts.endTime) {
-    command.inputOptions(`-to ${opts.endTime}`);
-  }
-  if (opts.audioFilter) {
-    command.audioFilters(opts.audioFilter);
-  }
+  const createCommand = () => {
+    const command = ffmpeg(videoFilePath)
+      .outputOptions("-vn")
+      .outputOptions(`-acodec ${opts.format}`)
+      .outputOptions("-ac 1")
+      .output(output);
+    if (opts.audioBitrate) {
+      command.outputOptions(`-ab ${opts.audioBitrate}`);
+    }
+    if (opts.sampleRate) {
+      command.outputOptions(`-ar ${opts.sampleRate}`);
+    }
+    if (opts.startTime) {
+      command.inputOptions(`-ss ${opts.startTime}`);
+    }
+    if (opts.endTime) {
+      command.inputOptions(`-to ${opts.endTime}`);
+    }
+    if (opts.audioFilter) {
+      command.audioFilters(opts.audioFilter);
+    }
+    return command;
+  };
+  const command = createCommand();
 
   const task = new FFmpegTask(
     command,
@@ -1533,6 +1557,9 @@ export const addExtractAudioTask = async (
       name: `提取音频任务: ${path.basename(videoFilePath)}`,
     },
     {},
+    {
+      commandFactory: createCommand,
+    },
   );
   if (opts.addQueue ?? true) {
     taskQueue.addTask(task, opts.autoRun ?? false);

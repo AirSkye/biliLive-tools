@@ -93,7 +93,8 @@ router.post("/:id/removeRecord", async (ctx) => {
 
 router.post("/:id/restart", async (ctx) => {
   const { id } = ctx.params;
-  handleRestartTask(id);
+  const { removeOutput } = (ctx.request.body ?? {}) as { removeOutput?: boolean };
+  await handleRestartTask(id, { removeOutput });
   ctx.body = { code: 0 };
 });
 

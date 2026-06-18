@@ -1,11 +1,63 @@
+import path from "node:path";
+import fs from "fs-extra";
 import { TypedEmitter } from "tiny-typed-emitter";
 import { isBetweenTimeRange } from "../../utils/index.js";
 import { TaskType } from "../../enum.js";
+import { AbstractTask } from "./AbstractTask.js";
 
 import type { Status } from "@biliLive-tools/types";
 import type { AppConfig } from "../../config.js";
-import type { AbstractTask } from "./AbstractTask.js";
 import type { TaskEvents } from "./types.js";
+
+type PersistedTaskRecord = {
+  pid?: string;
+  taskId: string;
+  status: Status;
+  name: string;
+  type: string;
+  relTaskId?: string;
+  output?: string;
+  progress: number;
+  action: AbstractTask["action"];
+  startTime: number;
+  endTime?: number;
+  custsomProgressMsg?: string;
+  error?: string;
+  extra?: Record<string, any>;
+};
+
+class RestoredTask extends AbstractTask {
+  type: string;
+
+  constructor(record: PersistedTaskRecord) {
+    super();
+    const interrupted = record.status === "running" || record.status === "paused";
+    this.pid = record.pid;
+    this.taskId = record.taskId;
+    this.status = interrupted ? "error" : record.status;
+    this.name = record.name;
+    this.type = record.type;
+    this.relTaskId = record.relTaskId;
+    this.output = record.output;
+    this.progress = interrupted ? 0 : record.progress;
+    this.action = [];
+    this.startTime = record.startTime;
+    this.endTime = record.endTime ?? (interrupted ? Date.now() : undefined);
+    this.custsomProgressMsg = record.custsomProgressMsg ?? "";
+    this.error = interrupted ? "应用关闭时任务已中断，请重新创建任务或删除记录" : record.error;
+    this.extra = record.extra;
+  }
+
+  exec() {}
+  kill() {
+    if (this.status === "completed" || this.status === "error" || this.status === "canceled")
+      return;
+    this.status = "canceled";
+    this.emit("task-cancel", { taskId: this.taskId, autoStart: true });
+  }
+  pause() {}
+  resume() {}
+}
 
 /**
  * 任务队列管理类
@@ -16,6 +68,9 @@ export class TaskQueue {
   emitter = new TypedEmitter<TaskEvents>();
   on: TypedEmitter<TaskEvents>["on"];
   off: TypedEmitter<TaskEvents>["off"];
+  private persistenceFile?: string;
+  private persistTimer?: ReturnType<typeof setTimeout>;
+  private isRestoring = false;
 
   constructor(appConfig: AppConfig) {
     this.queue = [];
@@ -41,6 +96,65 @@ export class TaskQueue {
       if (isVitest) return;
       this.addTaskForLimit();
     }, 1000 * 60);
+  }
+
+  initPersistence(userDataPath: string): void {
+    this.persistenceFile = path.join(userDataPath, "taskQueue.json");
+    this.restorePersistedQueue();
+    this.persistNow();
+  }
+
+  private restorePersistedQueue(): void {
+    if (!this.persistenceFile || !fs.pathExistsSync(this.persistenceFile)) return;
+    try {
+      this.isRestoring = true;
+      const data = fs.readJsonSync(this.persistenceFile) as {
+        version?: number;
+        tasks?: PersistedTaskRecord[];
+      };
+      const tasks = Array.isArray(data?.tasks) ? data.tasks : [];
+      if (this.queue.length === 0) {
+        this.queue.push(...tasks.map((task) => new RestoredTask(task)));
+      }
+    } catch (error) {
+      console.error("恢复任务队列失败", error);
+    } finally {
+      this.isRestoring = false;
+    }
+  }
+
+  private schedulePersist(): void {
+    if (!this.persistenceFile || this.isRestoring) return;
+    if (this.persistTimer) return;
+    this.persistTimer = setTimeout(() => {
+      this.persistTimer = undefined;
+      this.persistNow();
+    }, 300);
+  }
+
+  private persistNow(): void {
+    if (!this.persistenceFile) return;
+    try {
+      fs.ensureDirSync(path.dirname(this.persistenceFile));
+      fs.writeJsonSync(
+        this.persistenceFile,
+        {
+          version: 1,
+          tasks: this.stringify(this.queue),
+        },
+        { spaces: 2 },
+      );
+    } catch (error) {
+      console.error("保存任务队列失败", error);
+    }
+  }
+
+  flushPersistence(): void {
+    if (this.persistTimer) {
+      clearTimeout(this.persistTimer);
+      this.persistTimer = undefined;
+    }
+    this.persistNow();
   }
 
   /**
@@ -73,30 +187,38 @@ export class TaskQueue {
   addTask(task: AbstractTask, autoRun = true): void {
     task.emitter.on("task-end", ({ taskId, data }) => {
       this.emitter.emit("task-end", { taskId, data });
+      this.schedulePersist();
     });
     task.emitter.on("task-error", ({ taskId, error }) => {
       this.emitter.emit("task-error", { taskId, error });
+      this.schedulePersist();
     });
     task.emitter.on("task-progress", ({ taskId }) => {
       this.emitter.emit("task-progress", { taskId });
+      this.schedulePersist();
     });
     task.emitter.on("task-start", ({ taskId }) => {
       this.emitter.emit("task-start", { taskId });
+      this.schedulePersist();
     });
     task.emitter.on("task-pause", ({ taskId }) => {
       this.emitter.emit("task-pause", { taskId });
+      this.schedulePersist();
     });
     task.emitter.on("task-resume", ({ taskId }) => {
       this.emitter.emit("task-resume", { taskId });
+      this.schedulePersist();
     });
     task.emitter.on("task-cancel", ({ taskId, autoStart }) => {
       this.emitter.emit("task-cancel", { taskId, autoStart });
+      this.schedulePersist();
     });
     // task.emitter.on("task-removed-queue", ({ taskId }) => {
     //   this.emitter.emit("task-removed-queue", { taskId });
     // });
 
     this.queue.push(task);
+    this.schedulePersist();
 
     if (autoRun) {
       task.exec();
@@ -177,6 +299,7 @@ export class TaskQueue {
     if (index !== -1) {
       this.queue.splice(index, 1);
     }
+    this.schedulePersist();
   }
 
   /**
@@ -187,6 +310,7 @@ export class TaskQueue {
     if (!task) return;
     task.pause();
     task.pauseStartTime = Date.now();
+    this.schedulePersist();
   }
 
   /**
@@ -196,6 +320,7 @@ export class TaskQueue {
     const task = this.queryTask(taskId);
     if (!task) return;
     task.resume();
+    this.schedulePersist();
     // if (task.pauseStartTime !== null) {
     //   task.totalPausedDuration += Date.now() - task.pauseStartTime;
     //   task.pauseStartTime = null;
@@ -209,18 +334,22 @@ export class TaskQueue {
     const task = this.queryTask(taskId);
     if (!task) return;
     task.kill();
+    this.schedulePersist();
   }
 
   /**
    * 重启任务
    */
-  restart(taskId: string): void {
+  async restart(taskId: string, options: { removeOutput?: boolean } = {}): Promise<void> {
     const task = this.queryTask(taskId);
-    if (!task) return;
+    if (!task) throw new Error("任务不存在");
     if (task.action.includes("restart")) {
       // @ts-ignore
-      task.restart();
+      await task.restart(options);
+      this.schedulePersist();
+      return;
     }
+    throw new Error("该任务不支持重试");
   }
 
   /**

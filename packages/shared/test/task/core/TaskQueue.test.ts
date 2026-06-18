@@ -1,3 +1,6 @@
+import os from "node:os";
+import path from "node:path";
+import fs from "fs-extra";
 import { TaskQueue, AbstractTask } from "../../../src/task/task.js";
 import { TaskType } from "../../../src/enum.js";
 import { sleep } from "../../../src/utils/index.js";
@@ -44,6 +47,45 @@ describe("TaskQueue", () => {
     taskQueue.addTask(task);
     taskQueue.remove(task.taskId);
     expect(taskQueue.list()).not.toContain(task);
+  });
+
+  it("should pass restart options to restartable tasks", async () => {
+    class RestartableTask extends TestTask {
+      restart = vi.fn();
+      constructor() {
+        super();
+        this.status = "error";
+        this.action = ["restart"];
+      }
+    }
+    const task = new RestartableTask();
+    taskQueue.addTask(task, false);
+
+    await taskQueue.restart(task.taskId, { removeOutput: true });
+
+    expect(task.restart).toHaveBeenCalledWith({ removeOutput: true });
+  });
+
+  it("should persist and restore queue records", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-task-queue-"));
+    try {
+      const task = new TestTask();
+      task.name = "running task";
+      task.status = "running";
+      taskQueue.addTask(task, false);
+      taskQueue.initPersistence(tempDir);
+      taskQueue.flushPersistence();
+
+      const nextQueue = new TaskQueue(taskQueue.appConfig);
+      nextQueue.initPersistence(tempDir);
+      const restoredTask = nextQueue.list()[0];
+
+      expect(restoredTask.name).toBe("running task");
+      expect(restoredTask.status).toBe("error");
+      expect(restoredTask.error).toContain("应用关闭时任务已中断");
+    } finally {
+      fs.removeSync(tempDir);
+    }
   });
 
   it("should return a list of tasks", () => {

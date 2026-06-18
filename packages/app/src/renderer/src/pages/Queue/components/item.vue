@@ -34,7 +34,7 @@
           :size="20"
           class="btn pointer"
           title="重试任务"
-          @click="handleRestart(item.taskId)"
+          @click="handleRestart(item)"
         >
           <Refresh />
         </n-icon>
@@ -343,8 +343,17 @@ const handleRemoveRecord = async (taskId: string) => {
   store.getQuenu();
 };
 
-const handleRestart = async (taskId: string) => {
-  await taskApi.restart(taskId);
+const handleRestart = async (task: Task) => {
+  let removeOutput = false;
+  if (task.type === TaskType.ffmpeg && task.output) {
+    const [status] = await confirm.warning({
+      content: "重试前需要删除已有输出文件，确定删除并重试吗？",
+      positiveText: "删除并重试",
+    });
+    if (!status) return;
+    removeOutput = true;
+  }
+  await taskApi.restart(task.taskId, { removeOutput });
   store.getQuenu();
 };
 

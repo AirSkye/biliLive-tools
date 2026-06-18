@@ -60,8 +60,13 @@ const removeFile = async (id: string): Promise<string> => {
   return res.data;
 };
 
-const restart = async (id: string): Promise<string> => {
-  const res = await request.post(`/task/${id}/restart`);
+const restart = async (
+  id: string,
+  options: {
+    removeOutput?: boolean;
+  } = {},
+): Promise<string> => {
+  const res = await request.post(`/task/${id}/restart`, options);
   return res.data;
 };
 

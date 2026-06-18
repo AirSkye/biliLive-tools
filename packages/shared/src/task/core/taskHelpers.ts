@@ -157,6 +157,6 @@ export const handleRemoveTask = (taskId: string): void => {
 /**
  * 重启任务
  */
-export const handleRestartTask = (taskId: string): void => {
-  taskQueue.restart(taskId);
+export const handleRestartTask = (taskId: string, options: { removeOutput?: boolean } = {}) => {
+  return taskQueue.restart(taskId, options);
 };
