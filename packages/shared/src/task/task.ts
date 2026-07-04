@@ -42,7 +42,7 @@ type RestartOptions = {
 
 type FFmpegTaskCallback = {
   onStart?: () => void;
-  onEnd?: (output: string) => void;
+  onEnd?: (output: string) => void | Promise<void>;
   onError?: (err: string) => void;
   onProgress?: (progress: Progress) => any;
 };
@@ -204,7 +204,13 @@ export class FFmpegTask extends AbstractTask {
         this.status = "completed";
         this.progress = 100;
 
-        this.callback.onEnd && this.callback.onEnd(this.output as string);
+        if (this.callback.onEnd) {
+          try {
+            await this.callback.onEnd(this.output as string);
+          } catch (error) {
+            log.error(`task ${this.taskId} onEnd callback error`, error);
+          }
+        }
         this.emitter.emit("task-end", { taskId: this.taskId });
       }
       this.endTime = Date.now();

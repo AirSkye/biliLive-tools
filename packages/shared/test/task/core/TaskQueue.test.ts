@@ -1,7 +1,8 @@
 import os from "node:os";
 import path from "node:path";
+import EventEmitter from "node:events";
 import fs from "fs-extra";
-import { TaskQueue, AbstractTask } from "../../../src/task/task.js";
+import { TaskQueue, AbstractTask, FFmpegTask } from "../../../src/task/task.js";
 import { TaskType } from "../../../src/enum.js";
 import { sleep } from "../../../src/utils/index.js";
 import { expect, describe, it, beforeEach, vi } from "vitest";
@@ -64,6 +65,40 @@ describe("TaskQueue", () => {
     await taskQueue.restart(task.taskId, { removeOutput: true });
 
     expect(task.restart).toHaveBeenCalledWith({ removeOutput: true });
+  });
+
+  it("should keep FFmpegTask completion callbacks after restart", async () => {
+    const createCommand = () => {
+      const command = new EventEmitter() as any;
+      command.run = vi.fn(() => command.emit("start", "ffmpeg"));
+      command.kill = vi.fn();
+      command._getArguments = vi.fn(() => []);
+      return command;
+    };
+    const firstCommand = createCommand();
+    const restartedCommand = createCommand();
+    const onEnd = vi.fn();
+    const output = path.join(os.tmpdir(), `bili-ffmpeg-retry-${Date.now()}.mp4`);
+    const task = new FFmpegTask(
+      firstCommand,
+      {
+        output,
+        name: "ffmpeg retry",
+      },
+      {
+        onEnd,
+      },
+      {
+        commandFactory: () => restartedCommand,
+      },
+    );
+
+    firstCommand.emit("error", "failed once");
+    await task.restart();
+    restartedCommand.emit("end");
+
+    expect(onEnd).toHaveBeenCalledTimes(1);
+    expect(onEnd).toHaveBeenCalledWith(output);
   });
 
   it("should persist and restore queue records", () => {

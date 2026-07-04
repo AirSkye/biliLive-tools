@@ -38,6 +38,10 @@ import type {
 } from "@biliLive-tools/types";
 import type Ffmpeg from "@biliLive-tools/types/ffmpeg.js";
 
+type FFmpegTaskHooks = {
+  onEnd?: (output: string) => void | Promise<void>;
+};
+
 export const getBinPath = () => {
   const config = appConfig.getAll();
   let ffmpegPath = config.ffmpegPath;
@@ -1009,6 +1013,7 @@ export const mergeAssMp4 = async (
     limitTime?: [] | [string, string];
     autoRun?: boolean;
     removeSubtitle?: boolean;
+    onEnd?: (output: string) => void | Promise<void>;
   } = {
     removeOrigin: false,
     startTimestamp: 0,
@@ -1089,6 +1094,7 @@ export const mergeAssMp4 = async (
           log.info("mergrAssMp4, remove subtitle origin file", files.subtitlePath);
           await fs.unlink(files.subtitlePath);
         }
+        await options.onEnd?.(output);
       },
       onError: async () => {
         log.info("mergrAssMp4, keep temporary inputs for retry");
@@ -1389,6 +1395,7 @@ export const burn = async (
     saveType?: 1 | 2;
     limitTime?: [string, string];
   },
+  hooks: FFmpegTaskHooks = {},
 ) => {
   if (options.ffmpegOptions.encoder === "copy") {
     throw new Error("视频编码不能为copy");
@@ -1480,6 +1487,7 @@ export const burn = async (
       startTimestamp,
       timestampFont,
       limitTime: options.limitTime,
+      onEnd: hooks.onEnd,
     },
     options.ffmpegOptions,
   );

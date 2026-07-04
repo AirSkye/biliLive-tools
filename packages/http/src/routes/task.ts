@@ -35,12 +35,42 @@ import { generateWaveformData } from "@biliLive-tools/shared/task/audiowaveform.
 import { musicDetect } from "@biliLive-tools/shared/musicDetector/index.js";
 import { fileCache, appConfig } from "../index.js";
 
-import type { DanmuPreset, DanmaOptions } from "@biliLive-tools/types";
+import type { DanmuPreset, DanmaOptions, BiliupConfig } from "@biliLive-tools/types";
 import type { DetectionConfig } from "music-segment-detector";
 
 const router = new Router({
   prefix: "/task",
 });
+
+type BurnUploadOptions = {
+  upload?: boolean;
+  removeOriginAfterUploadCheck?: boolean;
+  config: BiliupConfig;
+  filePath?: string;
+  uid: number;
+  aid?: number;
+};
+
+const enqueueBurnUpload = async (uploadOptions: BurnUploadOptions, outputFile: string) => {
+  const file = uploadOptions.filePath || outputFile;
+  const afterUploadDeletAction = uploadOptions.removeOriginAfterUploadCheck
+    ? "deleteAfterCheck"
+    : "none";
+
+  if (uploadOptions.aid) {
+    await biliApi.editMedia(
+      uploadOptions.aid as number,
+      [file],
+      uploadOptions.config,
+      uploadOptions.uid,
+      { afterUploadDeletAction },
+    );
+  } else {
+    await biliApi.addMedia([file], uploadOptions.config, uploadOptions.uid, {
+      afterUploadDeletAction,
+    });
+  }
+};
 
 router.get("/", async (ctx) => {
   const type = ctx.query.type;
@@ -257,29 +287,21 @@ router.post("/transcode", async (ctx) => {
  */
 router.post("/burn", async (ctx) => {
   const { files, output, options } = ctx.request.body as any;
+  const uploadOptions = options?.uploadOptions as BurnUploadOptions | undefined;
 
-  if (options?.uploadOptions?.upload && !options?.uploadOptions?.aid) {
-    const [status, msg] = validateBiliupConfig(options?.uploadOptions?.config || {});
+  if (uploadOptions?.upload && !uploadOptions?.aid) {
+    const [status, msg] = validateBiliupConfig(uploadOptions?.config || {});
     if (!status) {
       ctx.status = 400;
       ctx.body = msg;
       return;
     }
   }
-  const task = await burn(files, output, options);
-
-  if (options?.uploadOptions?.upload) {
-    task.on("task-end", () => {
-      const aid = options?.uploadOptions?.aid;
-      const uid = options?.uploadOptions?.uid;
-      const file = options?.uploadOptions?.filePath;
-      if (aid) {
-        biliApi.editMedia(aid as number, [file], options?.uploadOptions?.config, uid);
-      } else {
-        biliApi.addMedia([file], options?.uploadOptions?.config, uid);
-      }
-    });
-  }
+  const task = await burn(files, output, options, {
+    onEnd: uploadOptions?.upload
+      ? (outputFile) => enqueueBurnUpload(uploadOptions, outputFile)
+      : undefined,
+  });
 
   ctx.body = { taskId: task.taskId };
 });
