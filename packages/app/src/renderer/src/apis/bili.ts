@@ -64,6 +64,45 @@ const getPlatformArchiveDetail = async (aid: number, uid: number) => {
   return res.data;
 };
 
+export type LocalUploadedFileMatch = {
+  localPath: string;
+  fileName: string;
+  root: string;
+  size: number;
+  mtimeMs: number;
+  aid: number;
+  bvid?: string;
+  archiveTitle: string;
+  partTitle?: string;
+  remoteFilename?: string;
+  confidence: "high" | "medium";
+  reason: string;
+};
+
+export type LocalUploadedFilesResult = {
+  roots: string[];
+  scannedFileCount: number;
+  archiveCount: number;
+  remotePartCount: number;
+  truncated: boolean;
+  matches: LocalUploadedFileMatch[];
+  errors: string[];
+};
+
+const detectLocalUploadedFiles = async (
+  uid: number,
+  options: {
+    rootPath?: string;
+    pages?: number;
+    pageSize?: number;
+  } = {},
+): Promise<LocalUploadedFilesResult> => {
+  const res = await request.get("/bili/localUploadedFiles", {
+    params: { uid, ...options },
+  });
+  return res.data;
+};
+
 const qrcode = async (): Promise<{
   url: string;
   id: string;
@@ -174,6 +213,7 @@ const bili = {
   getArchiveDetail,
   getSessionId,
   getPlatformArchiveDetail,
+  detectLocalUploadedFiles,
   qrcode,
   loginCancel,
   loginPoll,

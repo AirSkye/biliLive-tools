@@ -695,7 +695,7 @@ async function addMedia(
     afterUploadDeletAction?: "none" | "delete" | "deleteAfterCheck";
     // 强制检查稿件状态
     forceCheck?: boolean;
-    checkCallback?: (status: "completed" | "error") => void;
+    checkCallback?: (status: "completed" | "error") => void | Promise<void>;
   },
 ) {
   // 预格式化选项（解析元数据、格式化标题等）
@@ -751,30 +751,51 @@ async function addMedia(
             uid: uid,
           });
 
-          commentQueue.once("update", (_, status, media) => {
-            biliMediaAction(
-              status,
-              {
-                comment: formattedOptions.autoComment ? formattedOptions.comment : "",
-                top: formattedOptions.commentTop || false,
-                notification: !!appConfig.get("notification")?.task?.mediaStatusCheck?.length,
-                removeOriginAfterUploadCheck:
-                  extraOptions?.afterUploadDeletAction === "deleteAfterCheck",
-                files: videos.map((video) => video.path),
-                uid: uid,
-                aid: data.aid,
-              },
-              media,
-            );
-            extraOptions?.checkCallback && extraOptions?.checkCallback(status);
-          });
+          const onUpdate = (aid: number, status: "completed" | "error", media: MediaItem) => {
+            if (aid !== data.aid) return;
+            commentQueue.off("update", onUpdate);
+            clearTimeout(cleanupTimer);
+            void (async () => {
+              try {
+                await biliMediaAction(
+                  status,
+                  {
+                    comment: formattedOptions.autoComment ? formattedOptions.comment : "",
+                    top: formattedOptions.commentTop || false,
+                    notification: !!appConfig.get("notification")?.task?.mediaStatusCheck?.length,
+                    removeOriginAfterUploadCheck:
+                      extraOptions?.afterUploadDeletAction === "deleteAfterCheck",
+                    files: videos.map((video) => video.path),
+                    uid: uid,
+                    aid: data.aid,
+                  },
+                  media,
+                );
+              } catch (error) {
+                log.error("处理稿件审核后操作失败", error);
+              }
+              try {
+                await extraOptions?.checkCallback?.(status);
+              } catch (error) {
+                log.error("处理稿件审核回调失败", error);
+              }
+            })();
+          };
+          commentQueue.on("update", onUpdate);
+          const cleanupTimer = setTimeout(
+            () => {
+              commentQueue.off("update", onUpdate);
+            },
+            1000 * 60 * 60 * 25,
+          );
+          cleanupTimer.unref?.();
         }
 
         // 处理上传后操作
         if (extraOptions?.afterUploadDeletAction === "delete") {
           for (const video of videos) {
             try {
-              trashItem(video.path);
+              await trashItem(video.path);
             } catch (error) {
               log.error("删除源文件失败", error);
             }
@@ -833,7 +854,7 @@ export async function editMedia(
     forceCheck?: boolean;
     // 用于排序，按照列表顺序排序，cid可能为空，如果cid为空从上传分P件名中提取cid
     sortParams?: { filePath: string; cid?: number }[];
-    checkCallback?: (status: "completed" | "error") => void;
+    checkCallback?: (status: "completed" | "error") => void | Promise<void>;
   },
 ) {
   if (filePath.length === 0) {
@@ -864,30 +885,55 @@ export async function editMedia(
         ) {
           const commentQueue = container.resolve("commentQueue");
           commentQueue.add({ aid: aid, uid });
-          commentQueue.once("update", (_, status, media) => {
-            console.log("审核结果", status, media);
-            biliMediaAction(
-              status,
-              {
-                comment: "",
-                top: false,
-                notification: !!appConfig.get("notification")?.task?.mediaStatusCheck?.length,
-                removeOriginAfterUploadCheck:
-                  extraOptions?.afterUploadDeletAction === "deleteAfterCheck",
-                files: videos.map((video) => video.path),
-                uid: uid,
-                aid: aid,
-              },
-              media,
-            );
-            extraOptions?.checkCallback && extraOptions?.checkCallback(status);
-          });
+          const onUpdate = (
+            updatedAid: number,
+            status: "completed" | "error",
+            media: MediaItem,
+          ) => {
+            if (updatedAid !== aid) return;
+            commentQueue.off("update", onUpdate);
+            clearTimeout(cleanupTimer);
+            void (async () => {
+              try {
+                console.log("审核结果", status, media);
+                await biliMediaAction(
+                  status,
+                  {
+                    comment: "",
+                    top: false,
+                    notification: !!appConfig.get("notification")?.task?.mediaStatusCheck?.length,
+                    removeOriginAfterUploadCheck:
+                      extraOptions?.afterUploadDeletAction === "deleteAfterCheck",
+                    files: videos.map((video) => video.path),
+                    uid: uid,
+                    aid: aid,
+                  },
+                  media,
+                );
+              } catch (error) {
+                log.error("处理稿件审核后操作失败", error);
+              }
+              try {
+                await extraOptions?.checkCallback?.(status);
+              } catch (error) {
+                log.error("处理稿件审核回调失败", error);
+              }
+            })();
+          };
+          commentQueue.on("update", onUpdate);
+          const cleanupTimer = setTimeout(
+            () => {
+              commentQueue.off("update", onUpdate);
+            },
+            1000 * 60 * 60 * 25,
+          );
+          cleanupTimer.unref?.();
         }
         // 处理上传后操作
         if (extraOptions?.afterUploadDeletAction === "delete") {
           for (const video of videos) {
             try {
-              trashItem(video.path);
+              await trashItem(video.path);
             } catch (error) {
               log.error("删除源文件失败", error);
             }

@@ -8,6 +8,9 @@
       <n-button @click="addVideo"> 添加 </n-button>
       <n-button type="primary" @click="upload" title="立即上传(ctrl+enter)"> 立即上传 </n-button>
       <n-button type="primary" @click="appendVideoVisible = true"> 续传 </n-button>
+      <n-button :loading="detectingLocalUploadedFiles" @click="detectLocalUploadedFiles">
+        检测已上传未删除
+      </n-button>
       <n-checkbox v-model:checked="options.removeOriginAfterUploadCheck">
         审核通过后移除源文件
       </n-checkbox>
@@ -33,12 +36,50 @@
       v-model="aid"
       @confirm="appendVideo"
     ></AppendVideoDialog>
+
+    <n-modal
+      v-model:show="localUploadedFilesVisible"
+      preset="card"
+      title="已上传未删除检测"
+      style="width: min(1100px, 92vw)"
+      :bordered="false"
+    >
+      <div v-if="localUploadedFilesResult" class="detect-summary">
+        <span>扫描文件：{{ localUploadedFilesResult.scannedFileCount }}</span>
+        <span>稿件：{{ localUploadedFilesResult.archiveCount }}</span>
+        <span>分P：{{ localUploadedFilesResult.remotePartCount }}</span>
+        <span>匹配：{{ localUploadedFilesResult.matches.length }}</span>
+      </div>
+      <n-alert
+        v-if="localUploadedFilesResult?.truncated"
+        type="warning"
+        style="margin-bottom: 12px"
+      >
+        扫描达到上限，仅展示前 20000 个视频文件的结果
+      </n-alert>
+      <n-alert
+        v-if="localUploadedFilesResult?.errors.length"
+        type="warning"
+        style="margin-bottom: 12px"
+      >
+        {{ localUploadedFilesResult.errors.slice(0, 3).join("；") }}
+      </n-alert>
+      <n-empty v-if="localUploadedRows.length === 0" description="没有检测到疑似残留文件" />
+      <n-data-table
+        v-else
+        :columns="localUploadedColumns"
+        :data="localUploadedRows"
+        :pagination="{ pageSize: 8 }"
+        size="small"
+      />
+    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { toReactive } from "@vueuse/core";
 import { NButton, useNotification } from "naive-ui";
+import type { DataTableColumns } from "naive-ui";
 
 import FileSelect from "@renderer/pages/Tools/pages/FileUpload/components/FileSelect.vue";
 import BiliSetting from "@renderer/components/BiliSetting.vue";
@@ -49,6 +90,7 @@ import { biliApi } from "@renderer/apis";
 import hotkeys from "hotkeys-js";
 
 import { deepRaw } from "@renderer/utils";
+import type { LocalUploadedFileMatch, LocalUploadedFilesResult } from "@renderer/apis/bili";
 
 defineOptions({
   name: "Upload",
@@ -181,6 +223,113 @@ const clear = () => {
   fileList.value = [];
 };
 
+const localUploadedFilesVisible = ref(false);
+const detectingLocalUploadedFiles = ref(false);
+const localUploadedFilesResult = ref<LocalUploadedFilesResult | null>(null);
+const localUploadedRows = computed(() => localUploadedFilesResult.value?.matches ?? []);
+
+const openLocalFolder = (filePath: string) => {
+  window.api.openPath(window.path.dirname(filePath));
+};
+
+const openBiliArchive = (aid: number) => {
+  const url = `https://member.bilibili.com/platform/upload/video/frame?type=edit&version=new&aid=${aid}`;
+  window.api.openExternal(url);
+};
+
+const localUploadedColumns: DataTableColumns<LocalUploadedFileMatch> = [
+  {
+    title: "本地文件",
+    key: "fileName",
+    minWidth: 220,
+    render: (row) => h("span", { title: row.localPath }, row.fileName),
+  },
+  {
+    title: "稿件",
+    key: "archiveTitle",
+    minWidth: 220,
+    render: (row) => h("span", { title: `AV${row.aid}` }, row.archiveTitle || `AV${row.aid}`),
+  },
+  {
+    title: "分P",
+    key: "partTitle",
+    minWidth: 160,
+    render: (row) => row.partTitle || row.remoteFilename || "-",
+  },
+  {
+    title: "置信度",
+    key: "confidence",
+    width: 90,
+    render: (row) => (row.confidence === "high" ? "高" : "中"),
+  },
+  {
+    title: "原因",
+    key: "reason",
+    minWidth: 150,
+  },
+  {
+    title: "修改时间",
+    key: "mtimeMs",
+    width: 170,
+    render: (row) => new Date(row.mtimeMs).toLocaleString(),
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 180,
+    render: (row) =>
+      h(
+        "div",
+        {
+          style: "display: flex; gap: 8px;",
+        },
+        [
+          h(
+            NButton,
+            {
+              size: "small",
+              onClick: () => openLocalFolder(row.localPath),
+            },
+            { default: () => "打开目录" },
+          ),
+          h(
+            NButton,
+            {
+              size: "small",
+              onClick: () => openBiliArchive(row.aid),
+            },
+            { default: () => "打开稿件" },
+          ),
+        ],
+      ),
+  },
+];
+
+const detectLocalUploadedFiles = async () => {
+  const hasLogin = !!userInfo.value.uid;
+  if (!hasLogin) {
+    notice.error({
+      title: `请点击左侧头像处先进行登录`,
+      duration: 1000,
+    });
+    return;
+  }
+
+  detectingLocalUploadedFiles.value = true;
+  try {
+    localUploadedFilesResult.value = await biliApi.detectLocalUploadedFiles(userInfo.value.uid!);
+    localUploadedFilesVisible.value = true;
+  } catch (error) {
+    notice.error({
+      title: "检测失败",
+      content: error instanceof Error ? error.message : String(error),
+      duration: 3000,
+    });
+  } finally {
+    detectingLocalUploadedFiles.value = false;
+  }
+};
+
 const biliSettingRef = ref<InstanceType<typeof BiliSetting> | null>(null);
 // 只提示一次，清空提示
 const hasNotice = ref(false);
@@ -246,4 +395,12 @@ const fileChange = (files: any) => {
 };
 </script>
 
-<style scoped lang="less"></style>
+<style scoped lang="less">
+.detect-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+  color: #666;
+}
+</style>

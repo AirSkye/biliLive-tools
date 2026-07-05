@@ -304,20 +304,16 @@ export class WebhookHandler {
     log.warn(`${options.filePath}: file size is too small (${fileSizeMB}MB)`);
 
     if (config.removeSmallFile) {
-      try {
-        log.warn("small file should be deleted", options.filePath);
-        trashItem(options.filePath);
-
-        const cover = PathResolver.getCoverPath(options.filePath, options.coverPath);
-        if (cover) {
-          trashItem(cover);
+      log.warn("small file should be deleted", options.filePath);
+      const cover = PathResolver.getCoverPath(options.filePath, options.coverPath);
+      const xmlFilePath = PathResolver.getDanmuPath(options.filePath, options.danmuPath);
+      for (const file of [options.filePath, cover, xmlFilePath]) {
+        if (!file) continue;
+        try {
+          await trashItem(file);
+        } catch (error) {
+          log.error("small file deletion error", error);
         }
-        const xmlFilePath = PathResolver.getDanmuPath(options.filePath, options.danmuPath);
-        if (xmlFilePath) {
-          trashItem(xmlFilePath);
-        }
-      } catch (error) {
-        log.error("small file deletion error", error);
       }
     }
 
@@ -869,12 +865,20 @@ export class WebhookHandler {
     });
 
     return new Promise((resolve, reject) => {
-      task.on("task-end", () => {
+      task.on("task-end", async () => {
         if (options.removeVideo) {
-          trashItem(files.videoFilePath);
+          try {
+            await trashItem(files.videoFilePath);
+          } catch (error) {
+            log.error("删除源文件失败", error);
+          }
         }
         if (options.removeDanmu) {
-          trashItem(files.subtitleFilePath);
+          try {
+            await trashItem(files.subtitleFilePath);
+          } catch (error) {
+            log.error("删除弹幕文件失败", error);
+          }
         }
         resolve(output);
       });
@@ -902,9 +906,13 @@ export class WebhookHandler {
     });
 
     return new Promise((resolve, reject) => {
-      task.on("task-end", () => {
-        if (options.removeXml) {
-          trashItem(xmlFilePath);
+      task.on("task-end", async () => {
+        try {
+          if (options.removeXml) {
+            await trashItem(xmlFilePath);
+          }
+        } catch (error) {
+          log.error("删除弹幕文件失败", error);
         }
         resolve(outputPath);
       });
