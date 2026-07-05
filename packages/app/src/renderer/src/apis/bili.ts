@@ -86,7 +86,42 @@ export type LocalUploadedFilesResult = {
   remotePartCount: number;
   truncated: boolean;
   matches: LocalUploadedFileMatch[];
+  unuploadedGroups: LocalUnuploadedGroup[];
   errors: string[];
+};
+
+export type LocalUploadCandidateFile = {
+  path: string;
+  fileName: string;
+  size: number;
+  mtimeMs: number;
+  title: string;
+  startTime?: number;
+  endTime?: number;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
+  recordId?: number;
+};
+
+export type LocalUnuploadedGroup = {
+  id: string;
+  groupKey: string;
+  roomId?: string;
+  platform?: string;
+  username?: string;
+  title: string;
+  startTime: number;
+  endTime?: number;
+  fileCount: number;
+  totalSize: number;
+  danmuCount: number;
+  files: LocalUploadCandidateFile[];
+  suggestedAction: "new" | "append" | "ambiguous";
+  suggestedAid?: number;
+  archiveTitle?: string;
+  mergeCandidate: boolean;
+  hasWebhookUploadConfig: boolean;
+  warnings: string[];
 };
 
 const detectLocalUploadedFiles = async (
@@ -144,6 +179,35 @@ const upload = async (options: {
   taskId: string;
 }> => {
   const res = await request.post("/bili/upload", options);
+  return res.data;
+};
+
+const uploadLocalUnuploaded = async (data: {
+  groups: Array<{
+    roomId?: string;
+    platform?: string;
+    username?: string;
+    title?: string;
+    startTime?: number;
+    aid?: number;
+    uploadMode?: "auto" | "new" | "append";
+    files: LocalUploadCandidateFile[];
+  }>;
+  options: {
+    burnDanmu: boolean;
+    uploadRawWhenNoDanmu: boolean;
+    mergeSegments: boolean;
+  };
+}): Promise<{
+  status: string;
+  items: Array<{
+    roomId: string;
+    title?: string;
+    status: "queued" | "skipped";
+    reason?: string;
+  }>;
+}> => {
+  const res = await request.post("/bili/uploadLocalUnuploaded", data);
   return res.data;
 };
 
@@ -218,6 +282,7 @@ const bili = {
   loginCancel,
   loginPoll,
   upload,
+  uploadLocalUnuploaded,
   formatWebhookTitle,
   formatWebhookPartTitle,
   formatWebhookDesc,

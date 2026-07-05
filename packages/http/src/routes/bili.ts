@@ -4,15 +4,20 @@ import { omit } from "lodash-es";
 import path from "node:path";
 
 import { biliApi, validateBiliupConfig } from "@biliLive-tools/shared/task/bili.js";
+import { recordHistoryService, streamerService } from "@biliLive-tools/shared/db/index.js";
 import { TvQrcodeLogin } from "@renmu/bili-api";
 import {
   formatTitle,
   formatPartTitle,
   formatDesc,
   uuid,
+  replaceExtName,
 } from "@biliLive-tools/shared/utils/index.js";
 import type { BiliupConfig, PartTitleFormatOptions } from "@biliLive-tools/types";
-import { appConfig } from "../index.js";
+import { appConfig, handler } from "../index.js";
+import type { LocalUploadOptions } from "../services/webhook/webhook.js";
+import type { LiveHistory } from "@biliLive-tools/shared/db/model/recordHistory.js";
+import type { Streamer } from "@biliLive-tools/shared/db/model/streamer.js";
 
 const router = new Router({
   prefix: "/bili",
@@ -54,6 +59,59 @@ type LocalUploadedFileMatch = {
   remoteFilename?: string;
   confidence: "high" | "medium";
   reason: string;
+};
+
+type RecordWithStreamer = LiveHistory & {
+  streamer?: Streamer | null;
+};
+
+type LocalUploadCandidateFile = {
+  path: string;
+  fileName: string;
+  size: number;
+  mtimeMs: number;
+  title: string;
+  startTime?: number;
+  endTime?: number;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
+  recordId?: number;
+};
+
+type LocalUnuploadedGroup = {
+  id: string;
+  groupKey: string;
+  roomId?: string;
+  platform?: string;
+  username?: string;
+  title: string;
+  startTime: number;
+  endTime?: number;
+  fileCount: number;
+  totalSize: number;
+  danmuCount: number;
+  files: LocalUploadCandidateFile[];
+  suggestedAction: "new" | "append" | "ambiguous";
+  suggestedAid?: number;
+  archiveTitle?: string;
+  mergeCandidate: boolean;
+  hasWebhookUploadConfig: boolean;
+  warnings: string[];
+};
+
+type LocalFileContext = {
+  localFile: LocalVideoFile;
+  record?: RecordWithStreamer | null;
+  match?: LocalUploadedFileMatch;
+  groupKey: string;
+  roomId?: string;
+  platform?: string;
+  username?: string;
+  title: string;
+  startTime: number;
+  endTime?: number;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
 };
 
 const getQueryValue = (value: unknown) => {
@@ -255,6 +313,188 @@ const matchLocalFile = (localFile: LocalVideoFile, remotePart: RemoteVideoPart) 
   return null;
 };
 
+const normalizeLocalPath = (filePath: string) => {
+  const resolved = path.resolve(filePath);
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+};
+
+const buildRecordLookup = () => {
+  const map = new Map<string, RecordWithStreamer>();
+  const streamers = new Map<number, Streamer>();
+  for (const streamer of streamerService.list()) {
+    streamers.set(streamer.id, streamer);
+  }
+
+  for (const record of recordHistoryService.list({})) {
+    if (!record.video_file) continue;
+    const item: RecordWithStreamer = {
+      ...record,
+      streamer: streamers.get(record.streamer_id) ?? null,
+    };
+    map.set(normalizeLocalPath(record.video_file), item);
+    map.set(normalizeLocalPath(replaceExtName(record.video_file, ".mp4")), item);
+  }
+
+  return map;
+};
+
+const findDanmuFiles = async (videoPath: string) => {
+  const assFile = replaceExtName(videoPath, ".ass");
+  const xmlFile = replaceExtName(videoPath, ".xml");
+  const assExists = await fs.pathExists(assFile);
+  const xmlExists = await fs.pathExists(xmlFile);
+
+  return {
+    danmuPath: assExists ? assFile : xmlExists ? xmlFile : undefined,
+    xmlDanmuPath: xmlExists ? xmlFile : undefined,
+  };
+};
+
+const buildLocalFileContexts = async (
+  localFiles: LocalVideoFile[],
+  matches: LocalUploadedFileMatch[],
+) => {
+  const recordLookup = buildRecordLookup();
+  const matchMap = new Map(matches.map((item) => [normalizeLocalPath(item.localPath), item]));
+  const contexts: LocalFileContext[] = [];
+
+  for (const localFile of localFiles) {
+    const normalizedPath = normalizeLocalPath(localFile.localPath);
+    const record = recordLookup.get(normalizedPath) ?? null;
+    const streamer = record?.streamer ?? null;
+    const startTime = record?.record_start_time ?? localFile.mtimeMs;
+    const parentDir = path.dirname(localFile.localPath);
+    const fallbackDay = new Date(localFile.mtimeMs).toISOString().slice(0, 10);
+    const groupKey =
+      record && streamer
+        ? `${streamer.platform}:${streamer.room_id}:${record.live_id || record.live_start_time || record.title}`
+        : `dir:${normalizeLocalPath(parentDir)}:${fallbackDay}`;
+    const danmuFiles = await findDanmuFiles(localFile.localPath);
+
+    contexts.push({
+      localFile,
+      record,
+      match: matchMap.get(normalizedPath),
+      groupKey,
+      roomId: streamer?.room_id,
+      platform: streamer?.platform,
+      username: streamer?.name,
+      title: record?.title || localFile.stem,
+      startTime,
+      endTime: record?.record_end_time,
+      ...danmuFiles,
+    });
+  }
+
+  return contexts;
+};
+
+const hasWebhookUploadConfig = (roomId?: string) => {
+  if (!roomId) return false;
+  try {
+    const config = handler.configManager.getConfig(roomId);
+    return !!config.uid && !!config.uploadPresetId;
+  } catch {
+    return false;
+  }
+};
+
+const buildUnuploadedGroups = async (
+  localFiles: LocalVideoFile[],
+  matches: LocalUploadedFileMatch[],
+  remoteParts: RemoteVideoPart[],
+): Promise<LocalUnuploadedGroup[]> => {
+  const contexts = await buildLocalFileContexts(localFiles, matches);
+  const grouped = new Map<string, LocalFileContext[]>();
+  for (const context of contexts) {
+    const list = grouped.get(context.groupKey) ?? [];
+    list.push(context);
+    grouped.set(context.groupKey, list);
+  }
+
+  const groups: LocalUnuploadedGroup[] = [];
+  for (const [groupKey, groupContexts] of grouped) {
+    const unuploaded = groupContexts
+      .filter((item) => !item.match)
+      .sort((left, right) => left.startTime - right.startTime);
+    if (unuploaded.length === 0) continue;
+
+    const first = unuploaded[0];
+    const aidMap = new Map<number, LocalUploadedFileMatch>();
+    for (const context of groupContexts) {
+      if (!context.match) continue;
+      aidMap.set(context.match.aid, context.match);
+    }
+    let matchedAids = Array.from(aidMap.keys());
+    let titleMatchedArchiveTitle: string | undefined;
+    if (matchedAids.length === 0) {
+      const normalizedGroupTitle = normalizeMatchText(first.title);
+      const titleAidMap = new Map<number, RemoteVideoPart>();
+      for (const remotePart of remoteParts) {
+        if (!normalizedGroupTitle) continue;
+        if (normalizeMatchText(remotePart.archiveTitle) !== normalizedGroupTitle) continue;
+        titleAidMap.set(remotePart.aid, remotePart);
+      }
+      matchedAids = Array.from(titleAidMap.keys());
+      if (matchedAids.length === 1) {
+        titleMatchedArchiveTitle = titleAidMap.get(matchedAids[0])?.archiveTitle;
+      }
+    }
+    const suggestedAction =
+      matchedAids.length === 0 ? "new" : matchedAids.length === 1 ? "append" : "ambiguous";
+    const suggestedAid = suggestedAction === "append" ? matchedAids[0] : undefined;
+    const matchedArchive = suggestedAid ? aidMap.get(suggestedAid) : undefined;
+    const totalSize = unuploaded.reduce((sum, item) => sum + item.localFile.size, 0);
+    const danmuCount = unuploaded.filter((item) => item.danmuPath).length;
+    const mergeCandidate =
+      unuploaded.length > 1 &&
+      unuploaded.every((item) => path.extname(item.localFile.fileName).toLowerCase() === ".flv");
+    const groupHasWebhookConfig = hasWebhookUploadConfig(first.roomId);
+    const warnings: string[] = [];
+    if (!first.roomId) warnings.push("未从录制历史识别到房间号，无法复用 webhook 房间配置");
+    if (suggestedAction === "ambiguous") {
+      warnings.push("同组文件匹配到多个远端稿件，默认不会自动续传");
+    }
+    if (!groupHasWebhookConfig) {
+      warnings.push("该房间未配置 webhook 上传账号或上传预设");
+    }
+
+    groups.push({
+      id: uuid(),
+      groupKey,
+      roomId: first.roomId,
+      platform: first.platform,
+      username: first.username,
+      title: first.title,
+      startTime: first.startTime,
+      endTime: unuploaded[unuploaded.length - 1].endTime,
+      fileCount: unuploaded.length,
+      totalSize,
+      danmuCount,
+      files: unuploaded.map((item) => ({
+        path: item.localFile.localPath,
+        fileName: item.localFile.fileName,
+        size: item.localFile.size,
+        mtimeMs: item.localFile.mtimeMs,
+        title: item.title,
+        startTime: item.startTime,
+        endTime: item.endTime,
+        danmuPath: item.danmuPath,
+        xmlDanmuPath: item.xmlDanmuPath,
+        recordId: item.record?.id,
+      })),
+      suggestedAction,
+      suggestedAid,
+      archiveTitle: matchedArchive?.archiveTitle || titleMatchedArchiveTitle,
+      mergeCandidate,
+      hasWebhookUploadConfig: groupHasWebhookConfig,
+      warnings,
+    });
+  }
+
+  return groups.sort((left, right) => right.startTime - left.startTime);
+};
+
 // 验证视频上传参数
 router.post("/validUploadParams", async (ctx) => {
   const params = ctx.request.body;
@@ -366,6 +606,11 @@ router.get("/localUploadedFiles", async (ctx) => {
       break;
     }
   }
+  const unuploadedGroups = await buildUnuploadedGroups(
+    scanResult.files,
+    matches,
+    remoteResult.parts,
+  );
 
   ctx.body = {
     roots: rootResult.roots,
@@ -374,7 +619,88 @@ router.get("/localUploadedFiles", async (ctx) => {
     remotePartCount: remoteResult.parts.length,
     truncated: scanResult.truncated,
     matches,
+    unuploadedGroups,
     errors: [...rootResult.errors, ...scanResult.errors, ...remoteResult.errors],
+  };
+});
+
+router.post("/uploadLocalUnuploaded", async (ctx) => {
+  const data = ctx.request.body as {
+    groups?: Array<
+      Pick<
+        LocalUploadOptions,
+        "roomId" | "platform" | "username" | "title" | "startTime" | "aid" | "files"
+      > & {
+        uploadMode?: "auto" | "new" | "append";
+      }
+    >;
+    options?: {
+      burnDanmu?: boolean;
+      uploadRawWhenNoDanmu?: boolean;
+      mergeSegments?: boolean;
+    };
+  };
+
+  if (!data.groups?.length) {
+    ctx.body = "groups required";
+    ctx.status = 400;
+    return;
+  }
+
+  const items: Array<{
+    roomId: string;
+    title?: string;
+    status: "queued" | "skipped";
+    reason?: string;
+  }> = [];
+
+  for (const group of data.groups) {
+    if (!group.roomId) {
+      items.push({
+        roomId: "",
+        title: group.title,
+        status: "skipped",
+        reason: "missing roomId",
+      });
+      continue;
+    }
+    if (!group.files?.length) {
+      items.push({
+        roomId: group.roomId,
+        title: group.title,
+        status: "skipped",
+        reason: "missing files",
+      });
+      continue;
+    }
+
+    const uploadOptions: LocalUploadOptions = {
+      roomId: group.roomId,
+      platform: group.platform,
+      username: group.username,
+      title: group.title,
+      startTime: group.startTime,
+      aid: group.aid,
+      uploadMode: group.uploadMode ?? "auto",
+      burnDanmu: data.options?.burnDanmu ?? false,
+      uploadRawWhenNoDanmu: data.options?.uploadRawWhenNoDanmu ?? true,
+      mergeSegments: data.options?.mergeSegments ?? false,
+      files: group.files,
+    };
+
+    handler.uploadLocalFiles(uploadOptions).catch((error) => {
+      console.error("uploadLocalUnuploaded failed", error);
+    });
+    items.push({
+      roomId: group.roomId,
+      title: group.title,
+      status: "queued",
+    });
+  }
+
+  ctx.body = {
+    status: "success",
+    items,
   };
 });
 

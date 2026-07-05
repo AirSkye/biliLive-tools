@@ -1265,6 +1265,102 @@ export const checkMergeVideos = async (
   };
 };
 
+const createMergeVideosTask = async (
+  inputFiles: string[],
+  outputFile: string,
+  options: VideoMergeOptions,
+) => {
+  if (!inputFiles || inputFiles.length < 2) {
+    throw new Error("inputVideos length must be greater than 1");
+  }
+
+  await setFfmpegPath();
+
+  const fileTxtContent = inputFiles.map((videoFile) => `file '${videoFile}'`).join("\n");
+  let fileTxtPath = "";
+  const createCommand = async () => {
+    await setFfmpegPath();
+    fileTxtPath = join(getTempPath(), `${uuid()}.txt`);
+    await fs.writeFile(fileTxtPath, fileTxtContent);
+
+    const command = ffmpeg(fileTxtPath).inputOptions("-f concat").inputOptions("-safe 0");
+    if (options.keepFirstVideoMeta) {
+      command.input(inputFiles[0]).outputOptions(`-map_metadata 1`);
+      if (!options.transcode) {
+        command.outputOptions("-map 0");
+      }
+    }
+    if (options.transcode) {
+      const ffmpegParams = genFfmpegParams({
+        encoder: "libx264",
+        bitrateControl: "CRF",
+        crf: 23,
+        preset: "veryfast",
+        audioCodec: "aac",
+        extraOptions: "-movflags +faststart",
+      });
+      ffmpegParams.forEach((param) => {
+        command.outputOptions(param);
+      });
+    } else {
+      command.outputOptions("-c copy");
+    }
+    command.output(outputFile);
+    return command;
+  };
+  const command = await createCommand();
+
+  let duration = 1;
+  let videoMetas: Awaited<ReturnType<typeof readVideoMeta>>[] = [];
+  try {
+    videoMetas = await Promise.all(inputFiles.map((file) => readVideoMeta(file)));
+    duration = sumBy(videoMetas, (meta) => Number(meta?.format?.duration ?? 0));
+  } catch (error) {
+    log.error("mergeVideos, read video meta error", error);
+  }
+  if (!duration) {
+    log.error("mergeVideos, read video meta duration error", videoMetas);
+    duration = 1;
+  }
+
+  return new FFmpegTask(
+    command,
+    {
+      output: outputFile,
+      name: `合并视频任务: ${path.dirname(inputFiles[0])} 等文件`,
+    },
+    {
+      onProgress(progress) {
+        const currentTime = timemarkToSeconds(progress.timemark);
+
+        return { ...progress, percentage: Math.round((currentTime / duration) * 100) };
+      },
+      onEnd: async () => {
+        await fs.remove(fileTxtPath);
+        if (options.removeOrigin) {
+          await Promise.all(inputFiles.map((videoInput) => trashItem(videoInput)));
+        }
+      },
+      onError: async () => {
+        await fs.remove(fileTxtPath);
+      },
+    },
+    {
+      commandFactory: createCommand,
+    },
+  );
+};
+
+export const mergeVideosToFile = async (
+  inputFiles: string[],
+  options: VideoMergeOptions & { output: string },
+) => {
+  const task = await createMergeVideosTask(inputFiles, options.output, options);
+
+  taskQueue.addTask(task, false);
+  return task;
+};
+
 /**
  * 合并视频
  * @param inputFiles 输入文件
@@ -1306,9 +1402,27 @@ export const mergeVideos = async (
 
     const command = ffmpeg(fileTxtPath).inputOptions("-f concat").inputOptions("-safe 0");
     if (options.keepFirstVideoMeta) {
-      command.input(inputFiles[0]).outputOptions("-map 0").outputOptions(`-map_metadata 1`);
+      command.input(inputFiles[0]).outputOptions(`-map_metadata 1`);
+      if (!options.transcode) {
+        command.outputOptions("-map 0");
+      }
     }
-    command.outputOptions("-c copy").output(outputFile);
+    if (options.transcode) {
+      const ffmpegParams = genFfmpegParams({
+        encoder: "libx264",
+        bitrateControl: "CRF",
+        crf: 23,
+        preset: "veryfast",
+        audioCodec: "aac",
+        extraOptions: "-movflags +faststart",
+      });
+      ffmpegParams.forEach((param) => {
+        command.outputOptions(param);
+      });
+    } else {
+      command.outputOptions("-c copy");
+    }
+    command.output(outputFile);
     return command;
   };
   const command = await createCommand();

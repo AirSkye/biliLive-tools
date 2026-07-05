@@ -864,6 +864,7 @@ export interface Video2Mp4Options {
 
 export interface VideoMergeOptions {
   output?: string;
+  transcode?: boolean;
   removeOrigin: boolean; // 完成后移除源文件
   saveOriginPath: boolean; // 保存到原始文件夹
   keepFirstVideoMeta: boolean; // 保留第一个视频元数据

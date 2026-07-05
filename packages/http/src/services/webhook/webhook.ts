@@ -4,8 +4,14 @@ import fs from "fs-extra";
 import { FFmpegPreset, VideoPreset, DanmuPreset } from "@biliLive-tools/shared";
 import { DEFAULT_BILIUP_CONFIG } from "@biliLive-tools/shared/presets/videoPreset.js";
 import { biliApi } from "@biliLive-tools/shared/task/bili.js";
-import { isEmptyDanmu, convertXml2Ass } from "@biliLive-tools/shared/task/danmu.js";
-import { transcode, burn, analyzeResolutionChanges } from "@biliLive-tools/shared/task/video.js";
+import { isEmptyDanmu, convertXml2Ass, mergeXml } from "@biliLive-tools/shared/task/danmu.js";
+import {
+  transcode,
+  burn,
+  analyzeResolutionChanges,
+  checkMergeVideos,
+  mergeVideosToFile,
+} from "@biliLive-tools/shared/task/video.js";
 import { flvRepair } from "@biliLive-tools/shared/task/flvRepair.js";
 import log from "@biliLive-tools/shared/utils/log.js";
 import {
@@ -15,6 +21,8 @@ import {
   formatTitle,
   formatPartTitle,
   buildRoomLink,
+  getUnusedFileName,
+  replaceExtName,
 } from "@biliLive-tools/shared/utils/index.js";
 
 import { config } from "../../index.js";
@@ -46,16 +54,52 @@ type UploadFileItem = {
   path: string;
   title: string;
   type: "raw" | "handled";
+  cleanupPaths?: string[];
 };
 
 type RuntimePart = Part & {
   handledCid?: number;
   rawCid?: number;
+  cleanupPaths?: string[];
 };
 
 type SortParamItem = {
   filePath: string;
   cid?: number;
+};
+
+export type LocalUploadFileInput = {
+  path: string;
+  title?: string;
+  startTime?: number;
+  endTime?: number;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
+};
+
+export type LocalUploadOptions = {
+  roomId: string;
+  platform?: Platform;
+  username?: string;
+  title?: string;
+  startTime?: number;
+  aid?: number;
+  uploadMode?: "auto" | "new" | "append";
+  burnDanmu?: boolean;
+  uploadRawWhenNoDanmu?: boolean;
+  mergeSegments?: boolean;
+  files: LocalUploadFileInput[];
+};
+
+type PreparedLocalUploadPart = {
+  path: string;
+  title: string;
+  startTime?: number;
+  endTime?: number;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
+  cleanupPaths: string[];
+  warnings: string[];
 };
 
 const SAME_MEDIA_UPLOAD_ORDER: Array<"handled" | "raw"> = ["handled", "raw"];
@@ -77,6 +121,258 @@ export class WebhookHandler {
   get liveData(): Live[] {
     return this.liveManager.liveData;
   }
+
+  private waitForTaskOutput(task: any): Promise<string> {
+    if (task.status === "completed" && task.output) {
+      return Promise.resolve(task.output as string);
+    }
+    if (task.status === "error" || task.status === "canceled") {
+      return Promise.reject(new Error(task.error || "Task failed"));
+    }
+
+    return new Promise((resolve, reject) => {
+      task.on("task-end", () => {
+        resolve(task.output as string);
+      });
+      task.on("task-error", ({ error }: { error?: string }) => {
+        reject(new Error(error || "Task failed"));
+      });
+      task.on("task-cancel", () => {
+        reject(new Error("Task cancelled"));
+      });
+    });
+  }
+
+  private sortLocalUploadFiles(files: LocalUploadFileInput[]) {
+    return [...files].sort((left, right) => {
+      const leftTime = left.startTime ?? 0;
+      const rightTime = right.startTime ?? 0;
+      if (leftTime !== rightTime) return leftTime - rightTime;
+      return left.path.localeCompare(right.path);
+    });
+  }
+
+  private async resolveLocalDanmuPath(file: LocalUploadFileInput, xmlOnly = false) {
+    const candidates = xmlOnly
+      ? [file.xmlDanmuPath, replaceExtName(file.path, ".xml")]
+      : [
+          file.danmuPath,
+          file.xmlDanmuPath,
+          replaceExtName(file.path, ".ass"),
+          replaceExtName(file.path, ".xml"),
+        ];
+
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      if (await fs.pathExists(candidate)) return candidate;
+    }
+    return undefined;
+  }
+
+  private async buildMergedLocalUploadPart(
+    files: LocalUploadFileInput[],
+  ): Promise<PreparedLocalUploadPart> {
+    const sortedFiles = this.sortLocalUploadFiles(files);
+    const inputFiles = sortedFiles.map((item) => item.path);
+    const firstFile = path.parse(inputFiles[0]);
+    const output = await getUnusedFileName(path.join(firstFile.dir, `${firstFile.name}-合并.mp4`));
+    const checkResult = await checkMergeVideos(inputFiles);
+    const warnings = [...checkResult.warnings];
+    if (checkResult.errors.length > 0) {
+      warnings.push(`检测到编码或分辨率不一致，已切换为兼容转码合并：${checkResult.errors.join("；")}`);
+    }
+
+    const task = await mergeVideosToFile(inputFiles, {
+      output,
+      removeOrigin: false,
+      saveOriginPath: false,
+      keepFirstVideoMeta: true,
+      transcode: checkResult.errors.length > 0,
+    });
+    const mergedVideo = await this.waitForTaskOutput(task);
+
+    let mergedDanmu: string | undefined;
+    const xmlInputs: { videoPath: string; danmakuPath: string }[] = [];
+    for (const file of sortedFiles) {
+      const xmlPath = await this.resolveLocalDanmuPath(file, true);
+      if (!xmlPath) {
+        warnings.push(`未找到 ${path.basename(file.path)} 对应的 XML 弹幕，合并后将无法压制合并弹幕`);
+        xmlInputs.length = 0;
+        break;
+      }
+      xmlInputs.push({ videoPath: file.path, danmakuPath: xmlPath });
+    }
+
+    if (xmlInputs.length === sortedFiles.length) {
+      mergedDanmu = await mergeXml(xmlInputs, {
+        output: replaceExtName(mergedVideo, ".xml"),
+        saveMeta: true,
+      });
+    }
+
+    return {
+      path: mergedVideo,
+      title: sortedFiles[0].title || path.parse(sortedFiles[0].path).name,
+      startTime: sortedFiles[0].startTime,
+      endTime: sortedFiles[sortedFiles.length - 1].endTime,
+      danmuPath: mergedDanmu,
+      xmlDanmuPath: mergedDanmu,
+      cleanupPaths: inputFiles,
+      warnings,
+    };
+  }
+
+  private async buildLocalUploadParts(
+    options: LocalUploadOptions,
+  ): Promise<PreparedLocalUploadPart[]> {
+    const sortedFiles = this.sortLocalUploadFiles(options.files);
+    const shouldMerge =
+      options.mergeSegments &&
+      sortedFiles.length > 1 &&
+      sortedFiles.every((file) => path.extname(file.path).toLowerCase() === ".flv");
+    if (shouldMerge) {
+      return [await this.buildMergedLocalUploadPart(sortedFiles)];
+    }
+
+    const parts: PreparedLocalUploadPart[] = [];
+    for (const file of sortedFiles) {
+      parts.push({
+        path: file.path,
+        title: file.title || path.parse(file.path).name,
+        startTime: file.startTime,
+        endTime: file.endTime,
+        danmuPath: file.danmuPath || (await this.resolveLocalDanmuPath(file)),
+        xmlDanmuPath: file.xmlDanmuPath || (await this.resolveLocalDanmuPath(file, true)),
+        cleanupPaths: [],
+        warnings: [],
+      });
+    }
+    return parts;
+  }
+
+  private async burnLocalUploadPart(
+    part: PreparedLocalUploadPart,
+    config: RoomConfig,
+  ): Promise<string> {
+    const danmuPath = part.danmuPath || part.xmlDanmuPath;
+    if (!danmuPath || !(await fs.pathExists(danmuPath))) {
+      throw new Error("未找到对应弹幕文件");
+    }
+    if (danmuPath.endsWith(".xml") && (await isEmptyDanmu(danmuPath))) {
+      throw new Error("弹幕文件为空");
+    }
+    if (!config.danmuPresetId || !config.videoPresetId) {
+      throw new Error("房间未配置弹幕预设或视频压制预设");
+    }
+
+    const danmuConfig = await this.danmuPreset.get(config.danmuPresetId);
+    const ffmpegPreset = await this.ffmpegPreset.get(config.videoPresetId);
+    if (!danmuConfig || !ffmpegPreset) {
+      throw new Error("无法读取弹幕预设或视频压制预设");
+    }
+
+    return this.burn(
+      {
+        videoFilePath: part.path,
+        subtitleFilePath: danmuPath,
+      },
+      {
+        danmaOptions: danmuConfig.config,
+        ffmpegOptions: ffmpegPreset.config,
+        hasHotProgress: config.hotProgress,
+        hotProgressOptions: {
+          interval: config.hotProgressSample || 30,
+          color: config.hotProgressColor || "#f9f5f3",
+          fillColor: config.hotProgressFillColor || "#333333",
+          height: config.hotProgressHeight || 60,
+        },
+        removeVideo: false,
+        removeDanmu: false,
+        limitTime: config.videoHandleTime,
+      },
+    );
+  }
+
+  uploadLocalFiles = async (options: LocalUploadOptions) => {
+    if (!options.files.length) {
+      throw new Error("files is required");
+    }
+
+    const config = this.configManager.getConfig(options.roomId);
+    if (!config.uid) {
+      throw new Error("房间未配置 webhook 上传账号");
+    }
+
+    for (const file of options.files) {
+      if (!(await fs.pathExists(file.path))) {
+        throw new Error(`本地文件不存在：${file.path}`);
+      }
+    }
+
+    const preparedParts = await this.buildLocalUploadParts(options);
+    const appendAid =
+      options.uploadMode === "append" || (options.uploadMode !== "new" && options.aid)
+        ? options.aid
+        : undefined;
+    const live = new Live({
+      platform: options.platform || "custom",
+      software: "local-upload",
+      roomId: options.roomId,
+      title: options.title || preparedParts[0]?.title || "local upload",
+      username: options.username || "unknown",
+      startTime: options.startTime ?? preparedParts[0]?.startTime ?? Date.now(),
+      aid: appendAid,
+    });
+
+    const warnings: string[] = [];
+    const uploadRawWhenNoDanmu = options.uploadRawWhenNoDanmu ?? true;
+
+    for (const preparedPart of preparedParts) {
+      warnings.push(...preparedPart.warnings);
+      let uploadPath = preparedPart.path;
+      if (options.burnDanmu) {
+        try {
+          uploadPath = await this.burnLocalUploadPart(preparedPart, config);
+        } catch (error) {
+          if (!uploadRawWhenNoDanmu) {
+            warnings.push(`${path.basename(preparedPart.path)} 跳过：${String(error)}`);
+            continue;
+          }
+          warnings.push(`${path.basename(preparedPart.path)} 未压制弹幕，改为直接上传原视频：${String(error)}`);
+        }
+      }
+
+      const cleanupPaths =
+        uploadPath === preparedPart.path
+          ? preparedPart.cleanupPaths
+          : [preparedPart.path, ...preparedPart.cleanupPaths];
+      const part = live.addPart({
+        filePath: uploadPath,
+        rawFilePath: uploadPath,
+        recordStatus: "handled",
+        uploadStatus: "pending",
+        rawUploadStatus: "uploaded",
+        title: preparedPart.title,
+        startTime: preparedPart.startTime,
+        endTime: preparedPart.endTime,
+      });
+      this.setPartCleanupPaths(part, cleanupPaths);
+      this.registerUploadCleanupRefs([uploadPath, ...cleanupPaths], config);
+    }
+
+    if (live.parts.length === 0) {
+      throw new Error(warnings.join("；") || "没有可上传的本地文件");
+    }
+
+    this.liveManager.addLive(live);
+    await this.uploadVideoByType(live, "handled");
+
+    return {
+      eventId: live.eventId,
+      aid: live.aid,
+      warnings,
+    };
+  };
 
   /**
    * 设置 liveData 数组（向后兼容）
@@ -946,6 +1242,41 @@ export class WebhookHandler {
     return type === "handled" ? runtimePart.handledCid : runtimePart.rawCid;
   }
 
+  private setPartCleanupPaths(part: Part, paths: string[]) {
+    const runtimePart = this.getRuntimePart(part);
+    runtimePart.cleanupPaths = Array.from(new Set(paths.filter(Boolean)));
+  }
+
+  private getPartCleanupPaths(part: Part, uploadPath: string): string[] {
+    const runtimePart = this.getRuntimePart(part);
+    return (runtimePart.cleanupPaths ?? []).filter((item) => item !== uploadPath);
+  }
+
+  private getUploadReleasePaths(uploadedItems: UploadFileItem[]) {
+    const paths = new Set<string>();
+    for (const item of uploadedItems) {
+      paths.add(item.path);
+      for (const cleanupPath of item.cleanupPaths ?? []) {
+        paths.add(cleanupPath);
+      }
+    }
+    return Array.from(paths);
+  }
+
+  private registerUploadCleanupRefs(paths: string[], config: RoomConfig) {
+    const shouldRemove =
+      config.afterUploadDeletAction === "delete" ||
+      config.afterUploadDeletAction === "deleteAfterCheck";
+    if (!shouldRemove) return;
+
+    for (const filePath of Array.from(new Set(paths.filter(Boolean)))) {
+      this.fileRefManager.addRef(filePath, true);
+      if (config.afterUploadDeletAction === "deleteAfterCheck") {
+        this.fileRefManager.addRef(filePath, true);
+      }
+    }
+  }
+
   private toPathArray(items: UploadFileItem[]): { path: string; title: string }[] {
     return items.map((item) => ({
       path: item.path,
@@ -960,6 +1291,7 @@ export class WebhookHandler {
     return filePaths.map((item) => ({
       ...item,
       type,
+      cleanupPaths: this.getPartCleanupPaths(item.part, item.path),
     }));
   }
 
@@ -1006,8 +1338,8 @@ export class WebhookHandler {
           this.writeUploadResultToParts(uploadedItems, data);
 
           // 释放所有文件的引用
-          for (const { path } of uploadedItems) {
-            await this.fileRefManager.releaseRef(path);
+          for (const filePath of this.getUploadReleasePaths(uploadedItems)) {
+            await this.fileRefManager.releaseRef(filePath);
           }
           resolve(task.output);
         },
@@ -1051,7 +1383,14 @@ export class WebhookHandler {
     afterUploadDeletAction?: "none" | "delete" | "deleteAfterCheck",
   ) => {
     const pathArray = this.toPathArray(uploadedItems);
-    const checkCallback = this.setupDeleteAfterCheckLock(pathArray, afterUploadDeletAction);
+    const cleanupPathArray = this.getUploadReleasePaths(uploadedItems).map((filePath) => ({
+      path: filePath,
+      title: filePath,
+    }));
+    const checkCallback = this.setupDeleteAfterCheckLock(
+      cleanupPathArray,
+      afterUploadDeletAction,
+    );
 
     // console.log("upload", pathArray);
 
@@ -1075,7 +1414,14 @@ export class WebhookHandler {
     sortParams?: SortParamItem[],
   ) => {
     const pathArray = this.toPathArray(uploadedItems);
-    const checkCallback = this.setupDeleteAfterCheckLock(pathArray, afterUploadDeletAction);
+    const cleanupPathArray = this.getUploadReleasePaths(uploadedItems).map((filePath) => ({
+      path: filePath,
+      title: filePath,
+    }));
+    const checkCallback = this.setupDeleteAfterCheckLock(
+      cleanupPathArray,
+      afterUploadDeletAction,
+    );
 
     // console.log("sortParams111111111", sortParams, pathArray);
     // 参数sortParams: array<{filePath:string;cid?:number}>，表示按照 filePath 对历史分P和当前上传文件统一排序
@@ -1248,6 +1594,7 @@ export class WebhookHandler {
           path: item.path,
           title: baseTitle,
           type: item.type,
+          cleanupPaths: this.getPartCleanupPaths(part, item.path),
         });
 
         if (!cover) {
