@@ -4,6 +4,7 @@ import { omit } from "lodash-es";
 import path from "node:path";
 
 import { biliApi, validateBiliupConfig } from "@biliLive-tools/shared/task/bili.js";
+import { parseMeta } from "@biliLive-tools/shared/task/video.js";
 import { recordHistoryService, streamerService } from "@biliLive-tools/shared/db/index.js";
 import { TvQrcodeLogin } from "@renmu/bili-api";
 import {
@@ -25,6 +26,7 @@ const router = new Router({
 
 const VIDEO_EXTENSIONS = new Set([".mp4", ".flv", ".ts", ".mkv", ".webm", ".m4v", ".mov"]);
 const MAX_SCAN_FILES = 20000;
+const DEFAULT_WEBHOOK_ROOM_ID = "__global__";
 
 type LocalVideoFile = {
   localPath: string;
@@ -112,6 +114,14 @@ type LocalFileContext = {
   endTime?: number;
   danmuPath?: string;
   xmlDanmuPath?: string;
+};
+
+type ParsedLocalMetadata = {
+  roomId?: string;
+  platform?: string;
+  username?: string;
+  title?: string;
+  startTime?: number;
 };
 
 const getQueryValue = (value: unknown) => {
@@ -223,11 +233,15 @@ const scanVideoFiles = async (roots: string[]) => {
 const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: number) => {
   const archives = new Map<number, any>();
   const errors: string[] = [];
+  const warnings: string[] = [];
+  const logs: string[] = [];
 
   for (let pn = 1; pn <= pages; pn++) {
     try {
       const data = await biliApi.getArchives({ pn, ps: pageSize }, uid);
-      for (const item of data?.arc_audits ?? []) {
+      const pageItems = data?.arc_audits ?? [];
+      logs.push(`已读取B站稿件列表第 ${pn} 页：${pageItems.length} 条`);
+      for (const item of pageItems) {
         const aid = Number(item?.Archive?.aid);
         if (aid) archives.set(aid, item);
       }
@@ -235,6 +249,7 @@ const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: num
       if (total > 0 && pn * pageSize >= total) break;
     } catch (error) {
       errors.push(`获取稿件列表第 ${pn} 页失败`);
+      logs.push(`获取B站稿件列表第 ${pn} 页失败，检测已停止继续拉取远端列表`);
       break;
     }
   }
@@ -245,7 +260,8 @@ const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: num
     try {
       detail = await biliApi.getPlatformArchiveDetail(aid, uid);
     } catch (error) {
-      errors.push(`获取稿件详情失败：${aid}`);
+      warnings.push(`稿件详情接口不可用，已使用列表信息继续匹配：${aid}`);
+      logs.push(`稿件 ${aid} 详情接口不可用，已使用列表信息继续匹配`);
     }
 
     const archive = detail?.archive ?? item?.Archive ?? {};
@@ -286,7 +302,7 @@ const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: num
     }
   }
 
-  return { parts, archiveCount: archives.size, errors };
+  return { parts, archiveCount: archives.size, errors, warnings, logs };
 };
 
 const matchLocalFile = (localFile: LocalVideoFile, remotePart: RemoteVideoPart) => {
@@ -318,8 +334,40 @@ const normalizeLocalPath = (filePath: string) => {
   return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 };
 
+const normalizeRecordStem = (value?: string | null) => {
+  return normalizeMatchText(value)
+    .replace(/寮瑰箷鐗?[\da-f-]*$/i, "")
+    .replace(/弹幕版[\da-f-]*$/i, "")
+    .replace(/鍚庡鐞?$/i, "")
+    .replace(/后处理$/i, "")
+    .replace(/鍚堝苟$/i, "")
+    .replace(/合并$/i, "");
+};
+
+const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
+  const match = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
+  if (!match) return {};
+
+  const [, roomId, date, time, title] = match;
+  const year = Number(date.slice(0, 4));
+  const month = Number(date.slice(4, 6));
+  const day = Number(date.slice(6, 8));
+  const hour = Number(time.slice(0, 2));
+  const minute = Number(time.slice(2, 4));
+  const second = Number(time.slice(4, 6));
+  const startTime = new Date(year, month - 1, day, hour, minute, second).getTime();
+
+  return {
+    roomId,
+    platform: "bilibili",
+    title,
+    startTime: Number.isFinite(startTime) ? startTime : undefined,
+  };
+};
+
 const buildRecordLookup = () => {
-  const map = new Map<string, RecordWithStreamer>();
+  const pathMap = new Map<string, RecordWithStreamer>();
+  const stemMap = new Map<string, RecordWithStreamer[]>();
   const streamers = new Map<number, Streamer>();
   for (const streamer of streamerService.list()) {
     streamers.set(streamer.id, streamer);
@@ -331,11 +379,22 @@ const buildRecordLookup = () => {
       ...record,
       streamer: streamers.get(record.streamer_id) ?? null,
     };
-    map.set(normalizeLocalPath(record.video_file), item);
-    map.set(normalizeLocalPath(replaceExtName(record.video_file, ".mp4")), item);
+    pathMap.set(normalizeLocalPath(record.video_file), item);
+    pathMap.set(normalizeLocalPath(replaceExtName(record.video_file, ".mp4")), item);
+
+    const stems = new Set([
+      normalizeRecordStem(record.video_filename),
+      normalizeRecordStem(path.parse(record.video_file).name),
+    ]);
+    for (const stem of stems) {
+      if (!stem) continue;
+      const records = stemMap.get(stem) ?? [];
+      records.push(item);
+      stemMap.set(stem, records);
+    }
   }
 
-  return map;
+  return { pathMap, stemMap };
 };
 
 const findDanmuFiles = async (videoPath: string) => {
@@ -350,36 +409,86 @@ const findDanmuFiles = async (videoPath: string) => {
   };
 };
 
+const findRecordByLocalFile = (
+  localFile: LocalVideoFile,
+  recordLookup: ReturnType<typeof buildRecordLookup>,
+) => {
+  const byPath = recordLookup.pathMap.get(normalizeLocalPath(localFile.localPath));
+  if (byPath) return byPath;
+
+  const records = recordLookup.stemMap.get(normalizeRecordStem(localFile.stem)) ?? [];
+  return records.length === 1 ? records[0] : null;
+};
+
+const parseLocalFileMetadata = async (
+  localFile: LocalVideoFile,
+  danmuFiles: { danmuPath?: string; xmlDanmuPath?: string },
+): Promise<ParsedLocalMetadata> => {
+  const fromName = parseRecorderFileName(localFile.stem);
+
+  try {
+    const danmaFilePath = danmuFiles.xmlDanmuPath || danmuFiles.danmuPath;
+    const shouldReadVideoMeta = !fromName.roomId && !danmaFilePath;
+    const meta = await parseMeta({
+      videoFilePath: shouldReadVideoMeta ? localFile.localPath : undefined,
+      danmaFilePath,
+    });
+
+    return {
+      roomId: meta.roomId || fromName.roomId,
+      platform: meta.platform && meta.platform !== "unknown" ? meta.platform : fromName.platform,
+      username: meta.username || fromName.username,
+      title: meta.title || fromName.title,
+      startTime: meta.startTimestamp ? meta.startTimestamp * 1000 : fromName.startTime,
+    };
+  } catch {
+    return fromName;
+  }
+};
+
 const buildLocalFileContexts = async (
   localFiles: LocalVideoFile[],
   matches: LocalUploadedFileMatch[],
 ) => {
   const recordLookup = buildRecordLookup();
   const matchMap = new Map(matches.map((item) => [normalizeLocalPath(item.localPath), item]));
+  const streamerByRoomId = new Map<string, Streamer>();
+  for (const streamer of streamerService.list()) {
+    streamerByRoomId.set(streamer.room_id, streamer);
+  }
   const contexts: LocalFileContext[] = [];
 
   for (const localFile of localFiles) {
     const normalizedPath = normalizeLocalPath(localFile.localPath);
-    const record = recordLookup.get(normalizedPath) ?? null;
-    const streamer = record?.streamer ?? null;
-    const startTime = record?.record_start_time ?? localFile.mtimeMs;
+    const danmuFiles = await findDanmuFiles(localFile.localPath);
+    const record = findRecordByLocalFile(localFile, recordLookup);
+    const metadata =
+      record && record.streamer && record.title
+        ? {}
+        : await parseLocalFileMetadata(localFile, danmuFiles);
+    const roomId = record?.streamer?.room_id ?? metadata.roomId;
+    const streamer = record?.streamer ?? (roomId ? streamerByRoomId.get(roomId) : null) ?? null;
+    const platform = streamer?.platform ?? metadata.platform ?? (roomId ? "bilibili" : undefined);
+    const username = streamer?.name ?? metadata.username;
+    const title = record?.title || metadata.title || localFile.stem;
+    const startTime = record?.record_start_time ?? metadata.startTime ?? localFile.mtimeMs;
     const parentDir = path.dirname(localFile.localPath);
     const fallbackDay = new Date(localFile.mtimeMs).toISOString().slice(0, 10);
+    const dayKey = new Date(startTime).toISOString().slice(0, 10);
     const groupKey =
-      record && streamer
-        ? `${streamer.platform}:${streamer.room_id}:${record.live_id || record.live_start_time || record.title}`
+      roomId
+        ? `${platform || "bilibili"}:${roomId}:${record?.live_id || `${dayKey}:${normalizeMatchText(title)}`}`
         : `dir:${normalizeLocalPath(parentDir)}:${fallbackDay}`;
-    const danmuFiles = await findDanmuFiles(localFile.localPath);
 
     contexts.push({
       localFile,
       record,
       match: matchMap.get(normalizedPath),
       groupKey,
-      roomId: streamer?.room_id,
-      platform: streamer?.platform,
-      username: streamer?.name,
-      title: record?.title || localFile.stem,
+      roomId,
+      platform,
+      username,
+      title,
       startTime,
       endTime: record?.record_end_time,
       ...danmuFiles,
@@ -390,9 +499,8 @@ const buildLocalFileContexts = async (
 };
 
 const hasWebhookUploadConfig = (roomId?: string) => {
-  if (!roomId) return false;
   try {
-    const config = handler.configManager.getConfig(roomId);
+    const config = handler.configManager.getConfig(roomId || DEFAULT_WEBHOOK_ROOM_ID);
     return !!config.uid && !!config.uploadPresetId;
   } catch {
     return false;
@@ -611,6 +719,16 @@ router.get("/localUploadedFiles", async (ctx) => {
     matches,
     remoteResult.parts,
   );
+  const logs = [
+    `扫描目录：${rootResult.roots.join("；") || "未找到可扫描目录"}`,
+    `本地视频扫描完成：${scanResult.files.length} 个视频文件`,
+    ...remoteResult.logs,
+    `B站稿件读取完成：${remoteResult.archiveCount} 个稿件，${remoteResult.parts.length} 个可匹配项`,
+    `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+  ];
+  if (scanResult.truncated) {
+    logs.push(`本地视频数量达到扫描上限 ${MAX_SCAN_FILES}，结果可能不完整`);
+  }
 
   ctx.body = {
     roots: rootResult.roots,
@@ -621,6 +739,8 @@ router.get("/localUploadedFiles", async (ctx) => {
     matches,
     unuploadedGroups,
     errors: [...rootResult.errors, ...scanResult.errors, ...remoteResult.errors],
+    warnings: remoteResult.warnings,
+    logs,
   };
 });
 

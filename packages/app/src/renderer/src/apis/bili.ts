@@ -88,6 +88,8 @@ export type LocalUploadedFilesResult = {
   matches: LocalUploadedFileMatch[];
   unuploadedGroups: LocalUnuploadedGroup[];
   errors: string[];
+  warnings: string[];
+  logs: string[];
 };
 
 export type LocalUploadCandidateFile = {

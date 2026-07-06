@@ -64,7 +64,30 @@
       >
         {{ localUploadedFilesResult.errors.slice(0, 3).join("；") }}
       </n-alert>
-      <n-tabs type="line" animated>
+      <n-alert
+        v-if="localUploadedFilesResult?.warnings?.length"
+        type="info"
+        style="margin-bottom: 12px"
+      >
+        {{ (localUploadedFilesResult.warnings ?? []).slice(0, 5).join("；") }}
+      </n-alert>
+      <div v-if="localDetectLogs.length" class="detect-log">
+        <div
+          v-for="(item, index) in localDetectLogs"
+          :key="index"
+          class="detect-log__line"
+        >
+          {{ item }}
+        </div>
+      </div>
+      <div
+        v-if="detectingLocalUploadedFiles && !localUploadedFilesResult"
+        class="detect-loading"
+      >
+        <n-spin size="small" />
+        <span>检测中...</span>
+      </div>
+      <n-tabs v-if="localUploadedFilesResult" type="line" animated>
         <n-tab-pane name="uploaded" tab="已上传未删除">
           <n-empty
             v-if="localUploadedRows.length === 0"
@@ -80,6 +103,17 @@
         </n-tab-pane>
         <n-tab-pane name="unuploaded" tab="本地未上传">
           <div class="local-upload-toolbar">
+            <n-input
+              v-model:value="localUnuploadedSearchKeyword"
+              clearable
+              placeholder="搜索标题、主播、房间号或文件名"
+              style="width: 260px"
+            />
+            <n-select
+              v-model:value="localUnuploadedSortKey"
+              :options="localUnuploadedSortOptions"
+              style="width: 180px"
+            />
             <n-checkbox v-model:checked="localUploadOptions.burnDanmu">压制对应弹幕</n-checkbox>
             <n-checkbox v-model:checked="localUploadOptions.uploadRawWhenNoDanmu">
               弹幕不存在时上传原视频
@@ -270,8 +304,45 @@ const clear = () => {
 const localUploadedFilesVisible = ref(false);
 const detectingLocalUploadedFiles = ref(false);
 const localUploadedFilesResult = ref<LocalUploadedFilesResult | null>(null);
+const localDetectLogs = ref<string[]>([]);
 const localUploadedRows = computed(() => localUploadedFilesResult.value?.matches ?? []);
-const localUnuploadedRows = computed(() => localUploadedFilesResult.value?.unuploadedGroups ?? []);
+type LocalUnuploadedSortKey =
+  | "startTimeDesc"
+  | "startTimeAsc"
+  | "fileCountDesc"
+  | "fileCountAsc"
+  | "totalSizeDesc"
+  | "totalSizeAsc";
+const localUnuploadedSearchKeyword = ref("");
+const localUnuploadedSortKey = ref<LocalUnuploadedSortKey>("startTimeDesc");
+const localUnuploadedSortOptions = [
+  { label: "时间从新到旧", value: "startTimeDesc" },
+  { label: "时间从旧到新", value: "startTimeAsc" },
+  { label: "文件数量从多到少", value: "fileCountDesc" },
+  { label: "文件数量从少到多", value: "fileCountAsc" },
+  { label: "总大小从大到小", value: "totalSizeDesc" },
+  { label: "总大小从小到大", value: "totalSizeAsc" },
+];
+const localUnuploadedRows = computed(() => {
+  const keyword = localUnuploadedSearchKeyword.value.trim().toLowerCase();
+  const rows = [...(localUploadedFilesResult.value?.unuploadedGroups ?? [])].filter((row) => {
+    if (!keyword) return true;
+    return [row.title, row.username, row.roomId, ...row.files.map((file) => file.fileName)]
+      .filter(Boolean)
+      .some((value) => String(value).toLowerCase().includes(keyword));
+  });
+
+  const direction = localUnuploadedSortKey.value.endsWith("Asc") ? 1 : -1;
+  const key = localUnuploadedSortKey.value.replace(/Asc|Desc$/, "") as
+    | "startTime"
+    | "fileCount"
+    | "totalSize";
+  return rows.sort((left, right) => {
+    const diff = Number(left[key] ?? 0) - Number(right[key] ?? 0);
+    if (diff !== 0) return diff * direction;
+    return right.startTime - left.startTime;
+  });
+});
 const selectedLocalUploadGroupIds = ref<DataTableRowKey[]>([]);
 const uploadingLocalUnuploaded = ref(false);
 const localUploadOptions = reactive({
@@ -280,6 +351,30 @@ const localUploadOptions = reactive({
   mergeSegments: true,
 });
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
+
+let localDetectLogTimer: number | undefined;
+const pushLocalDetectLog = (message: string) => {
+  localDetectLogs.value.push(`[${new Date().toLocaleTimeString()}] ${message}`);
+};
+const stopLocalDetectLogTimer = () => {
+  if (localDetectLogTimer === undefined) return;
+  window.clearInterval(localDetectLogTimer);
+  localDetectLogTimer = undefined;
+};
+const startLocalDetectLogTimer = () => {
+  const messages = [
+    "仍在扫描本地视频目录和读取B站稿件列表...",
+    "仍在比对文件名、稿件标题和分P信息...",
+    "检测仍在进行，视频文件较多时会稍慢...",
+  ];
+  let index = 0;
+  stopLocalDetectLogTimer();
+  localDetectLogTimer = window.setInterval(() => {
+    pushLocalDetectLog(messages[index % messages.length]);
+    index += 1;
+  }, 5000);
+};
+onBeforeUnmount(stopLocalDetectLogTimer);
 
 const formatFileSize = (size: number) => {
   if (size >= 1024 * 1024 * 1024) return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
@@ -495,19 +590,33 @@ const detectLocalUploadedFiles = async () => {
   }
 
   detectingLocalUploadedFiles.value = true;
+  localUploadedFilesVisible.value = true;
+  localUploadedFilesResult.value = null;
+  localUnuploadedSearchKeyword.value = "";
+  selectedLocalUploadGroupIds.value = [];
+  localDetectLogs.value = [];
+  pushLocalDetectLog("开始检测本地视频和B站稿件");
+  pushLocalDetectLog("正在扫描本地视频目录并拉取B站稿件列表...");
+  startLocalDetectLogTimer();
   try {
-    localUploadedFilesResult.value = await biliApi.detectLocalUploadedFiles(userInfo.value.uid!);
+    const result = await biliApi.detectLocalUploadedFiles(userInfo.value.uid!);
+    stopLocalDetectLogTimer();
+    localUploadedFilesResult.value = result;
+    for (const item of result.logs ?? []) pushLocalDetectLog(item);
+    for (const item of result.warnings ?? []) pushLocalDetectLog(`提示：${item}`);
     selectedLocalUploadGroupIds.value = localUnuploadedRows.value
       .filter((row) => row.roomId && row.hasWebhookUploadConfig)
       .map((row) => row.id);
-    localUploadedFilesVisible.value = true;
+    pushLocalDetectLog("检测完成");
   } catch (error) {
+    pushLocalDetectLog(`检测失败：${error instanceof Error ? error.message : String(error)}`);
     notice.error({
       title: "检测失败",
       content: error instanceof Error ? error.message : String(error),
       duration: 3000,
     });
   } finally {
+    stopLocalDetectLogTimer();
     detectingLocalUploadedFiles.value = false;
   }
 };
@@ -582,6 +691,32 @@ const fileChange = (files: any) => {
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
+  margin-bottom: 12px;
+  color: #666;
+}
+
+.detect-log {
+  max-height: 160px;
+  overflow: auto;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 6px;
+  background: #f8f8f8;
+  color: #555;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.detect-log__line {
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.detect-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 12px;
   color: #666;
 }
