@@ -695,6 +695,7 @@ async function addMedia(
     afterUploadDeletAction?: "none" | "delete" | "deleteAfterCheck";
     // 强制检查稿件状态
     forceCheck?: boolean;
+    checkRemovePaths?: string[];
     checkCallback?: (status: "completed" | "error") => void | Promise<void>;
   },
 ) {
@@ -746,9 +747,16 @@ async function addMedia(
           extraOptions?.afterUploadDeletAction === "deleteAfterCheck"
         ) {
           const commentQueue = container.resolve("commentQueue");
+          const removePaths =
+            extraOptions?.checkRemovePaths ??
+            (extraOptions?.afterUploadDeletAction === "deleteAfterCheck"
+              ? videos.map((video) => video.path)
+              : undefined);
           commentQueue.add({
             aid: data.aid,
             uid: uid,
+            removePaths,
+            runtimeCleanupActive: !!removePaths?.length,
           });
 
           const onUpdate = (aid: number, status: "completed" | "error", media: MediaItem) => {
@@ -854,6 +862,7 @@ export async function editMedia(
     forceCheck?: boolean;
     // 用于排序，按照列表顺序排序，cid可能为空，如果cid为空从上传分P件名中提取cid
     sortParams?: { filePath: string; cid?: number }[];
+    checkRemovePaths?: string[];
     checkCallback?: (status: "completed" | "error") => void | Promise<void>;
   },
 ) {
@@ -884,7 +893,17 @@ export async function editMedia(
           extraOptions?.afterUploadDeletAction === "deleteAfterCheck"
         ) {
           const commentQueue = container.resolve("commentQueue");
-          commentQueue.add({ aid: aid, uid });
+          const removePaths =
+            extraOptions?.checkRemovePaths ??
+            (extraOptions?.afterUploadDeletAction === "deleteAfterCheck"
+              ? videos.map((video) => video.path)
+              : undefined);
+          commentQueue.add({
+            aid: aid,
+            uid,
+            removePaths,
+            runtimeCleanupActive: !!removePaths?.length,
+          });
           const onUpdate = (
             updatedAid: number,
             status: "completed" | "error",

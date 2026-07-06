@@ -232,8 +232,11 @@ export class FFmpegTask extends AbstractTask {
         // @ts-ignore
         progress = this.callback.onProgress(progress);
       }
+      const preflightMsg = this.custsomProgressMsg?.startsWith("预计输出")
+        ? `${this.custsomProgressMsg.split(" | ")[0]} | `
+        : "";
       // @ts-ignore
-      this.custsomProgressMsg = `比特率: ${progress.currentKbps}kbits/s   速率: ${progress.speed}`;
+      this.custsomProgressMsg = `${preflightMsg}比特率: ${progress.currentKbps}kbits/s   速率: ${progress.speed}`;
       // @ts-ignore
       this.progress = progress.percentage || 0;
       this.emitter.emit("task-progress", { taskId: this.taskId });
@@ -311,7 +314,9 @@ export class FFmpegTask extends AbstractTask {
 
     this.isInterrupted = false;
     this.progress = 0;
-    this.custsomProgressMsg = "";
+    if (!this.custsomProgressMsg?.startsWith("预计输出")) {
+      this.custsomProgressMsg = "";
+    }
     this.error = undefined;
     this.startTime = 0;
     this.endTime = undefined;

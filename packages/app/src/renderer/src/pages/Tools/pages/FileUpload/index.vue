@@ -66,6 +66,9 @@
       title="已上传未删除检测"
       style="width: min(1100px, 92vw)"
       :bordered="false"
+      :mask="false"
+      :trap-focus="false"
+      :auto-focus="false"
     >
       <div v-if="localUploadedFilesResult" class="detect-summary">
         <span>扫描文件：{{ localUploadedFilesResult.scannedFileCount }}</span>
@@ -112,12 +115,35 @@
       </div>
       <n-tabs v-if="localUploadedFilesResult" type="line" animated>
         <n-tab-pane name="uploaded" tab="已上传未删除">
+          <div class="local-upload-toolbar">
+            <n-button
+              size="small"
+              type="error"
+              :loading="deletingLocalUploadedFiles"
+              :disabled="selectedLocalUploadedFileKeys.length === 0"
+              @click="deleteSelectedLocalUploadedFiles"
+            >
+              删除选中
+            </n-button>
+            <n-button
+              size="small"
+              type="error"
+              secondary
+              :loading="deletingLocalUploadedFiles"
+              :disabled="localUploadedRows.length === 0"
+              @click="deleteAllLocalUploadedFiles"
+            >
+              一键删除
+            </n-button>
+          </div>
           <n-empty
             v-if="localUploadedRows.length === 0"
             description="没有检测到疑似残留文件"
           />
           <n-data-table
             v-else
+            v-model:checked-row-keys="selectedLocalUploadedFileKeys"
+            :row-key="getLocalUploadedRowKey"
             :columns="localUploadedColumns"
             :data="localUploadedRows"
             :pagination="{ pageSize: 8 }"
@@ -181,9 +207,9 @@ import type { DataTableColumns, DataTableRowKey } from "naive-ui";
 import FileSelect from "@renderer/pages/Tools/pages/FileUpload/components/FileSelect.vue";
 import BiliSetting from "@renderer/components/BiliSetting.vue";
 import AppendVideoDialog from "@renderer/components/AppendVideoDialog.vue";
-import { useBili } from "@renderer/hooks";
+import { useBili, useConfirm } from "@renderer/hooks";
 import { useUserInfoStore, useAppConfig } from "@renderer/stores";
-import { biliApi } from "@renderer/apis";
+import { biliApi, fileBrowserApi } from "@renderer/apis";
 import hotkeys from "hotkeys-js";
 
 import { deepRaw } from "@renderer/utils";
@@ -203,6 +229,7 @@ const appConfigStore = useAppConfig();
 const { appConfig } = storeToRefs(appConfigStore);
 
 const notice = useNotification();
+const confirm = useConfirm();
 
 const options = toReactive(
   computed({
@@ -330,10 +357,12 @@ const localUploadedFilesResult = ref<LocalUploadedFilesResult | null>(null);
 const localDetectLogs = ref<string[]>([]);
 const localDetectOptions = useLocalStorage("file-upload-local-detect-options", {
   pages: 3,
-  useArchiveDetail: false,
+  useArchiveDetail: true,
   detailIntervalMs: 1500,
 });
 const localUploadedRows = computed(() => localUploadedFilesResult.value?.matches ?? []);
+const selectedLocalUploadedFileKeys = ref<DataTableRowKey[]>([]);
+const deletingLocalUploadedFiles = ref(false);
 type LocalUnuploadedSortKey =
   | "startTimeDesc"
   | "startTimeAsc"
@@ -378,6 +407,7 @@ const localUploadOptions = reactive({
   uploadRawWhenNoDanmu: true,
   mergeSegments: true,
 });
+const getLocalUploadedRowKey = (row: LocalUploadedFileMatch) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
 
 let localDetectLogTimer: number | undefined;
@@ -392,7 +422,7 @@ const stopLocalDetectLogTimer = () => {
 const startLocalDetectLogTimer = () => {
   const messages = [
     "仍在扫描本地视频目录和读取B站稿件列表...",
-    "仍在比对文件名、稿件标题和分P信息...",
+    "仍在比对文件名、视频原始标题和分P信息...",
     "检测仍在进行，视频文件较多时会稍慢...",
   ];
   let index = 0;
@@ -413,17 +443,93 @@ const openLocalFolder = (filePath: string) => {
   window.api.openPath(window.path.dirname(filePath));
 };
 
-const openBiliArchive = (aid: number) => {
-  const url = `https://member.bilibili.com/platform/upload/video/frame?type=edit&version=new&aid=${aid}`;
+const openBiliArchive = (row: LocalUploadedFileMatch) => {
+  const url = row.bvid
+    ? `https://www.bilibili.com/video/${row.bvid}${row.page ? `?p=${row.page}` : ""}`
+    : `https://www.bilibili.com/video/av${row.aid}${row.page ? `?p=${row.page}` : ""}`;
   window.api.openExternal(url);
 };
 
+const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
+  if (rows.length === 0 || deletingLocalUploadedFiles.value) return;
+  const [confirmed] = await confirm.warning({
+    title: "确认删除",
+    content: `确定删除 ${rows.length} 个已上传残留文件吗？此操作不可撤销。`,
+    positiveText: "删除",
+    negativeText: "取消",
+  });
+  if (!confirmed) return;
+
+  deletingLocalUploadedFiles.value = true;
+  const deletedPaths = new Set<string>();
+  const failed: string[] = [];
+  try {
+    for (const row of rows) {
+      try {
+        await fileBrowserApi.removeFile(row.localPath);
+        deletedPaths.add(row.localPath);
+        pushLocalDetectLog(`已删除残留文件：${row.fileName}`);
+      } catch (error) {
+        failed.push(`${row.fileName}：${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+
+    if (localUploadedFilesResult.value && deletedPaths.size > 0) {
+      localUploadedFilesResult.value.matches = localUploadedFilesResult.value.matches.filter(
+        (row) => !deletedPaths.has(row.localPath),
+      );
+    }
+    selectedLocalUploadedFileKeys.value = selectedLocalUploadedFileKeys.value.filter(
+      (key) => !deletedPaths.has(String(key)),
+    );
+
+    if (deletedPaths.size > 0) {
+      notice.success({
+        title: "删除完成",
+        content: `已删除 ${deletedPaths.size} 个残留文件`,
+        duration: 3000,
+      });
+    }
+    if (failed.length > 0) {
+      notice.warning({
+        title: "部分文件删除失败",
+        content: failed.slice(0, 3).join("；"),
+        duration: 5000,
+      });
+      for (const item of failed) pushLocalDetectLog(`删除失败：${item}`);
+    }
+  } finally {
+    deletingLocalUploadedFiles.value = false;
+  }
+};
+
+const deleteSelectedLocalUploadedFiles = async () => {
+  const selectedKeys = new Set(selectedLocalUploadedFileKeys.value.map((item) => String(item)));
+  await deleteLocalUploadedFiles(
+    localUploadedRows.value.filter((row) => selectedKeys.has(getLocalUploadedRowKey(row))),
+  );
+};
+
+const deleteAllLocalUploadedFiles = async () => {
+  await deleteLocalUploadedFiles(localUploadedRows.value);
+};
+
 const localUploadedColumns: DataTableColumns<LocalUploadedFileMatch> = [
+  {
+    type: "selection",
+  },
   {
     title: "本地文件",
     key: "fileName",
     minWidth: 220,
     render: (row) => h("span", { title: row.localPath }, row.fileName),
+  },
+  {
+    title: "大小",
+    key: "size",
+    width: 110,
+    sorter: (left, right) => left.size - right.size,
+    render: (row) => formatFileSize(row.size),
   },
   {
     title: "稿件",
@@ -452,12 +558,13 @@ const localUploadedColumns: DataTableColumns<LocalUploadedFileMatch> = [
     title: "修改时间",
     key: "mtimeMs",
     width: 170,
+    sorter: (left, right) => left.mtimeMs - right.mtimeMs,
     render: (row) => new Date(row.mtimeMs).toLocaleString(),
   },
   {
     title: "操作",
     key: "actions",
-    width: 180,
+    width: 240,
     render: (row) =>
       h(
         "div",
@@ -477,9 +584,19 @@ const localUploadedColumns: DataTableColumns<LocalUploadedFileMatch> = [
             NButton,
             {
               size: "small",
-              onClick: () => openBiliArchive(row.aid),
+              onClick: () => openBiliArchive(row),
             },
             { default: () => "打开稿件" },
+          ),
+          h(
+            NButton,
+            {
+              size: "small",
+              type: "error",
+              disabled: deletingLocalUploadedFiles.value,
+              onClick: () => deleteLocalUploadedFiles([row]),
+            },
+            { default: () => "删除" },
           ),
         ],
       ),
@@ -621,6 +738,7 @@ const detectLocalUploadedFiles = async () => {
   localUploadedFilesVisible.value = true;
   localUploadedFilesResult.value = null;
   localUnuploadedSearchKeyword.value = "";
+  selectedLocalUploadedFileKeys.value = [];
   selectedLocalUploadGroupIds.value = [];
   localDetectLogs.value = [];
   pushLocalDetectLog("开始检测本地视频和B站稿件");

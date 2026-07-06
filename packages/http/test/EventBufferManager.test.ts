@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   EventBufferManager,
   type MatchedEventPair,
@@ -20,6 +20,11 @@ describe("EventBufferManager", () => {
   beforeEach(() => {
     manager = new EventBufferManager();
     vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    manager.clear();
+    vi.useRealTimers();
   });
 
   const createMockEvent = (event: string, filePath: string): Options =>
@@ -111,6 +116,57 @@ describe("EventBufferManager", () => {
       manager.addEvent(createMockEvent("FileClosed", "/path/to/file2.mp4"));
 
       expect(manager.getBufferStatus()).toBe(2);
+    });
+
+    it("should synthesize opening event for close-only files after timeout", () => {
+      vi.useFakeTimers();
+      const manager = new EventBufferManager(1000);
+      const filePath = "/path/to/file.mp4";
+      const closeEvent = createMockEvent("FileClosed", filePath);
+      const events: MatchedEventPair[] = [];
+
+      manager.on("process", (pair: MatchedEventPair) => {
+        events.push(pair);
+      });
+
+      manager.addEvent(closeEvent);
+      expect(events).toHaveLength(0);
+      expect(manager.getBufferStatus()).toBe(1);
+
+      vi.advanceTimersByTime(1000);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].close).toBe(closeEvent);
+      expect(events[0].open).toMatchObject({
+        ...closeEvent,
+        event: "FileOpening",
+      });
+      expect(manager.getBufferStatus()).toBe(0);
+      manager.clear();
+    });
+
+    it("should not synthesize opening event when real opening arrives before timeout", () => {
+      vi.useFakeTimers();
+      const manager = new EventBufferManager(1000);
+      const filePath = "/path/to/file.mp4";
+      const closeEvent = createMockEvent("FileClosed", filePath);
+      const openEvent = createMockEvent("FileOpening", filePath);
+      const events: MatchedEventPair[] = [];
+
+      manager.on("process", (pair: MatchedEventPair) => {
+        events.push(pair);
+      });
+
+      manager.addEvent(closeEvent);
+      vi.advanceTimersByTime(500);
+      manager.addEvent(openEvent);
+      vi.advanceTimersByTime(1000);
+
+      expect(events).toHaveLength(1);
+      expect(events[0].open).toBe(openEvent);
+      expect(events[0].close).toBe(closeEvent);
+      expect(manager.getBufferStatus()).toBe(0);
+      manager.clear();
     });
   });
 

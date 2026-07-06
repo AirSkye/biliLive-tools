@@ -154,6 +154,10 @@ export type CommonRoomConfig = {
   uploadToSameMedia?: boolean;
   // 上传非视频版预设
   noDanmuVideoPreset?: string;
+  /** 上传时自动追加直播间链接到简介 */
+  appendLiveRoomLinkToDesc?: boolean;
+  /** 上传时自动追加主播和直播标题相关标签 */
+  appendLiveInfoTags?: boolean;
 };
 
 // webhook房间配置

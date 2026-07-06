@@ -17,7 +17,10 @@ export interface MatchedEventPair {
 interface EventData {
   open?: Options;
   close?: Options;
+  closeOnlyFallbackTimer?: ReturnType<typeof setTimeout>;
 }
+
+const DEFAULT_CLOSE_ONLY_FALLBACK_DELAY_MS = 30 * 1000;
 
 /**
  * 事件缓冲管理器
@@ -28,6 +31,10 @@ export class EventBufferManager extends EventEmitter<{
 }> {
   // 事件缓冲区,同时保存 open 和 close 事件
   private events: Map<string, EventData> = new Map();
+
+  constructor(private closeOnlyFallbackDelayMs = DEFAULT_CLOSE_ONLY_FALLBACK_DELAY_MS) {
+    super();
+  }
 
   /**
    * 添加事件到缓冲区
@@ -70,6 +77,31 @@ export class EventBufferManager extends EventEmitter<{
     this.emitPair();
   }
 
+  private clearCloseOnlyFallbackTimer(eventData: EventData): void {
+    if (!eventData.closeOnlyFallbackTimer) return;
+    clearTimeout(eventData.closeOnlyFallbackTimer);
+    eventData.closeOnlyFallbackTimer = undefined;
+  }
+
+  private scheduleCloseOnlyFallback(filePath: string): void {
+    const eventData = this.events.get(filePath);
+    if (!eventData?.close || eventData.open || eventData.closeOnlyFallbackTimer) return;
+
+    eventData.closeOnlyFallbackTimer = setTimeout(() => {
+      const latest = this.events.get(filePath);
+      if (!latest?.close || latest.open) return;
+
+      latest.open = {
+        ...latest.close,
+        event: "FileOpening",
+      };
+      latest.closeOnlyFallbackTimer = undefined;
+      log.warn(`[EventBuffer] FileClosed 未等到 FileOpening，已补充开始事件: ${filePath}`);
+      this.emitPair();
+    }, this.closeOnlyFallbackDelayMs);
+    eventData.closeOnlyFallbackTimer.unref?.();
+  }
+
   /**
    * 处理 FileOpening 事件
    */
@@ -82,6 +114,7 @@ export class EventBufferManager extends EventEmitter<{
    */
   private handleCloseEvent(event: Options): void {
     this.setEvent(event, "close");
+    this.scheduleCloseOnlyFallback(event.filePath);
   }
 
   /**
@@ -91,6 +124,7 @@ export class EventBufferManager extends EventEmitter<{
     // 遍历所有事件数据,找出同时有 open 和 close 的
     for (const [filePath, eventData] of this.events.entries()) {
       if (eventData.open && eventData.close) {
+        this.clearCloseOnlyFallbackTimer(eventData);
         const pair: MatchedEventPair = {
           open: eventData.open,
           close: eventData.close,
@@ -107,6 +141,9 @@ export class EventBufferManager extends EventEmitter<{
    * 清理所有缓冲区
    */
   clear(): void {
+    for (const eventData of this.events.values()) {
+      this.clearCloseOnlyFallbackTimer(eventData);
+    }
     this.events.clear();
     log.info("[EventBuffer] 所有缓冲区已清理");
   }

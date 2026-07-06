@@ -1,10 +1,14 @@
 import fs from "fs-extra";
+import os from "node:os";
+import path from "node:path";
+import checkDiskSpace from "check-disk-space";
 import { expect, describe, it, beforeEach, vi } from "vitest";
 import { WebhookHandler } from "../src/services/webhook/webhook.js";
 import { Live, Part } from "../src/services/webhook/Live.js";
 import { DEFAULT_BILIUP_CONFIG } from "@biliLive-tools/shared/presets/videoPreset.js";
 import * as utils from "@biliLive-tools/shared/utils/index.js";
 import * as syncTask from "@biliLive-tools/shared/task/sync.js";
+import biliApi from "@biliLive-tools/shared/task/bili.js";
 
 import type { Options } from "../src/types/webhook.js";
 
@@ -25,6 +29,10 @@ vi.mock("@biliLive-tools/shared/utils/index.js", async (importOriginal) => {
     trashItem: vi.fn().mockResolvedValue(true),
   };
 });
+
+vi.mock("check-disk-space", () => ({
+  default: vi.fn(),
+}));
 
 vi.spyOn(utils, "sleep").mockImplementation(async () => {
   return undefined;
@@ -183,6 +191,176 @@ describe("WebhookHandler", () => {
       await utils.sleep(500); // 等待异步处理完成
       expect(liveData2.length).toBe(1);
       expect(liveData2[0].parts[0].recordStatus).toBe("recorded");
+    });
+  });
+
+  describe("effective processing config", () => {
+    const baseConfig = {
+      roomId: "123",
+      danmu: false,
+      mergePart: false,
+      minSize: 0,
+      uploadPresetId: "default",
+      title: "",
+      open: true,
+      partMergeMinute: -1,
+      hotProgress: false,
+      useLiveCover: false,
+      afterConvertAction: [],
+      afterConvertRemoveVideo: true,
+      afterConvertRemoveXml: false,
+      uploadHandleTime: ["00:00:00", "23:59:59"],
+      uploadNoDanmu: false,
+      uploadToSameMedia: false,
+      noDanmuVideoPreset: "default",
+      appendLiveRoomLinkToDesc: true,
+      appendLiveInfoTags: true,
+      partTitleTemplate: "{{filename}}",
+      afterUploadDeletAction: "none",
+      afterConvertRemoveXmlRaw: false,
+      afterConvertRemoveVideoRaw: true,
+    };
+
+    it("不压弹幕且 copy 预设无实际输出改动时，不应创建视频处理任务", async () => {
+      // @ts-ignore
+      webhookHandler.ffmpegPreset.get = vi.fn().mockResolvedValue({
+        config: {
+          encoder: "copy",
+          audioCodec: "copy",
+        },
+      });
+
+      const result = await (webhookHandler as any).getEffectiveProcessingConfig({
+        ...baseConfig,
+        videoPresetId: "b_copy",
+      });
+
+      expect(result.videoPresetId).toBeUndefined();
+      expect(result.afterConvertRemoveVideo).toBe(false);
+    });
+
+    it("copy 预设带滤镜或额外输出参数时，仍应保留视频处理任务", async () => {
+      // @ts-ignore
+      webhookHandler.ffmpegPreset.get = vi.fn().mockResolvedValue({
+        config: {
+          encoder: "copy",
+          audioCodec: "copy",
+          extraOptions: "-movflags +faststart",
+        },
+      });
+
+      const result = await (webhookHandler as any).getEffectiveProcessingConfig({
+        ...baseConfig,
+        videoPresetId: "custom-copy",
+      });
+
+      expect(result.videoPresetId).toBe("custom-copy");
+      expect(result.afterConvertRemoveVideo).toBe(true);
+    });
+  });
+
+  describe("ffmpeg space preflight", () => {
+    const copyPreset = {
+      encoder: "copy",
+      audioCodec: "copy",
+    };
+
+    const createInputFile = async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bili-webhook-plan-"));
+      const input = path.join(tempDir, "source.flv");
+      await fs.writeFile(input, Buffer.alloc(1024));
+      return { tempDir, input };
+    };
+
+    it("空间足够时应在原目录自动压制且提示不迁移", async () => {
+      const { tempDir, input } = await createInputFile();
+      try {
+        vi.mocked(checkDiskSpace).mockResolvedValue({
+          diskPath: tempDir,
+          free: 1024 * 1024 * 1024,
+        });
+        const output = path.join(tempDir, "source.mp4");
+
+        const plan = await (webhookHandler as any).planFfmpegOutput(input, output, copyPreset, {
+          roomId: "123",
+          username: "主播",
+        });
+
+        expect(plan.output).toBe(output);
+        expect(plan.savePath).toBe(tempDir);
+        expect(plan.autoRun).toBe(true);
+        expect(plan.migrated).toBe(false);
+        expect(plan.message).toContain("不迁移");
+      } finally {
+        await fs.remove(tempDir);
+      }
+    });
+
+    it("原盘空间不足且候选盘足够时应迁移到专用主播目录并自动运行", async () => {
+      const { tempDir, input } = await createInputFile();
+      const alternateOutput = path.join(
+        tempDir,
+        "alternate",
+        "biliLive-tools-webhook-temp",
+        "123-TestUser",
+        "source.mp4",
+      );
+      try {
+        vi.mocked(checkDiskSpace).mockResolvedValue({
+          diskPath: tempDir,
+          free: 128 * 1024 * 1024,
+        });
+        vi.spyOn(webhookHandler as any, "chooseAlternateOutput").mockResolvedValue({
+          root: path.parse(alternateOutput).root,
+          free: 10 * 1024 * 1024 * 1024,
+          output: alternateOutput,
+        });
+
+        const plan = await (webhookHandler as any).planFfmpegOutput(
+          input,
+          path.join(tempDir, "source.mp4"),
+          copyPreset,
+          {
+            roomId: "123",
+            username: "TestUser",
+          },
+        );
+
+        expect(plan.output).toBe(alternateOutput);
+        expect(plan.savePath).toBe(path.dirname(alternateOutput));
+        expect(plan.autoRun).toBe(true);
+        expect(plan.migrated).toBe(true);
+        expect(plan.message).toContain("迁移到");
+        await expect(fs.pathExists(path.dirname(alternateOutput))).resolves.toBe(true);
+      } finally {
+        await fs.remove(tempDir);
+      }
+    });
+
+    it("所有盘符空间都不足时应保持原输出并暂停等待手动开始", async () => {
+      const { tempDir, input } = await createInputFile();
+      try {
+        vi.mocked(checkDiskSpace).mockResolvedValue({
+          diskPath: tempDir,
+          free: 128 * 1024 * 1024,
+        });
+        vi.spyOn(webhookHandler as any, "chooseAlternateOutput").mockResolvedValue(undefined);
+        const output = path.join(tempDir, "source.mp4");
+
+        const plan = await (webhookHandler as any).planFfmpegOutput(input, output, copyPreset, {
+          roomId: "123",
+          username: "TestUser",
+        });
+
+        expect(plan.output).toBe(output);
+        expect(plan.savePath).toBe(tempDir);
+        expect(plan.autoRun).toBe(false);
+        expect(plan.migrated).toBe(false);
+        expect(plan.message).toContain("空间不足");
+        expect(plan.message).toContain("手动开始");
+      } finally {
+        await fs.remove(tempDir);
+      }
     });
   });
 
@@ -376,14 +554,70 @@ describe("WebhookHandler", () => {
           audioCodec: "copy",
           encoder: "copy",
         },
-        {
+        expect.objectContaining({
           removeVideo: true,
-        },
+        }),
       );
       expect(webhookHandler.liveManager.liveData[0].parts[0].filePath).toBe("/path/to/part1.mp4");
       expect(webhookHandler.liveManager.liveData[0].parts[0].rawFilePath).toBe(
         "/path/to/part1.mp4",
       );
+    });
+    it("不压弹幕、不转mp4且copy预设无实际处理时不应创建压制任务", async () => {
+      const openOptions: Options = {
+        roomId: "123",
+        event: "FileOpening",
+        filePath: "/path/to/noop.flv",
+        time: "2022-01-01T00:00:00Z",
+        username: "test",
+        platform: "blrec",
+        title: "test video",
+        software: "bili-recorder",
+      };
+      const closeOptions: Options = {
+        roomId: "123",
+        event: "FileClosed",
+        filePath: "/path/to/noop.flv",
+        time: "2022-01-01T00:05:00Z",
+        username: "test",
+        platform: "blrec",
+        title: "test video",
+        software: "bili-recorder",
+      };
+      vi.spyOn(webhookHandler.configManager, "getConfig")
+        // @ts-ignore
+        .mockReturnValue({
+          open: true,
+          roomId: "123",
+          title: "test",
+          danmu: false,
+          convert2Mp4Option: false,
+          videoPresetId: "copy-preset",
+          afterConvertRemoveVideo: true,
+          afterConvertRemoveVideoRaw: true,
+          minSize: 0,
+          partMergeMinute: -1,
+          uploadHandleTime: ["00:00:00", "23:59:59"],
+        });
+      // @ts-ignore
+      webhookHandler.ffmpegPreset.get = vi.fn().mockResolvedValue({
+        config: {
+          encoder: "copy",
+          audioCodec: "copy",
+        },
+      });
+      const transcodeSpy = vi
+        .spyOn(webhookHandler, "transcode")
+        .mockResolvedValue("/path/to/noop-后处理.mp4");
+
+      await webhookHandler.handle(openOptions);
+      await webhookHandler.handle(closeOptions);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      expect(transcodeSpy).not.toHaveBeenCalled();
+      expect(webhookHandler.liveManager.liveData[0].parts[0].filePath).toBe("/path/to/noop.flv");
+      expect(webhookHandler.liveManager.liveData[0].parts[0].rawFilePath).toBe("/path/to/noop.flv");
+      expect(webhookHandler.liveManager.liveData[0].parts[0].recordStatus).toBe("handled");
     });
     it("should handle the options and return if the file size is too small", async () => {
       // Arrange
@@ -2964,6 +3198,391 @@ describe("Live", () => {
       });
 
       describe("buildUploadFileList", () => {
+        it("上传后删除时应把处理前源视频加入上传清理列表", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerProcessedSourceUploadCleanup(part, "/path/to/source.flv", {
+            afterUploadDeletAction: "delete",
+            afterConvertRemoveVideoRaw: false,
+          });
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([
+            "/path/to/source.flv",
+          ]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(1);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.shouldDelete("/path/to/source.flv")).toBe(true);
+        });
+
+        it("未配置上传后删除时不应把处理前源视频加入上传清理列表", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerProcessedSourceUploadCleanup(part, "/path/to/source.flv", {
+            afterUploadDeletAction: "none",
+            afterConvertRemoveVideoRaw: false,
+          });
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(0);
+        });
+
+        it("审核后删除时应为处理前源视频保留上传完成和审核完成两次释放", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerProcessedSourceUploadCleanup(part, "/path/to/source.flv", {
+            afterUploadDeletAction: "deleteAfterCheck",
+            afterConvertRemoveVideoRaw: false,
+          });
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([
+            "/path/to/source.flv",
+          ]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(2);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.shouldDelete("/path/to/source.flv")).toBe(true);
+        });
+
+        it("已配置处理后删除源视频时不应重复注册上传后删除", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerProcessedSourceUploadCleanup(part, "/path/to/source.flv", {
+            afterUploadDeletAction: "delete",
+            afterConvertRemoveVideoRaw: true,
+          });
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(0);
+        });
+
+        it("上传后删除时应把转封装前原始文件加入上传清理列表", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/converted.mp4",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerConvertedOriginalUploadCleanup(
+            part,
+            "/path/to/source.flv",
+            "/path/to/converted.mp4",
+            {
+              afterUploadDeletAction: "delete",
+              removeSourceAferrConvert2Mp4: false,
+            },
+          );
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([
+            "/path/to/source.flv",
+          ]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(1);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.shouldDelete("/path/to/source.flv")).toBe(true);
+        });
+
+        it("审核后删除时应为转封装前原始文件保留两次释放", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/converted.mp4",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerConvertedOriginalUploadCleanup(
+            part,
+            "/path/to/source.flv",
+            "/path/to/converted.mp4",
+            {
+              afterUploadDeletAction: "deleteAfterCheck",
+              removeSourceAferrConvert2Mp4: false,
+            },
+          );
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([
+            "/path/to/source.flv",
+          ]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(2);
+        });
+
+        it("转封装后已配置删除源文件时不应重复注册原始文件上传清理", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/converted.mp4",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerConvertedOriginalUploadCleanup(
+            part,
+            "/path/to/source.flv",
+            "/path/to/converted.mp4",
+            {
+              afterUploadDeletAction: "delete",
+              removeSourceAferrConvert2Mp4: true,
+            },
+          );
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(0);
+        });
+
+        it("未配置上传后删除时不应注册转封装前原始文件上传清理", () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/converted.mp4",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+
+          // @ts-ignore
+          webhookHandler.registerConvertedOriginalUploadCleanup(
+            part,
+            "/path/to/source.flv",
+            "/path/to/converted.mp4",
+            {
+              afterUploadDeletAction: "none",
+              removeSourceAferrConvert2Mp4: false,
+            },
+          );
+
+          // @ts-ignore
+          expect(webhookHandler.getPartCleanupPaths(part, part.filePath)).toEqual([]);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(0);
+        });
+
+        it("审核后删除上传任务应传递完整清理路径给审核队列持久化", async () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/handled.mp4",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+          const fakeTask = {
+            output: 123,
+            on: vi.fn((event: string, handler: (payload?: unknown) => void) => {
+              if (event === "task-end") {
+                setTimeout(() => handler({ taskId: "task", data: [] }), 0);
+              }
+              return fakeTask;
+            }),
+          };
+          const addMediaSpy = vi.spyOn(biliApi, "addMedia").mockResolvedValue(fakeTask as any);
+
+          // @ts-ignore
+          await webhookHandler.addUploadTask(
+            1,
+            [
+              {
+                part,
+                path: "/path/to/handled.mp4",
+                title: "Part 1",
+                type: "handled",
+                cleanupPaths: ["/path/to/source.flv", "/path/to/converted.mp4"],
+              },
+            ],
+            DEFAULT_BILIUP_CONFIG,
+            [],
+            "deleteAfterCheck",
+          );
+
+          expect(addMediaSpy).toHaveBeenCalledWith(
+            [{ path: "/path/to/handled.mp4", title: "Part 1" }],
+            DEFAULT_BILIUP_CONFIG,
+            1,
+            expect.objectContaining({
+              afterUploadDeletAction: "none",
+              forceCheck: true,
+              checkRemovePaths: [
+                "/path/to/handled.mp4",
+                "/path/to/source.flv",
+                "/path/to/converted.mp4",
+              ],
+            }),
+          );
+        });
+
+        it("同一上传任务重复使用同一路径时应按引用次数释放但持久化路径去重", async () => {
+          const part = new Part({
+            filePath: "/path/to/handled.mp4",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+          let checkCallback: ((status: "completed" | "error") => Promise<void>) | undefined;
+          const fakeTask = {
+            output: 123,
+            on: vi.fn((event: string, handler: (payload?: unknown) => void) => {
+              if (event === "task-end") {
+                setTimeout(() => handler({ taskId: "task", data: [] }), 0);
+              }
+              return fakeTask;
+            }),
+          };
+          const addMediaSpy = vi
+            .spyOn(biliApi, "addMedia")
+            .mockImplementation(async (_paths, _options, _uid, extraOptions) => {
+              checkCallback = extraOptions?.checkCallback;
+              return fakeTask as any;
+            });
+
+          // 同一个 source.flv 同时作为原画上传文件和弹幕版清理源文件，各自有上传完成/审核完成两次释放。
+          // @ts-ignore
+          webhookHandler.fileRefManager.addRef("/path/to/source.flv", true);
+          // @ts-ignore
+          webhookHandler.fileRefManager.addRef("/path/to/source.flv", true);
+          // @ts-ignore
+          webhookHandler.fileRefManager.addRef("/path/to/source.flv", true);
+          // @ts-ignore
+          webhookHandler.fileRefManager.addRef("/path/to/source.flv", true);
+          // @ts-ignore
+          webhookHandler.fileRefManager.addRef("/path/to/handled.mp4", true);
+          // @ts-ignore
+          webhookHandler.fileRefManager.addRef("/path/to/handled.mp4", true);
+
+          // @ts-ignore
+          await webhookHandler.addUploadTask(
+            1,
+            [
+              {
+                part,
+                path: "/path/to/source.flv",
+                title: "Raw",
+                type: "raw",
+                cleanupPaths: [],
+              },
+              {
+                part,
+                path: "/path/to/handled.mp4",
+                title: "Handled",
+                type: "handled",
+                cleanupPaths: ["/path/to/source.flv"],
+              },
+            ],
+            DEFAULT_BILIUP_CONFIG,
+            [],
+            "deleteAfterCheck",
+          );
+
+          expect(addMediaSpy).toHaveBeenCalledWith(
+            [
+              { path: "/path/to/source.flv", title: "Raw" },
+              { path: "/path/to/handled.mp4", title: "Handled" },
+            ],
+            DEFAULT_BILIUP_CONFIG,
+            1,
+            expect.objectContaining({
+              checkRemovePaths: ["/path/to/source.flv", "/path/to/handled.mp4"],
+            }),
+          );
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(2);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/handled.mp4")).toBe(1);
+
+          await checkCallback?.("completed");
+
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/source.flv")).toBe(0);
+          // @ts-ignore
+          expect(webhookHandler.fileRefManager.getRefCount("/path/to/handled.mp4")).toBe(0);
+        });
+
+        it("本地补偿上传应拒绝已经在 webhook 流程中的文件", async () => {
+          const live = new Live({
+            platform: "bilibili",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Live",
+            username: "User",
+          });
+          live.addPart({
+            filePath: "/path/to/source.flv",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            title: "Part 1",
+          });
+          webhookHandler.liveData.push(live);
+
+          await expect(
+            webhookHandler.uploadLocalFiles({
+              roomId: "123",
+              files: [{ path: "/path/to/source.flv" }],
+            }),
+          ).rejects.toThrow("文件已在 webhook 上传流程中");
+        });
+
+        it("本地补偿上传应拒绝并发提交同一个文件", async () => {
+          let resolveExists!: (value: boolean) => void;
+          const existsPromise = new Promise<boolean>((resolve) => {
+            resolveExists = resolve;
+          });
+          const pathExistsSpy = vi.spyOn(fs, "pathExists").mockReturnValue(existsPromise as any);
+          // @ts-ignore
+          webhookHandler.configManager.getConfig = vi.fn().mockReturnValue({
+            uid: 1,
+            roomId: "123",
+            afterUploadDeletAction: "none",
+          });
+
+          const firstUpload = webhookHandler.uploadLocalFiles({
+            roomId: "123",
+            files: [{ path: "/path/to/source.flv" }],
+          });
+
+          await expect(
+            webhookHandler.uploadLocalFiles({
+              roomId: "123",
+              files: [{ path: "/path/to/source.flv" }],
+            }),
+          ).rejects.toThrow("文件已在 webhook 上传流程中");
+
+          resolveExists(false);
+          await expect(firstUpload).rejects.toThrow("本地文件不存在");
+          pathExistsSpy.mockRestore();
+        });
+
         it("应正确构建上传文件列表", () => {
           const live = new Live({
             eventId: "123",
@@ -3320,6 +3939,66 @@ describe("Live", () => {
           expect(result.title).toBe("Raw Title");
           // 注意：DEFAULT_BILIUP_CONFIG 可能包含空字符串的 cover
           expect(result.cover).toBeDefined();
+        });
+
+        it("应按配置追加直播间链接和直播信息标签", async () => {
+          const config = {
+            uploadPresetId: "test-preset",
+            appendLiveRoomLinkToDesc: true,
+            appendLiveInfoTags: true,
+          };
+          const live = {
+            platform: "bilibili",
+            roomId: "123456",
+            username: "Test User",
+            title: "当天直播 标题",
+          };
+
+          // @ts-ignore
+          webhookHandler.videoPreset.get = vi.fn().mockResolvedValue({
+            config: {
+              title: "Test Title",
+              desc: "原简介",
+              tag: ["已有标签"],
+              copyright: 1,
+            },
+          });
+
+          // @ts-ignore
+          const result = await webhookHandler.prepareUploadPreset("handled", config, live);
+
+          expect(result.desc).toBe("原简介\n\n直播间：https://live.bilibili.com/123456");
+          expect(result.tag).toEqual(["已有标签", "TestUser", "123456", "当天直播标题"]);
+        });
+
+        it("关闭配置时不应追加直播间链接和直播信息标签", async () => {
+          const config = {
+            uploadPresetId: "test-preset",
+            appendLiveRoomLinkToDesc: false,
+            appendLiveInfoTags: false,
+          };
+          const live = {
+            platform: "bilibili",
+            roomId: "123456",
+            username: "Test User",
+            title: "当天直播 标题",
+          };
+
+          // @ts-ignore
+          webhookHandler.videoPreset.get = vi.fn().mockResolvedValue({
+            config: {
+              title: "Test Title",
+              desc: "原简介",
+              tag: ["已有标签"],
+              copyright: 1,
+            },
+          });
+
+          // @ts-ignore
+          const result = await webhookHandler.prepareUploadPreset("handled", config, live);
+
+          expect(result.desc).toBe("原简介");
+          expect(result.tag).toEqual(["已有标签"]);
         });
 
         describe("prepareUploadPreset - 转载来源自动生成", () => {

@@ -24,6 +24,7 @@ type PersistedTaskRecord = {
   custsomProgressMsg?: string;
   error?: string;
   extra?: Record<string, any>;
+  manualStart?: boolean;
 };
 
 class RestoredTask extends AbstractTask {
@@ -46,6 +47,7 @@ class RestoredTask extends AbstractTask {
     this.custsomProgressMsg = record.custsomProgressMsg ?? "";
     this.error = interrupted ? "应用关闭时任务已中断，请重新创建任务或删除记录" : record.error;
     this.extra = record.extra;
+    this.manualStart = record.manualStart ?? false;
   }
 
   exec() {}
@@ -161,6 +163,8 @@ export class TaskQueue {
    * 运行任务，考虑任务限制和时间范围
    */
   runTask(task: AbstractTask): void {
+    if (task.manualStart) return;
+
     const typeMap: Record<string, string> = {
       [TaskType.ffmpeg]: "ffmpegMaxNum",
       [TaskType.douyuDownload]: "douyuDownloadMaxNum",
@@ -256,6 +260,7 @@ export class TaskQueue {
         error: task.error ? String(task.error) : "",
         duration: task.getDuration(),
         extra: task.extra,
+        manualStart: task.manualStart,
       };
     });
   }
@@ -370,6 +375,7 @@ export class TaskQueue {
    */
   private taskLimit(maxNum: number, type: string): void {
     const pendingFFmpegTask = this.filter({ type: type, status: "pending" }).filter((task) => {
+      if (task.manualStart) return false;
       return isBetweenTimeRange(task.limitTime);
     });
     if (maxNum !== -1) {

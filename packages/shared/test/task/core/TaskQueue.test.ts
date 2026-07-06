@@ -252,6 +252,18 @@ describe("TaskQueue", () => {
         expect(task2.exec).toHaveBeenCalled();
         expect(task3.exec).toHaveBeenCalled();
       });
+      it("should not auto start manual pending tasks but allow explicit start", async () => {
+        const task = new FFmpegTask();
+        task.manualStart = true;
+
+        taskQueue.addTask(task, false);
+
+        expect(task.exec).not.toHaveBeenCalled();
+        expect(taskQueue.list()).toContain(task);
+
+        taskQueue.start(task.taskId);
+        expect(task.exec).toHaveBeenCalledTimes(1);
+      });
       // it("should auto start after task-end event", async () => {
       //   const task1 = new FFmpegTask();
       //   const task2 = new FFmpegTask();

@@ -1012,6 +1012,7 @@ export const mergeAssMp4 = async (
     timestampFont?: string;
     limitTime?: [] | [string, string];
     autoRun?: boolean;
+    manualStart?: boolean;
     removeSubtitle?: boolean;
     onEnd?: (output: string) => void | Promise<void>;
   } = {
@@ -1104,6 +1105,7 @@ export const mergeAssMp4 = async (
       commandFactory: createCommand,
     },
   );
+  task.manualStart = options.manualStart ?? false;
   log.debug("mergeAssMp4 start task", task.taskId);
   taskQueue.addTask(task, options.autoRun ?? false);
 
@@ -1182,6 +1184,7 @@ export const transcode = async (
     limitTime?: [string, string];
     /** 自动运行 */
     autoRun?: boolean;
+    manualStart?: boolean;
   },
 ) => {
   const options = Object.assign(
@@ -1207,6 +1210,7 @@ export const transcode = async (
       override: options.override,
       limitTime: options.limitTime,
       autoRun: options.autoRun ?? false,
+      manualStart: options.manualStart ?? false,
     },
     ffmpegOptions,
   );
@@ -1508,6 +1512,8 @@ export const burn = async (
     /** 1: 保存到原始文件夹，2：保存到特定文件夹 */
     saveType?: 1 | 2;
     limitTime?: [string, string];
+    autoRun?: boolean;
+    manualStart?: boolean;
   },
   hooks: FFmpegTaskHooks = {},
 ) => {
@@ -1601,6 +1607,8 @@ export const burn = async (
       startTimestamp,
       timestampFont,
       limitTime: options.limitTime,
+      autoRun: options.autoRun ?? false,
+      manualStart: options.manualStart ?? false,
       onEnd: hooks.onEnd,
     },
     options.ffmpegOptions,

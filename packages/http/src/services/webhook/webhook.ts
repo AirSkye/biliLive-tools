@@ -1,5 +1,6 @@
 import path from "node:path";
 import fs from "fs-extra";
+import checkDiskSpaceModule from "check-disk-space";
 
 import { FFmpegPreset, VideoPreset, DanmuPreset } from "@biliLive-tools/shared";
 import { DEFAULT_BILIUP_CONFIG } from "@biliLive-tools/shared/presets/videoPreset.js";
@@ -8,6 +9,7 @@ import { isEmptyDanmu, convertXml2Ass, mergeXml } from "@biliLive-tools/shared/t
 import {
   transcode,
   burn,
+  readVideoMeta,
   analyzeResolutionChanges,
   checkMergeVideos,
   mergeVideosToFile,
@@ -103,6 +105,24 @@ type PreparedLocalUploadPart = {
 };
 
 const SAME_MEDIA_UPLOAD_ORDER: Array<"handled" | "raw"> = ["handled", "raw"];
+const FFMPEG_SPACE_BUFFER_RATIO = 0.15;
+const FFMPEG_MIN_SPACE_BUFFER = 512 * 1024 * 1024;
+const checkDiskSpace = checkDiskSpaceModule as unknown as (directoryPath: string) => Promise<{
+  diskPath: string;
+  free: number;
+  size: number;
+}>;
+
+type FfmpegSpacePlan = {
+  output: string;
+  savePath: string;
+  estimatedBytes: number;
+  requiredBytes: number;
+  freeBytes: number;
+  migrated: boolean;
+  autoRun: boolean;
+  message: string;
+};
 
 export class WebhookHandler {
   liveManager: LiveManager = new LiveManager();
@@ -112,6 +132,7 @@ export class WebhookHandler {
   appConfig: AppConfig;
   configManager: ConfigManager;
   private processedFiles: Set<string> = new Set();
+  private localUploadReservations: Set<string> = new Set();
   private fileRefManager: FileRefManager = new FileRefManager();
   eventBufferManager: EventBufferManager = new EventBufferManager();
 
@@ -152,6 +173,263 @@ export class WebhookHandler {
     });
   }
 
+  private normalizeManagedPath(filePath: string) {
+    const resolved = path.resolve(filePath);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  }
+
+  private getPartAllManagedPaths(part: Part) {
+    return new Set([
+      this.normalizeManagedPath(part.filePath),
+      this.normalizeManagedPath(part.rawFilePath),
+      ...this.getPartCleanupPaths(part, part.filePath).map((item) =>
+        this.normalizeManagedPath(item),
+      ),
+    ]);
+  }
+
+  private isPathInActiveLive(filePath: string) {
+    const normalizedPath = this.normalizeManagedPath(filePath);
+    for (const live of this.liveData) {
+      for (const part of live.parts) {
+        if (this.getPartAllManagedPaths(part).has(normalizedPath)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private reserveLocalUploadPaths(files: LocalUploadFileInput[]) {
+    const paths = Array.from(new Set(files.map((file) => this.normalizeManagedPath(file.path))));
+    const duplicatedPath = paths.find(
+      (filePath) => this.localUploadReservations.has(filePath) || this.isPathInActiveLive(filePath),
+    );
+    if (duplicatedPath) {
+      throw new Error(`文件已在 webhook 上传流程中，跳过重复上传：${duplicatedPath}`);
+    }
+
+    for (const filePath of paths) {
+      this.localUploadReservations.add(filePath);
+    }
+    return paths;
+  }
+
+  private releaseLocalUploadReservations(paths: string[]) {
+    for (const filePath of paths) {
+      this.localUploadReservations.delete(filePath);
+    }
+  }
+
+  private isNoopCopyPreset(preset: FfmpegOptions) {
+    if (preset.encoder !== "copy") return false;
+    if (preset.audioCodec && preset.audioCodec !== "copy") return false;
+
+    return ![
+      preset.resetResolution,
+      preset.fps,
+      preset.vf?.trim(),
+      preset.extraOptions?.trim(),
+      preset.ss,
+      preset.to,
+      preset.addTimestamp,
+      preset.pkOptimize,
+      preset.subtitleOptions,
+    ].some(Boolean);
+  }
+
+  private async shouldRunRegularVideoTranscode(config: RoomConfig) {
+    if (config.danmu || !config.videoPresetId) return false;
+
+    const preset = await this.ffmpegPreset.get(config.videoPresetId);
+    if (!preset) {
+      return true;
+    }
+
+    return !this.isNoopCopyPreset(preset.config);
+  }
+
+  private async getEffectiveProcessingConfig(config: RoomConfig): Promise<RoomConfig> {
+    if (config.danmu || !config.videoPresetId) return config;
+
+    const shouldRunTranscode = await this.shouldRunRegularVideoTranscode(config);
+    if (shouldRunTranscode) return config;
+
+    return {
+      ...config,
+      videoPresetId: undefined,
+      afterConvertRemoveVideo: false,
+    };
+  }
+
+  private formatBytes(bytes: number) {
+    if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+    const units = ["B", "MB", "GB", "TB"];
+    let value = bytes;
+    let unitIndex = 0;
+    while (value >= 1024 && unitIndex < units.length - 1) {
+      value /= 1024;
+      unitIndex++;
+    }
+    return `${value.toFixed(unitIndex === 0 ? 0 : 2)} ${units[unitIndex]}`;
+  }
+
+  private sanitizePathSegment(value?: string) {
+    return String(value || "unknown")
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, "_")
+      .replace(/\s+/g, "_")
+      .slice(0, 80);
+  }
+
+  private async estimateFfmpegOutputBytes(input: string, preset: FfmpegOptions) {
+    const stat = await fs.stat(input);
+    const sourceBytes = stat.size;
+
+    if (preset.encoder === "copy") {
+      return Math.ceil(sourceBytes * 1.05);
+    }
+
+    if (preset.bitrate && ["ABR", "CBR", "VBR"].includes(String(preset.bitrateControl))) {
+      try {
+        const meta = await readVideoMeta(input);
+        const duration = Number(meta?.format?.duration ?? 0);
+        if (Number.isFinite(duration) && duration > 0) {
+          const videoBytes = (Number(preset.bitrate) * 1000 * duration) / 8;
+          const audioKbps =
+            preset.audioCodec && preset.audioCodec !== "copy"
+              ? 192
+              : Number(meta?.format?.bit_rate ?? 0) > 0
+                ? Math.min(320, Number(meta.format.bit_rate) / 1000)
+                : 192;
+          const audioBytes = (audioKbps * 1000 * duration) / 8;
+          return Math.ceil((videoBytes + audioBytes) * 1.15);
+        }
+      } catch (error) {
+        log.warn("估算转码输出大小失败，使用源文件大小兜底", error);
+      }
+    }
+
+    return Math.ceil(sourceBytes * 1.3);
+  }
+
+  private async listCandidateOutputRoots(currentOutputDir: string) {
+    const currentRoot = path.parse(path.resolve(currentOutputDir)).root;
+    const roots: string[] = [];
+    const appendRoot = async (root: string) => {
+      if (!root || roots.includes(root)) return;
+      if (await fs.pathExists(root)) roots.push(root);
+    };
+
+    if (process.platform === "win32") {
+      for (let code = 67; code <= 90; code++) {
+        await appendRoot(`${String.fromCharCode(code)}:\\`);
+      }
+    } else {
+      await appendRoot("/");
+    }
+
+    return roots.filter((root) => root !== currentRoot);
+  }
+
+  private async chooseAlternateOutput(
+    currentOutput: string,
+    requiredBytes: number,
+    context?: { roomId?: string; username?: string },
+  ) {
+    const outputName = path.basename(currentOutput);
+    const roots = await this.listCandidateOutputRoots(path.dirname(currentOutput));
+    let best:
+      | {
+          root: string;
+          free: number;
+          output: string;
+        }
+      | undefined;
+
+    for (const root of roots) {
+      try {
+        const disk = await checkDiskSpace(root);
+        if (disk.free < requiredBytes) continue;
+        const tempDir = path.join(
+          root,
+          "biliLive-tools-webhook-temp",
+          `${this.sanitizePathSegment(context?.roomId)}-${this.sanitizePathSegment(
+            context?.username,
+          )}`,
+        );
+        const candidate = path.join(tempDir, outputName);
+        if (!best || disk.free > best.free) {
+          best = { root, free: disk.free, output: candidate };
+        }
+      } catch (error) {
+        log.warn("读取候选磁盘空间失败", root, error);
+      }
+    }
+
+    return best;
+  }
+
+  private async planFfmpegOutput(
+    input: string,
+    output: string,
+    preset: FfmpegOptions,
+    context?: { roomId?: string; username?: string },
+  ): Promise<FfmpegSpacePlan> {
+    const estimatedBytes = await this.estimateFfmpegOutputBytes(input, preset);
+    const requiredBytes =
+      estimatedBytes +
+      Math.max(Math.ceil(estimatedBytes * FFMPEG_SPACE_BUFFER_RATIO), FFMPEG_MIN_SPACE_BUFFER);
+    const outputDir = path.dirname(output);
+    const disk = await checkDiskSpace(outputDir);
+
+    if (disk.free >= requiredBytes) {
+      return {
+        output,
+        savePath: outputDir,
+        estimatedBytes,
+        requiredBytes,
+        freeBytes: disk.free,
+        migrated: false,
+        autoRun: true,
+        message: `预计输出 ${this.formatBytes(estimatedBytes)}，目标盘剩余 ${this.formatBytes(
+          disk.free,
+        )}，不迁移`,
+      };
+    }
+
+    const alternate = await this.chooseAlternateOutput(output, requiredBytes, context);
+    if (alternate) {
+      await fs.ensureDir(path.dirname(alternate.output));
+      return {
+        output: alternate.output,
+        savePath: path.dirname(alternate.output),
+        estimatedBytes,
+        requiredBytes,
+        freeBytes: alternate.free,
+        migrated: true,
+        autoRun: true,
+        message: `预计输出 ${this.formatBytes(estimatedBytes)}，原盘剩余 ${this.formatBytes(
+          disk.free,
+        )} 不足，迁移到 ${path.dirname(alternate.output)}，目标盘剩余 ${this.formatBytes(
+          alternate.free,
+        )}`,
+      };
+    }
+
+    return {
+      output,
+      savePath: outputDir,
+      estimatedBytes,
+      requiredBytes,
+      freeBytes: disk.free,
+      migrated: false,
+      autoRun: false,
+      message: `预计输出 ${this.formatBytes(estimatedBytes)}，目标盘剩余 ${this.formatBytes(
+        disk.free,
+      )}，需要约 ${this.formatBytes(requiredBytes)}；空间不足，已暂停等待清理后手动开始`,
+    };
+  }
+
   private async resolveLocalDanmuPath(file: LocalUploadFileInput, xmlOnly = false) {
     const candidates = xmlOnly
       ? [file.xmlDanmuPath, replaceExtName(file.path, ".xml")]
@@ -179,7 +457,9 @@ export class WebhookHandler {
     const checkResult = await checkMergeVideos(inputFiles);
     const warnings = [...checkResult.warnings];
     if (checkResult.errors.length > 0) {
-      warnings.push(`检测到编码或分辨率不一致，已切换为兼容转码合并：${checkResult.errors.join("；")}`);
+      warnings.push(
+        `检测到编码或分辨率不一致，已切换为兼容转码合并：${checkResult.errors.join("；")}`,
+      );
     }
 
     const task = await mergeVideosToFile(inputFiles, {
@@ -196,7 +476,9 @@ export class WebhookHandler {
     for (const file of sortedFiles) {
       const xmlPath = await this.resolveLocalDanmuPath(file, true);
       if (!xmlPath) {
-        warnings.push(`未找到 ${path.basename(file.path)} 对应的 XML 弹幕，合并后将无法压制合并弹幕`);
+        warnings.push(
+          `未找到 ${path.basename(file.path)} 对应的 XML 弹幕，合并后将无法压制合并弹幕`,
+        );
         xmlInputs.length = 0;
         break;
       }
@@ -289,6 +571,7 @@ export class WebhookHandler {
         removeVideo: false,
         removeDanmu: false,
         limitTime: config.videoHandleTime,
+        roomId: config.roomId,
       },
     );
   }
@@ -298,80 +581,90 @@ export class WebhookHandler {
       throw new Error("files is required");
     }
 
-    const config = this.configManager.getConfig(options.roomId);
-    if (!config.uid) {
-      throw new Error("房间未配置 webhook 上传账号");
-    }
+    const reservedPaths = this.reserveLocalUploadPaths(options.files);
 
-    for (const file of options.files) {
-      if (!(await fs.pathExists(file.path))) {
-        throw new Error(`本地文件不存在：${file.path}`);
+    try {
+      const config = this.configManager.getConfig(options.roomId);
+      if (!config.uid) {
+        throw new Error("房间未配置 webhook 上传账号");
       }
-    }
 
-    const preparedParts = await this.buildLocalUploadParts(options);
-    const appendAid =
-      options.uploadMode === "append" || (options.uploadMode !== "new" && options.aid)
-        ? options.aid
-        : undefined;
-    const live = new Live({
-      platform: options.platform || "custom",
-      software: "local-upload",
-      roomId: options.roomId,
-      title: options.title || preparedParts[0]?.title || "local upload",
-      username: options.username || "unknown",
-      startTime: options.startTime ?? preparedParts[0]?.startTime ?? Date.now(),
-      aid: appendAid,
-    });
-
-    const warnings: string[] = [];
-    const uploadRawWhenNoDanmu = options.uploadRawWhenNoDanmu ?? true;
-
-    for (const preparedPart of preparedParts) {
-      warnings.push(...preparedPart.warnings);
-      let uploadPath = preparedPart.path;
-      if (options.burnDanmu) {
-        try {
-          uploadPath = await this.burnLocalUploadPart(preparedPart, config);
-        } catch (error) {
-          if (!uploadRawWhenNoDanmu) {
-            warnings.push(`${path.basename(preparedPart.path)} 跳过：${String(error)}`);
-            continue;
-          }
-          warnings.push(`${path.basename(preparedPart.path)} 未压制弹幕，改为直接上传原视频：${String(error)}`);
+      for (const file of options.files) {
+        if (!(await fs.pathExists(file.path))) {
+          throw new Error(`本地文件不存在：${file.path}`);
         }
       }
 
-      const cleanupPaths =
-        uploadPath === preparedPart.path
-          ? preparedPart.cleanupPaths
-          : [preparedPart.path, ...preparedPart.cleanupPaths];
-      const part = live.addPart({
-        filePath: uploadPath,
-        rawFilePath: uploadPath,
-        recordStatus: "handled",
-        uploadStatus: "pending",
-        rawUploadStatus: "uploaded",
-        title: preparedPart.title,
-        startTime: preparedPart.startTime,
-        endTime: preparedPart.endTime,
+      const preparedParts = await this.buildLocalUploadParts(options);
+      const appendAid =
+        options.uploadMode === "append" || (options.uploadMode !== "new" && options.aid)
+          ? options.aid
+          : undefined;
+      const live = new Live({
+        platform: options.platform || "custom",
+        software: "local-upload",
+        roomId: options.roomId,
+        title: options.title || preparedParts[0]?.title || "local upload",
+        username: options.username || "unknown",
+        startTime: options.startTime ?? preparedParts[0]?.startTime ?? Date.now(),
+        aid: appendAid,
       });
-      this.setPartCleanupPaths(part, cleanupPaths);
-      this.registerUploadCleanupRefs([uploadPath, ...cleanupPaths], config);
+
+      const warnings: string[] = [];
+      const uploadRawWhenNoDanmu = options.uploadRawWhenNoDanmu ?? true;
+
+      for (const preparedPart of preparedParts) {
+        warnings.push(...preparedPart.warnings);
+        let uploadPath = preparedPart.path;
+        if (options.burnDanmu) {
+          try {
+            uploadPath = await this.burnLocalUploadPart(preparedPart, config);
+          } catch (error) {
+            if (!uploadRawWhenNoDanmu) {
+              warnings.push(`${path.basename(preparedPart.path)} 跳过：${String(error)}`);
+              continue;
+            }
+            warnings.push(
+              `${path.basename(preparedPart.path)} 未压制弹幕，改为直接上传原视频：${String(error)}`,
+            );
+          }
+        }
+
+        const cleanupPaths =
+          uploadPath === preparedPart.path
+            ? preparedPart.cleanupPaths
+            : [preparedPart.path, ...preparedPart.cleanupPaths];
+        const part = live.addPart({
+          filePath: uploadPath,
+          rawFilePath: uploadPath,
+          recordStatus: "handled",
+          uploadStatus: "pending",
+          rawUploadStatus: "uploaded",
+          title: preparedPart.title,
+          startTime: preparedPart.startTime,
+          endTime: preparedPart.endTime,
+        });
+        this.setPartCleanupPaths(part, cleanupPaths);
+        this.registerUploadCleanupRefs([uploadPath, ...cleanupPaths], config);
+      }
+
+      if (live.parts.length === 0) {
+        throw new Error(warnings.join("；") || "没有可上传的本地文件");
+      }
+
+      this.liveManager.addLive(live);
+      this.releaseLocalUploadReservations(reservedPaths);
+      await this.uploadVideoByType(live, "handled");
+
+      return {
+        eventId: live.eventId,
+        aid: live.aid,
+        warnings,
+      };
+    } catch (error) {
+      this.releaseLocalUploadReservations(reservedPaths);
+      throw error;
     }
-
-    if (live.parts.length === 0) {
-      throw new Error(warnings.join("；") || "没有可上传的本地文件");
-    }
-
-    this.liveManager.addLive(live);
-    await this.uploadVideoByType(live, "handled");
-
-    return {
-      eventId: live.eventId,
-      aid: live.aid,
-      warnings,
-    };
   };
 
   /**
@@ -545,29 +838,44 @@ export class WebhookHandler {
 
     log.debug(context.live);
 
+    const originalFilePath = options.filePath;
+
     // 3. 转封装处理
     await this.processConversion(context, options, config);
+    const processingConfig = await this.getEffectiveProcessingConfig(config);
 
     // 4. 设置预处理状态
     context.part.recordStatus = "prehandled";
 
     // 收集需要执行的操作并添加计数
     const xmlFilePath = PathResolver.getDanmuPath(options.filePath, options.danmuPath);
-    this.collectTasks(options.filePath, "originVideo", config);
-    this.collectTasks(xmlFilePath, "xml", config);
+    this.collectTasks(options.filePath, "originVideo", processingConfig);
+    this.collectTasks(xmlFilePath, "xml", processingConfig);
     if (context.part.cover) {
-      this.collectTasks(context.part.cover, "cover", config);
+      this.collectTasks(context.part.cover, "cover", processingConfig);
     }
 
     // 5. 处理弹幕和视频压制
-    const processingResult = await this.processMediaFiles(context, options, config, xmlFilePath);
+    const processingResult = await this.processMediaFiles(
+      context,
+      options,
+      processingConfig,
+      xmlFilePath,
+    );
     log.debug("processingResult", processingResult, options.filePath, context.part.filePath);
-    this.collectTasks(context.part.filePath, "handledVideo", config);
+    this.registerProcessedSourceUploadCleanup(context.part, options.filePath, config);
+    this.registerConvertedOriginalUploadCleanup(
+      context.part,
+      originalFilePath,
+      options.filePath,
+      config,
+    );
+    this.collectTasks(context.part.filePath, "handledVideo", processingConfig);
     if (processingResult.conversionSuccessful) {
-      this.fileRefManager.releaseRef(options.filePath);
+      await this.fileRefManager.releaseRef(options.filePath);
     }
     if (xmlFilePath && processingResult.danmuConversionSuccessful) {
-      this.fileRefManager.releaseRef(xmlFilePath);
+      await this.fileRefManager.releaseRef(xmlFilePath);
     }
 
     // 6. 处理文件同步和锁定
@@ -635,6 +943,8 @@ export class WebhookHandler {
         },
         {
           removeVideo: config.removeSourceAferrConvert2Mp4 ?? true,
+          roomId: config.roomId,
+          username: context.live.username,
         },
       );
 
@@ -713,6 +1023,8 @@ export class WebhookHandler {
           removeVideo: false,
           removeDanmu: false,
           limitTime: config.videoHandleTime,
+          roomId: config.roomId,
+          username: context.live.username,
         },
       );
 
@@ -750,6 +1062,8 @@ export class WebhookHandler {
           removeVideo: false,
           suffix: "-后处理",
           limitTime: config.videoHandleTime,
+          roomId: config.roomId,
+          username: context.live.username,
         });
         context.part.filePath = output;
         conversionSuccessful = true;
@@ -1069,6 +1383,8 @@ export class WebhookHandler {
       removeVideo: boolean;
       suffix?: string;
       limitTime?: [string, string];
+      roomId?: string;
+      username?: string;
     },
   ): Promise<string> {
     const { dir, name } = path.parse(videoFile);
@@ -1089,13 +1405,20 @@ export class WebhookHandler {
       }
     }
 
-    const task = await transcode(videoFile, outputName, preset, {
+    const plan = await this.planFfmpegOutput(videoFile, output, preset, {
+      roomId: options.roomId,
+      username: options.username,
+    });
+
+    const task = await transcode(videoFile, path.basename(plan.output), preset, {
       saveType: 2,
-      savePath: dir,
+      savePath: plan.savePath,
       override: false,
       removeOrigin: options.removeVideo,
-      autoRun: true,
+      autoRun: plan.autoRun,
+      manualStart: !plan.autoRun,
     });
+    task.custsomProgressMsg = plan.message;
 
     return new Promise((resolve, reject) => {
       task.on("task-end", () => {
@@ -1142,6 +1465,8 @@ export class WebhookHandler {
       removeVideo?: boolean;
       removeDanmu?: boolean;
       limitTime?: [string, string];
+      roomId?: string;
+      username?: string;
     },
   ): Promise<string> => {
     const videoInput = files.videoFilePath;
@@ -1154,11 +1479,18 @@ export class WebhookHandler {
       output = path.join(file.dir, `${file.name}-${suffix}-${uuid()}.mp4`);
     }
 
-    const task = await burn(files, output, {
+    const plan = await this.planFfmpegOutput(videoInput, output, options.ffmpegOptions, {
+      roomId: options.roomId,
+      username: options.username,
+    });
+    const task = await burn(files, plan.output, {
       ...options,
       removeOrigin: false,
       override: false,
+      autoRun: plan.autoRun,
+      manualStart: !plan.autoRun,
     });
+    task.custsomProgressMsg = plan.message;
 
     return new Promise((resolve, reject) => {
       task.on("task-end", async () => {
@@ -1176,7 +1508,7 @@ export class WebhookHandler {
             log.error("删除弹幕文件失败", error);
           }
         }
-        resolve(output);
+        resolve(plan.output);
       });
       task.on("task-error", ({ error }) => {
         reject(new Error(error));
@@ -1253,14 +1585,18 @@ export class WebhookHandler {
   }
 
   private getUploadReleasePaths(uploadedItems: UploadFileItem[]) {
-    const paths = new Set<string>();
+    const paths: string[] = [];
     for (const item of uploadedItems) {
-      paths.add(item.path);
+      paths.push(item.path);
       for (const cleanupPath of item.cleanupPaths ?? []) {
-        paths.add(cleanupPath);
+        paths.push(cleanupPath);
       }
     }
-    return Array.from(paths);
+    return paths.filter(Boolean);
+  }
+
+  private getUniqueUploadReleasePaths(uploadedItems: UploadFileItem[]) {
+    return Array.from(new Set(this.getUploadReleasePaths(uploadedItems)));
   }
 
   private registerUploadCleanupRefs(paths: string[], config: RoomConfig) {
@@ -1275,6 +1611,33 @@ export class WebhookHandler {
         this.fileRefManager.addRef(filePath, true);
       }
     }
+  }
+
+  private registerProcessedSourceUploadCleanup(part: Part, sourcePath: string, config: RoomConfig) {
+    if (part.filePath === sourcePath) return;
+    if (config.afterConvertRemoveVideoRaw) return;
+    if (config.afterUploadDeletAction === "none") return;
+
+    const cleanupPaths = new Set(this.getPartCleanupPaths(part, part.filePath));
+    cleanupPaths.add(sourcePath);
+    this.setPartCleanupPaths(part, Array.from(cleanupPaths));
+    this.registerUploadCleanupRefs([sourcePath], config);
+  }
+
+  private registerConvertedOriginalUploadCleanup(
+    part: Part,
+    originalPath: string,
+    convertedPath: string,
+    config: RoomConfig,
+  ) {
+    if (originalPath === convertedPath) return;
+    if (config.removeSourceAferrConvert2Mp4) return;
+    if (config.afterUploadDeletAction === "none") return;
+
+    const cleanupPaths = new Set(this.getPartCleanupPaths(part, part.filePath));
+    cleanupPaths.add(originalPath);
+    this.setPartCleanupPaths(part, Array.from(cleanupPaths));
+    this.registerUploadCleanupRefs([originalPath], config);
   }
 
   private toPathArray(items: UploadFileItem[]): { path: string; title: string }[] {
@@ -1387,10 +1750,7 @@ export class WebhookHandler {
       path: filePath,
       title: filePath,
     }));
-    const checkCallback = this.setupDeleteAfterCheckLock(
-      cleanupPathArray,
-      afterUploadDeletAction,
-    );
+    const checkCallback = this.setupDeleteAfterCheckLock(cleanupPathArray, afterUploadDeletAction);
 
     // console.log("upload", pathArray);
 
@@ -1398,6 +1758,10 @@ export class WebhookHandler {
       limitedUploadTime,
       afterUploadDeletAction: "none",
       forceCheck: afterUploadDeletAction === "deleteAfterCheck",
+      checkRemovePaths:
+        afterUploadDeletAction === "deleteAfterCheck"
+          ? this.getUniqueUploadReleasePaths(uploadedItems)
+          : undefined,
       checkCallback,
     });
 
@@ -1418,10 +1782,7 @@ export class WebhookHandler {
       path: filePath,
       title: filePath,
     }));
-    const checkCallback = this.setupDeleteAfterCheckLock(
-      cleanupPathArray,
-      afterUploadDeletAction,
-    );
+    const checkCallback = this.setupDeleteAfterCheckLock(cleanupPathArray, afterUploadDeletAction);
 
     // console.log("sortParams111111111", sortParams, pathArray);
     // 参数sortParams: array<{filePath:string;cid?:number}>，表示按照 filePath 对历史分P和当前上传文件统一排序
@@ -1429,6 +1790,10 @@ export class WebhookHandler {
       limitedUploadTime,
       afterUploadDeletAction: "none",
       forceCheck: afterUploadDeletAction === "deleteAfterCheck",
+      checkRemovePaths:
+        afterUploadDeletAction === "deleteAfterCheck"
+          ? this.getUniqueUploadReleasePaths(uploadedItems)
+          : undefined,
       checkCallback,
       sortParams,
     });
@@ -1659,7 +2024,7 @@ export class WebhookHandler {
   private async prepareUploadPreset(
     type: "raw" | "handled",
     config: RoomConfig,
-    live: Live,
+    live?: Live,
     cover?: string,
   ): Promise<BiliupConfig> {
     let uploadPreset = DEFAULT_BILIUP_CONFIG;
@@ -1671,9 +2036,37 @@ export class WebhookHandler {
       uploadPreset.cover = cover;
     }
 
+    const roomLink = live ? buildRoomLink(live.platform, live.roomId) || live.roomId : undefined;
+    if (config.appendLiveRoomLinkToDesc && roomLink) {
+      const roomLine = `直播间：${roomLink}`;
+      if (!uploadPreset.desc?.includes(roomLine)) {
+        uploadPreset.desc = [uploadPreset.desc?.trim(), roomLine]
+          .filter(Boolean)
+          .join("\n\n")
+          .slice(0, 2000);
+      }
+    }
+
+    if (config.appendLiveInfoTags && live) {
+      const tags = new Set((uploadPreset.tag ?? []).map((item) => item.trim()).filter(Boolean));
+      const addTag = (value?: string | number) => {
+        const tag = String(value ?? "")
+          .normalize("NFKC")
+          .trim()
+          .replace(/[,\s，#]+/g, "");
+        if (tag.length < 2) return;
+        tags.add(tag.slice(0, 20));
+      };
+      addTag(live.username);
+      addTag(live.roomId);
+      addTag(live.title);
+      uploadPreset.tag = Array.from(tags).slice(0, 10);
+    }
+
     // 处理转载来源：当设置为转载类型且转载来源为空时，自动生成直播间链接
     // TODO: 考虑迁移到上传预设配置实现，需要将metadata参数传递到上传函数中
     if (
+      live &&
       uploadPreset.copyright === 2 &&
       (!uploadPreset.source || uploadPreset.source.trim() === "")
     ) {

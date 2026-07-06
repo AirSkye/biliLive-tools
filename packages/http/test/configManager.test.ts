@@ -180,6 +180,27 @@ describe("ConfigManager", () => {
         const result = configManager.getConfig(roomId);
         expect(result.afterConvertRemoveVideo).toBe(false);
       });
+
+      it("should keep raw removeVideo flag even when no video preset exists", () => {
+        const appConfig = {
+          getAll: vi.fn().mockReturnValue({
+            webhook: {
+              open: true,
+              autoPartMerge: false,
+              partMergeMinute: 10,
+              afterConvertAction: ["removeVideo"],
+              ffmpegPreset: undefined,
+              syncId: undefined,
+            },
+          }),
+        };
+        // @ts-ignore
+        const configManager = new ConfigManager(appConfig);
+        const result = configManager.getConfig("123");
+
+        expect(result.afterConvertRemoveVideo).toBe(false);
+        expect(result.afterConvertRemoveVideoRaw).toBe(true);
+      });
     });
 
     describe("afterConvertRemoveXml", () => {
@@ -280,6 +301,27 @@ describe("ConfigManager", () => {
         const result = configManager.getConfig(roomId);
         expect(result.afterConvertRemoveXml).toBe(false);
       });
+
+      it("should keep raw removeXml flag even when no danmu preset exists", () => {
+        const appConfig = {
+          getAll: vi.fn().mockReturnValue({
+            webhook: {
+              open: true,
+              autoPartMerge: false,
+              partMergeMinute: 10,
+              afterConvertAction: ["removeXml"],
+              danmuPreset: undefined,
+              syncId: undefined,
+            },
+          }),
+        };
+        // @ts-ignore
+        const configManager = new ConfigManager(appConfig);
+        const result = configManager.getConfig("123");
+
+        expect(result.afterConvertRemoveXml).toBe(false);
+        expect(result.afterConvertRemoveXmlRaw).toBe(true);
+      });
     });
 
     describe("uploadNoDanmu", () => {
@@ -379,6 +421,54 @@ describe("ConfigManager", () => {
         const configManager = new ConfigManager(appConfig);
         const result = configManager.getConfig("123");
         expect(result.uploadToSameMedia).toBe(true);
+      });
+    });
+
+    describe("upload metadata defaults", () => {
+      it("should enable live room link and live info tags by default", () => {
+        const appConfig = {
+          getAll: vi.fn().mockReturnValue({
+            webhook: {
+              open: true,
+              autoPartMerge: false,
+              partMergeMinute: 10,
+            },
+          }),
+        };
+        // @ts-ignore
+        const configManager = new ConfigManager(appConfig);
+        const result = configManager.getConfig("123");
+
+        expect(result.appendLiveRoomLinkToDesc).toBe(true);
+        expect(result.appendLiveInfoTags).toBe(true);
+      });
+
+      it("should allow room setting to disable live room link and live info tags", () => {
+        const appConfig = {
+          getAll: vi.fn().mockReturnValue({
+            webhook: {
+              open: true,
+              autoPartMerge: false,
+              partMergeMinute: 10,
+              appendLiveRoomLinkToDesc: true,
+              appendLiveInfoTags: true,
+              rooms: {
+                "123": {
+                  open: true,
+                  noGlobal: ["appendLiveRoomLinkToDesc", "appendLiveInfoTags"],
+                  appendLiveRoomLinkToDesc: false,
+                  appendLiveInfoTags: false,
+                },
+              },
+            },
+          }),
+        };
+        // @ts-ignore
+        const configManager = new ConfigManager(appConfig);
+        const result = configManager.getConfig("123");
+
+        expect(result.appendLiveRoomLinkToDesc).toBe(false);
+        expect(result.appendLiveInfoTags).toBe(false);
       });
     });
 

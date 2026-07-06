@@ -75,6 +75,8 @@ export const APP_DEFAULT_CONFIG: AppConfig = {
     uploadNoDanmu: false,
     uploadToSameMedia: false,
     noDanmuVideoPreset: undefined,
+    appendLiveRoomLinkToDesc: true,
+    appendLiveInfoTags: true,
     limitVideoConvertTime: false,
     videoHandleTime: ["00:00:00", "23:59:59"],
     afterUploadDeletAction: "none",

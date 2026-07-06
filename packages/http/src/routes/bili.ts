@@ -30,6 +30,8 @@ const DEFAULT_WEBHOOK_ROOM_ID = "__global__";
 const DETAIL_FAILURE_LIMIT = 5;
 const DEFAULT_ARCHIVE_PAGES = 3;
 const DEFAULT_DETAIL_INTERVAL_MS = 1500;
+const ARCHIVE_SEARCH_CONCURRENCY = 2;
+const SEARCH_PRIVATE_DETAIL_LIMIT = 30;
 
 type LocalVideoFile = {
   localPath: string;
@@ -45,10 +47,14 @@ type LocalVideoFile = {
 type RemoteVideoPart = {
   aid: number;
   bvid?: string;
+  cid?: number;
+  page?: number;
   archiveTitle: string;
   partTitle?: string;
   remoteFilename?: string;
-  values: { label: string; normalized: string; allowFuzzy: boolean }[];
+  values: { label: string; raw?: string; normalized: string }[];
+  sources: string[];
+  searchKeywords: ArchiveSearchKeyword[];
 };
 
 type LocalUploadedFileMatch = {
@@ -59,6 +65,8 @@ type LocalUploadedFileMatch = {
   mtimeMs: number;
   aid: number;
   bvid?: string;
+  cid?: number;
+  page?: number;
   archiveTitle: string;
   partTitle?: string;
   remoteFilename?: string;
@@ -104,6 +112,19 @@ type LocalUnuploadedGroup = {
   warnings: string[];
 };
 
+type RemoteArchiveItem = {
+  aid: number;
+  item: any;
+  sources: string[];
+  searchKeywords: ArchiveSearchKeyword[];
+};
+
+type ArchiveSearchKeyword = {
+  keyword: string;
+  normalized: string;
+  type: "title" | "streamer";
+};
+
 type LocalFileContext = {
   localFile: LocalVideoFile;
   record?: RecordWithStreamer | null;
@@ -125,6 +146,29 @@ type ParsedLocalMetadata = {
   username?: string;
   title?: string;
   startTime?: number;
+};
+
+type ParsedRecorderIdentity = {
+  roomId?: string;
+  date: string;
+  time: string;
+  title: string;
+  startTime?: number;
+};
+
+type LocalMatchHint = {
+  title?: string;
+  username?: string;
+  dateKey?: string;
+  normalizedTitle: string;
+  normalizedTitleAliases: string[];
+  normalizedUsername: string;
+};
+
+type LocalFileMatchResult = {
+  confidence: "high" | "medium";
+  reason: string;
+  score: number;
 };
 
 const getQueryValue = (value: unknown) => {
@@ -163,20 +207,39 @@ const normalizeMatchText = (value?: string | null) => {
     .replace(/[\[\]【】()（）{}<>《》「」『』._-]/g, "");
 };
 
-const formatDateKey = (timestamp?: number) => {
-  if (!timestamp || !Number.isFinite(timestamp)) return undefined;
-  const date = new Date(timestamp);
-  const year = date.getFullYear();
-  const month = `${date.getMonth() + 1}`.padStart(2, "0");
-  const day = `${date.getDate()}`.padStart(2, "0");
-  return `${year}${month}${day}`;
+const trimGeneratedVideoSuffix = (value?: string | null) => {
+  return path
+    .parse(String(value ?? ""))
+    .name.replace(/-弹幕版[\da-f-]*$/i, "")
+    .replace(/-后处理$/i, "")
+    .replace(/-合并$/i, "");
 };
 
-const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
-  const match = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
-  if (!match) return {};
+const parseRecorderIdentity = (value?: string | null): ParsedRecorderIdentity | null => {
+  const stem = trimGeneratedVideoSuffix(value);
+  const recordMatch = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
+  const compactMatch = stem.match(/^(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
+  const readableMatch = stem.match(
+    /^(\d{4})-(\d{2})-(\d{2})[\sT_-]+(\d{2})[-:](\d{2})[-:](\d{2})(?:[-_.]\d+)?[\s_-]+(.+)$/,
+  );
 
-  const [, roomId, date, time, title] = match;
+  let roomId: string | undefined;
+  let date: string;
+  let time: string;
+  let title: string;
+  if (recordMatch) {
+    [, roomId, date, time, title] = recordMatch;
+  } else if (compactMatch) {
+    [, date, time, title] = compactMatch;
+  } else if (readableMatch) {
+    const [, year, month, day, hour, minute, second, text] = readableMatch;
+    date = `${year}${month}${day}`;
+    time = `${hour}${minute}${second}`;
+    title = text;
+  } else {
+    return null;
+  }
+
   const year = Number(date.slice(0, 4));
   const month = Number(date.slice(4, 6));
   const day = Number(date.slice(6, 8));
@@ -187,9 +250,58 @@ const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
 
   return {
     roomId,
-    platform: "bilibili",
+    date,
+    time,
     title,
     startTime: Number.isFinite(startTime) ? startTime : undefined,
+  };
+};
+
+const normalizePartIdentity = (value?: string | null) => {
+  const recorderIdentity = parseRecorderIdentity(value);
+  if (recorderIdentity) {
+    const roomSegment = recorderIdentity.roomId ? `${recorderIdentity.roomId}-` : "";
+    return normalizeMatchText(
+      `录制-${roomSegment}${recorderIdentity.date}-${recorderIdentity.time}-${recorderIdentity.title}`,
+    );
+  }
+  const normalized = normalizeMatchText(value)
+    .replace(/弹幕版[\da-f]*$/i, "")
+    .replace(/后处理$/i, "")
+    .replace(/合并$/i, "");
+  return normalized;
+};
+
+const recorderIdentitiesMatch = (
+  left: ParsedRecorderIdentity,
+  right: ParsedRecorderIdentity,
+  { requireTime }: { requireTime: boolean },
+) => {
+  const sameDate = left.date === right.date;
+  const sameTime = !requireTime || left.time === right.time;
+  const sameTitle = normalizeMatchText(left.title) === normalizeMatchText(right.title);
+  const sameRoom = !left.roomId || !right.roomId || left.roomId === right.roomId;
+  return sameDate && sameTime && sameTitle && sameRoom;
+};
+
+const formatDateKey = (timestamp?: number) => {
+  if (!timestamp || !Number.isFinite(timestamp)) return undefined;
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}${month}${day}`;
+};
+
+const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
+  const identity = parseRecorderIdentity(stem);
+  if (!identity) return {};
+
+  return {
+    roomId: identity.roomId,
+    platform: "bilibili",
+    title: identity.title,
+    startTime: identity.startTime,
   };
 };
 
@@ -206,6 +318,182 @@ const parseLocalMatchMetadata = (localFile: LocalVideoFile) => {
 };
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const runLimited = async <T>(
+  items: T[],
+  limit: number,
+  worker: (item: T, index: number) => Promise<void>,
+) => {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor;
+      cursor += 1;
+      await worker(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+};
+
+const mergeArchiveItem = (current: any, incoming: any) => {
+  if (!current) return incoming;
+  if (!incoming) return current;
+
+  const currentVideos = Array.isArray(current?.Videos) ? current.Videos : [];
+  const incomingVideos = Array.isArray(incoming?.Videos) ? incoming.Videos : [];
+  const merged = {
+    ...current,
+    ...incoming,
+    Archive: {
+      ...(current?.Archive ?? {}),
+      ...(incoming?.Archive ?? {}),
+    },
+  };
+  if (currentVideos.length > 0 && incomingVideos.length === 0) {
+    merged.Videos = currentVideos;
+  }
+  return merged;
+};
+
+const buildArchiveSearchKeywords = (localFiles: LocalVideoFile[]) => {
+  const titleKeywords = new Map<string, ArchiveSearchKeyword>();
+  const userKeywords = new Map<string, ArchiveSearchKeyword>();
+  const recordLookup = buildRecordLookup();
+  const addKeyword = (
+    map: Map<string, ArchiveSearchKeyword>,
+    type: ArchiveSearchKeyword["type"],
+    value?: string | null,
+    minLength = 2,
+  ) => {
+    const keyword = value?.trim();
+    if (!keyword || keyword.length < minLength) return;
+    const normalized = normalizeMatchText(keyword);
+    if (!normalized || map.has(normalized)) return;
+    map.set(normalized, { keyword, normalized, type });
+  };
+
+  for (const localFile of localFiles) {
+    const metadata = parseLocalMatchMetadata(localFile);
+    const record = findRecordByLocalFile(localFile, recordLookup);
+    addKeyword(titleKeywords, "title", record?.title || metadata.title, 4);
+    addKeyword(titleKeywords, "title", record?.video_filename, 4);
+    addKeyword(userKeywords, "streamer", record?.streamer?.name || metadata.username, 2);
+  }
+  const keywords: ArchiveSearchKeyword[] = [];
+  const appendKeyword = (keyword: ArchiveSearchKeyword) => {
+    if (
+      keywords.length >= 60 ||
+      keywords.some((item) => item.type === keyword.type && item.normalized === keyword.normalized)
+    ) {
+      return;
+    }
+    keywords.push(keyword);
+  };
+  const titleList = Array.from(titleKeywords.values());
+  const userList = Array.from(userKeywords.values());
+  const maxLength = Math.max(titleList.length, userList.length);
+  for (let index = 0; index < maxLength; index++) {
+    if (titleList[index]) appendKeyword(titleList[index]);
+    if (userList[index]) appendKeyword(userList[index]);
+  }
+  return keywords;
+};
+
+const buildLocalMatchHints = (localFiles: LocalVideoFile[]) => {
+  const recordLookup = buildRecordLookup();
+  const hints = new Map<string, LocalMatchHint>();
+  const buildAliases = (...values: Array<string | undefined | null>) => {
+    return Array.from(new Set(values.map((value) => normalizeMatchText(value)).filter(Boolean)));
+  };
+  for (const localFile of localFiles) {
+    const metadata = parseLocalMatchMetadata(localFile);
+    const record = findRecordByLocalFile(localFile, recordLookup);
+    const title = record?.title || metadata.title;
+    const username = record?.streamer?.name || metadata.username;
+    const identity = parseRecorderIdentity(localFile.stem);
+    const normalizedTitle = normalizeMatchText(title);
+    const normalizedTitleAliases = buildAliases(
+      title,
+      metadata.title,
+      record?.video_filename,
+      identity?.title,
+      localFile.stem,
+    );
+    const dateKey = record?.record_start_time
+      ? formatDateKey(record.record_start_time)
+      : metadata.dateKey;
+    hints.set(normalizeLocalPath(localFile.localPath), {
+      title,
+      username,
+      dateKey,
+      normalizedTitle,
+      normalizedTitleAliases,
+      normalizedUsername: normalizeMatchText(username),
+    });
+  }
+  return hints;
+};
+
+const getSearchSignals = (
+  searchKeywords: ArchiveSearchKeyword[],
+  normalizedTitles?: string | string[],
+  normalizedUsername?: string,
+) => {
+  const titleList = Array.isArray(normalizedTitles)
+    ? normalizedTitles
+    : normalizedTitles
+      ? [normalizedTitles]
+      : [];
+  const titleSearchMatched =
+    titleList.length > 0 &&
+    searchKeywords.some(
+      (keyword) => keyword.type === "title" && titleList.includes(keyword.normalized),
+    );
+  const streamerSearchMatched =
+    !!normalizedUsername &&
+    searchKeywords.some(
+      (keyword) => keyword.type === "streamer" && keyword.normalized === normalizedUsername,
+    );
+  return {
+    titleSearchMatched,
+    streamerSearchMatched,
+    dualSearchMatched: titleSearchMatched && streamerSearchMatched,
+  };
+};
+
+const fetchPublicArchiveDetail = async (archive: { aid?: number; bvid?: string }) => {
+  const params = archive.bvid
+    ? `bvid=${encodeURIComponent(String(archive.bvid))}`
+    : `aid=${encodeURIComponent(String(archive.aid))}`;
+  const response = await fetch(`https://api.bilibili.com/x/web-interface/view?${params}`, {
+    headers: {
+      "user-agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126 Safari/537.36",
+      referer: "https://www.bilibili.com/",
+    },
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const data = (await response.json()) as {
+    code?: number;
+    message?: string;
+    data?: {
+      title?: string;
+      bvid?: string;
+      pages?: Array<{
+        cid?: number;
+        page?: number;
+        part?: string;
+        duration?: number;
+      }>;
+    };
+  };
+  if (data.code !== 0 || !data.data) {
+    throw new Error(data.message || `code ${data.code}`);
+  }
+  return data.data;
+};
 
 const resolveScanRoots = async (rootPath?: string) => {
   const config = appConfig.getAll();
@@ -295,29 +583,112 @@ const collectRemoteVideoParts = async (
   pageSize: number,
   useArchiveDetail = false,
   detailIntervalMs = DEFAULT_DETAIL_INTERVAL_MS,
+  searchKeywords: ArchiveSearchKeyword[] = [],
 ) => {
-  const archives = new Map<number, any>();
+  const archives = new Map<number, RemoteArchiveItem>();
   const errors: string[] = [];
   const warnings: string[] = [];
   const logs: string[] = [];
 
-  for (let pn = 1; pn <= pages; pn++) {
-    try {
-      const data = await biliApi.getArchives({ pn, ps: pageSize }, uid);
-      const pageItems = data?.arc_audits ?? [];
-      logs.push(`已读取B站稿件列表第 ${pn} 页：${pageItems.length} 条`);
-      for (const item of pageItems) {
-        const aid = Number(item?.Archive?.aid);
-        if (aid) archives.set(aid, item);
+  const addArchive = (item: any, source: string, searchKeyword?: ArchiveSearchKeyword) => {
+    const aid = Number(item?.Archive?.aid);
+    if (!aid) return;
+    const existing = archives.get(aid);
+    if (existing) {
+      existing.item = mergeArchiveItem(existing.item, item);
+      if (!existing.sources.includes(source)) existing.sources.push(source);
+      if (
+        searchKeyword &&
+        !existing.searchKeywords.some(
+          (keyword) =>
+            keyword.type === searchKeyword.type && keyword.normalized === searchKeyword.normalized,
+        )
+      ) {
+        existing.searchKeywords.push(searchKeyword);
       }
-      const total = Number(data?.page?.count ?? 0);
-      if (total > 0 && pn * pageSize >= total) break;
-    } catch (error) {
-      errors.push(`获取稿件列表第 ${pn} 页失败`);
-      logs.push(`获取B站稿件列表第 ${pn} 页失败，检测已停止继续拉取远端列表`);
-      break;
+      return;
     }
-  }
+    archives.set(aid, {
+      aid,
+      item,
+      sources: [source],
+      searchKeywords: searchKeyword ? [searchKeyword] : [],
+    });
+  };
+
+  const collectPagedArchives = async () => {
+    for (let pn = 1; pn <= pages; pn++) {
+      try {
+        const data = await biliApi.getArchives({ pn, ps: pageSize }, uid);
+        const pageItems = data?.arc_audits ?? [];
+        logs.push(`已读取B站稿件列表第 ${pn} 页：${pageItems.length} 条`);
+        for (const item of pageItems) {
+          addArchive(item, `列表第 ${pn} 页`);
+        }
+        const total = Number(data?.page?.count ?? 0);
+        if (total > 0 && pn * pageSize >= total) break;
+      } catch (error) {
+        errors.push(`获取稿件列表第 ${pn} 页失败`);
+        logs.push(`获取B站稿件列表第 ${pn} 页失败，检测已停止继续拉取远端列表`);
+        break;
+      }
+    }
+  };
+
+  const collectSearchArchives = async () => {
+    if (searchKeywords.length === 0) return;
+    const titleCount = searchKeywords.filter((item) => item.type === "title").length;
+    const streamerCount = searchKeywords.filter((item) => item.type === "streamer").length;
+    logs.push(
+      `开始按本地标题/主播搜索稿件：标题 ${titleCount} 个，主播 ${streamerCount} 个，并发 ${ARCHIVE_SEARCH_CONCURRENCY}`,
+    );
+
+    const results: Array<{
+      keyword: ArchiveSearchKeyword;
+      pageItems?: any[];
+      error?: unknown;
+    }> = new Array(searchKeywords.length);
+    await runLimited(searchKeywords, ARCHIVE_SEARCH_CONCURRENCY, async (keyword, index) => {
+      try {
+        const data = await biliApi.getArchives(
+          { pn: 1, ps: 10, keyword: keyword.keyword } as any,
+          uid,
+        );
+        results[index] = {
+          keyword,
+          pageItems: data?.arc_audits ?? [],
+        };
+      } catch (error) {
+        results[index] = { keyword, error };
+      }
+    });
+
+    for (const result of results) {
+      if (!result) continue;
+      const label = result.keyword.type === "streamer" ? "主播" : "标题";
+      if (result.error) {
+        warnings.push(`搜索${label}稿件失败：${result.keyword.keyword}`);
+        logs.push(`搜索${label}“${result.keyword.keyword}”失败，已跳过`);
+        continue;
+      }
+      const pageItems = result.pageItems ?? [];
+      logs.push(`搜索${label}“${result.keyword.keyword}”：${pageItems.length} 条`);
+      for (const item of pageItems) {
+        addArchive(item, `搜索${label}：${result.keyword.keyword}`, result.keyword);
+      }
+    }
+
+    const dualSearchArchiveCount = Array.from(archives.values()).filter((archive) => {
+      const hasTitle = archive.searchKeywords.some((keyword) => keyword.type === "title");
+      const hasStreamer = archive.searchKeywords.some((keyword) => keyword.type === "streamer");
+      return hasTitle && hasStreamer;
+    }).length;
+    if (dualSearchArchiveCount > 0) {
+      logs.push(`搜索结果合并完成：${dualSearchArchiveCount} 个稿件同时命中标题和主播搜索`);
+    }
+  };
+
+  await Promise.all([collectPagedArchives(), collectSearchArchives()]);
 
   const parts: RemoteVideoPart[] = [];
   if (!useArchiveDetail) {
@@ -325,67 +696,142 @@ const collectRemoteVideoParts = async (
   } else {
     logs.push(`本轮启用稿件详情接口匹配，详情请求间隔 ${detailIntervalMs}ms`);
   }
-  let consecutiveDetailFailures = 0;
-  let skipArchiveDetail = false;
-  let skippedDetailCount = 0;
+  let consecutivePrivateDetailFailures = 0;
+  let skipPrivateDetail = false;
+  let skippedPrivateDetailCount = 0;
   let detailRequestCount = 0;
-  for (const [aid, item] of archives) {
-    let detail: any | null = null;
-    if (useArchiveDetail && !skipArchiveDetail) {
-      try {
-        if (detailRequestCount > 0 && detailIntervalMs > 0) {
-          await sleep(detailIntervalMs);
-        }
-        detailRequestCount += 1;
-        detail = await biliApi.getPlatformArchiveDetail(aid, uid);
-        consecutiveDetailFailures = 0;
-      } catch (error) {
-        consecutiveDetailFailures += 1;
-        warnings.push(`稿件详情接口不可用，已使用列表信息继续匹配：${aid}`);
-        logs.push(`稿件 ${aid} 详情接口不可用，已使用列表信息继续匹配`);
-        if (consecutiveDetailFailures >= DETAIL_FAILURE_LIMIT) {
-          skipArchiveDetail = true;
+  let publicDetailCount = 0;
+  let privateDetailCount = 0;
+  let searchPrivateDetailAttempts = 0;
+  let searchPrivateDetailLimitLogged = false;
+  const waitDetailInterval = async () => {
+    if (detailRequestCount > 0 && detailIntervalMs > 0) {
+      await sleep(detailIntervalMs);
+    }
+    detailRequestCount += 1;
+  };
+  const fetchPrivateDetail = async (aid: number, forceForSearch: boolean) => {
+    if (!forceForSearch && skipPrivateDetail) {
+      return null;
+    }
+    if (forceForSearch) {
+      if (searchPrivateDetailAttempts >= SEARCH_PRIVATE_DETAIL_LIMIT) {
+        if (!searchPrivateDetailLimitLogged) {
           logs.push(
-            `稿件详情接口连续失败 ${DETAIL_FAILURE_LIMIT} 次，本轮后续稿件改用列表信息匹配`,
+            `搜索命中稿件私有详情尝试达到 ${SEARCH_PRIVATE_DETAIL_LIMIT} 个，后续改用公开/列表信息`,
           );
+          searchPrivateDetailLimitLogged = true;
+        }
+        return null;
+      }
+      searchPrivateDetailAttempts += 1;
+    }
+    await waitDetailInterval();
+    const data = await biliApi.getPlatformArchiveDetail(aid, uid);
+    privateDetailCount += 1;
+    consecutivePrivateDetailFailures = 0;
+    return data;
+  };
+  for (const [aid, archiveItem] of archives) {
+    const item = archiveItem.item;
+    let detail: any | null = null;
+    let publicDetail: Awaited<ReturnType<typeof fetchPublicArchiveDetail>> | null = null;
+    let privateDetailTried = false;
+    const isSearchHit = archiveItem.searchKeywords.length > 0;
+    if (useArchiveDetail) {
+      if (isSearchHit) {
+        logs.push(`稿件 ${aid} 来自搜索命中，优先尝试私有详情接口`);
+        try {
+          privateDetailTried = searchPrivateDetailAttempts < SEARCH_PRIVATE_DETAIL_LIMIT;
+          detail = await fetchPrivateDetail(aid, true);
+        } catch (error) {
+          consecutivePrivateDetailFailures += 1;
+          logs.push(`搜索命中稿件 ${aid} 私有详情不可用，继续尝试公开详情`);
+          if (consecutivePrivateDetailFailures >= DETAIL_FAILURE_LIMIT) {
+            skipPrivateDetail = true;
+            logs.push(
+              `私有稿件详情接口连续失败 ${DETAIL_FAILURE_LIMIT} 次，非搜索命中稿件将跳过私有兜底`,
+            );
+          }
         }
       }
-    } else {
-      if (useArchiveDetail) skippedDetailCount += 1;
+
+      try {
+        if (!detail) {
+          await waitDetailInterval();
+          publicDetail = await fetchPublicArchiveDetail({
+            aid,
+            bvid: item?.Archive?.bvid,
+          });
+          publicDetailCount += 1;
+        }
+      } catch (publicError) {
+        if (privateDetailTried) {
+          warnings.push(`稿件分P详情不可用，已使用列表信息继续判断未上传：${aid}`);
+          logs.push(`稿件 ${aid} 公开详情和私有详情均不可用，无法做分P级匹配`);
+        } else if (skipPrivateDetail) {
+          skippedPrivateDetailCount += 1;
+          logs.push(`稿件 ${aid} 公开分P信息不可用，私有详情已临时跳过`);
+        } else {
+          logs.push(`稿件 ${aid} 公开分P信息不可用，尝试私有详情接口`);
+          try {
+            detail = await fetchPrivateDetail(aid, false);
+          } catch (error) {
+            consecutivePrivateDetailFailures += 1;
+            warnings.push(`稿件分P详情不可用，已使用列表信息继续判断未上传：${aid}`);
+            logs.push(`稿件 ${aid} 私有详情接口不可用，无法做分P级匹配`);
+            if (consecutivePrivateDetailFailures >= DETAIL_FAILURE_LIMIT) {
+              skipPrivateDetail = true;
+              logs.push(
+                `私有稿件详情接口连续失败 ${DETAIL_FAILURE_LIMIT} 次，本轮后续仅在公开详情失败时跳过私有兜底`,
+              );
+            }
+          }
+        }
+      }
     }
 
-    const archive = detail?.archive ?? item?.Archive ?? {};
+    const archive = detail?.archive ?? publicDetail ?? item?.Archive ?? {};
     const videos = Array.isArray(detail?.videos)
       ? detail.videos
-      : Array.isArray(item?.Videos)
-        ? item.Videos
-        : [];
+      : Array.isArray(publicDetail?.pages)
+        ? publicDetail.pages
+        : Array.isArray(item?.Videos)
+          ? item.Videos
+          : [];
     const archiveTitle = String(archive?.title ?? item?.Archive?.title ?? "");
-    const bvid = archive?.bvid ?? item?.Archive?.bvid;
+    const bvid = archive?.bvid ?? publicDetail?.bvid ?? item?.Archive?.bvid;
     const addPart = (video?: any) => {
       const remoteFilename = video?.filename ? path.basename(String(video.filename)) : undefined;
       const remoteFilenameStem = remoteFilename ? path.parse(remoteFilename).name : undefined;
-      const partTitle = video?.title ? String(video.title) : undefined;
+      const partTitle = video?.title
+        ? String(video.title)
+        : video?.part
+          ? String(video.part)
+          : undefined;
       const values = [
-        { label: "分P文件名", value: remoteFilename, allowFuzzy: true },
-        { label: "分P文件名", value: remoteFilenameStem, allowFuzzy: true },
-        { label: "分P标题", value: partTitle, allowFuzzy: true },
-        { label: "稿件标题", value: archiveTitle, allowFuzzy: archiveTitle.length >= 12 },
+        { label: "分P文件名", value: remoteFilename },
+        { label: "分P文件名", value: remoteFilenameStem },
+        { label: "分P标题", value: partTitle },
       ]
         .map((value) => ({
           label: value.label,
-          normalized: normalizeMatchText(value.value),
-          allowFuzzy: value.allowFuzzy,
+          raw: value.value,
+          normalized: normalizePartIdentity(value.value),
         }))
         .filter((value) => value.normalized);
 
       parts.push({
         aid,
         bvid,
+        cid: video?.cid ? Number(video.cid) : undefined,
+        page: video?.page ? Number(video.page) : undefined,
         archiveTitle,
         partTitle,
         remoteFilename,
         values,
+        sources: archiveItem.sources,
+        searchKeywords: archiveItem.searchKeywords,
       });
     };
 
@@ -395,52 +841,113 @@ const collectRemoteVideoParts = async (
       for (const video of videos) addPart(video);
     }
   }
-  if (skippedDetailCount > 0) {
-    warnings.push(`已跳过 ${skippedDetailCount} 个稿件详情请求，改用稿件列表信息匹配`);
+  if (skippedPrivateDetailCount > 0) {
+    warnings.push(`已跳过 ${skippedPrivateDetailCount} 个私有稿件详情请求，改用稿件列表信息匹配`);
+  }
+  if (useArchiveDetail) {
+    logs.push(
+      `分P详情读取完成：公开接口 ${publicDetailCount} 个，私有接口 ${privateDetailCount} 个`,
+    );
   }
 
   return { parts, archiveCount: archives.size, errors, warnings, logs };
 };
 
-const matchLocalFile = (localFile: LocalVideoFile, remotePart: RemoteVideoPart) => {
+const matchLocalFile = (
+  localFile: LocalVideoFile,
+  remotePart: RemoteVideoPart,
+  hint?: LocalMatchHint,
+) => {
+  const candidates: LocalFileMatchResult[] = [];
+  const addCandidate = (
+    score: number,
+    confidence: LocalFileMatchResult["confidence"],
+    reason: string,
+  ) => {
+    candidates.push({ score, confidence, reason });
+  };
+  const localBase = normalizePartIdentity(localFile.fileName);
+  const localStem = normalizePartIdentity(localFile.stem);
+  const localIdentities = [
+    parseRecorderIdentity(localFile.fileName),
+    parseRecorderIdentity(localFile.stem),
+  ].filter((item): item is ParsedRecorderIdentity => !!item);
   for (const value of remotePart.values) {
-    if (localFile.normalizedBase && localFile.normalizedBase === value.normalized) {
-      return { confidence: "high" as const, reason: `文件名匹配 ${value.label}` };
-    }
-    if (localFile.normalizedStem && localFile.normalizedStem === value.normalized) {
-      return { confidence: "high" as const, reason: `文件名主干匹配 ${value.label}` };
-    }
-  }
-
-  if (localFile.normalizedStem.length < 8) return null;
-  for (const value of remotePart.values) {
-    if (!value.allowFuzzy || value.normalized.length < 8) continue;
+    const remoteIdentity = parseRecorderIdentity(value.raw);
     if (
-      value.normalized.includes(localFile.normalizedStem) ||
-      localFile.normalizedStem.includes(value.normalized)
+      remoteIdentity &&
+      localIdentities.some((localIdentity) =>
+        recorderIdentitiesMatch(localIdentity, remoteIdentity, { requireTime: true }),
+      )
     ) {
-      return { confidence: "medium" as const, reason: `疑似包含匹配 ${value.label}` };
+      addCandidate(100, "high", `原始标题匹配 ${value.label}`);
+    }
+    if (localBase && localBase === value.normalized) {
+      addCandidate(98, "high", `文件名匹配 ${value.label}`);
+    }
+    if (localStem && localStem === value.normalized) {
+      addCandidate(96, "high", `文件名主干匹配 ${value.label}`);
     }
   }
 
-  const localMetadata = parseLocalMatchMetadata(localFile);
-  const localTitle = normalizeMatchText(localMetadata.title);
-  const localUsername = normalizeMatchText(localMetadata.username);
+  if (localStem.length >= 8) {
+    for (const value of remotePart.values) {
+      if (value.normalized.length < 8) continue;
+      if (value.normalized.includes(localStem) || localStem.includes(value.normalized)) {
+        addCandidate(50, "medium", `疑似包含匹配 ${value.label}`);
+      }
+    }
+  }
+
   const archiveTitle = normalizeMatchText(remotePart.archiveTitle);
-  if (localTitle.length >= 6 && archiveTitle.includes(localTitle)) {
-    const hasUserSignal = !!localUsername && archiveTitle.includes(localUsername);
-    const hasDateSignal = !!localMetadata.dateKey && archiveTitle.includes(localMetadata.dateKey);
-    if (hasUserSignal || hasDateSignal || localTitle.length >= 10) {
-      return {
-        confidence: hasUserSignal || hasDateSignal ? ("high" as const) : ("medium" as const),
-        reason: `录制标题匹配稿件标题${hasUserSignal ? "，主播一致" : ""}${
-          hasDateSignal ? "，日期一致" : ""
-        }`,
-      };
-    }
+  const fallbackMetadata = hint ? null : parseLocalMatchMetadata(localFile);
+  const normalizedTitle = hint?.normalizedTitle || normalizeMatchText(fallbackMetadata?.title);
+  const normalizedTitleAliases = hint?.normalizedTitleAliases?.length
+    ? hint.normalizedTitleAliases
+    : [normalizedTitle].filter(Boolean);
+  const normalizedUsername =
+    hint?.normalizedUsername || normalizeMatchText(fallbackMetadata?.username);
+  const dateKey = hint?.dateKey || fallbackMetadata?.dateKey;
+  const { titleSearchMatched, streamerSearchMatched, dualSearchMatched } = getSearchSignals(
+    remotePart.searchKeywords,
+    normalizedTitleAliases,
+    normalizedUsername,
+  );
+  const archiveHasTitle = normalizedTitleAliases.some(
+    (title) => title.length >= 6 && archiveTitle.includes(title),
+  );
+  const archiveHasDate = !!dateKey && archiveTitle.includes(dateKey);
+  const archiveHasUser = !!normalizedUsername && archiveTitle.includes(normalizedUsername);
+  if (
+    archiveHasTitle &&
+    (titleSearchMatched || streamerSearchMatched || archiveHasDate || archiveHasUser)
+  ) {
+    const signals = [
+      dualSearchMatched ? "标题+主播搜索同时命中" : "",
+      !dualSearchMatched && titleSearchMatched ? "标题搜索命中" : "",
+      !dualSearchMatched && streamerSearchMatched ? "主播搜索命中" : "",
+      archiveHasUser ? "稿件标题含主播" : "",
+      archiveHasDate ? "稿件标题含日期" : "",
+    ].filter(Boolean);
+    const hasStrongSignal =
+      dualSearchMatched || streamerSearchMatched || archiveHasDate || archiveHasUser;
+    addCandidate(
+      dualSearchMatched ? 90 : hasStrongSignal ? 82 : 70,
+      hasStrongSignal ? "high" : "medium",
+      `稿件标题匹配（${signals.join("，")}）`,
+    );
   }
 
-  return null;
+  if (!archiveHasTitle && dualSearchMatched && (archiveHasDate || archiveHasUser)) {
+    const signals = [
+      "标题+主播搜索同时命中",
+      archiveHasUser ? "稿件标题含主播" : "",
+      archiveHasDate ? "稿件标题含日期" : "",
+    ].filter(Boolean);
+    addCandidate(72, "medium", `搜索结果匹配（${signals.join("，")}）`);
+  }
+
+  return candidates.sort((left, right) => right.score - left.score)[0] ?? null;
 };
 
 const normalizeLocalPath = (filePath: string) => {
@@ -568,10 +1075,9 @@ const buildLocalFileContexts = async (
     const parentDir = path.dirname(localFile.localPath);
     const fallbackDay = new Date(localFile.mtimeMs).toISOString().slice(0, 10);
     const dayKey = new Date(startTime).toISOString().slice(0, 10);
-    const groupKey =
-      roomId
-        ? `${platform || "bilibili"}:${roomId}:${record?.live_id || `${dayKey}:${normalizeMatchText(title)}`}`
-        : `dir:${normalizeLocalPath(parentDir)}:${fallbackDay}`;
+    const groupKey = roomId
+      ? `${platform || "bilibili"}:${roomId}:${record?.live_id || `${dayKey}:${normalizeMatchText(title)}`}`
+      : `dir:${normalizeLocalPath(parentDir)}:${fallbackDay}`;
 
     contexts.push({
       localFile,
@@ -598,6 +1104,79 @@ const hasWebhookUploadConfig = (roomId?: string) => {
   } catch {
     return false;
   }
+};
+
+const archiveMatchesLocalGroup = (context: LocalFileContext, archiveTitle: string) => {
+  const normalizedArchiveTitle = normalizeMatchText(archiveTitle);
+  const normalizedTitle = normalizeMatchText(context.title);
+  if (!normalizedTitle || !normalizedArchiveTitle.includes(normalizedTitle)) return false;
+
+  const normalizedUsername = normalizeMatchText(context.username);
+  const dateKey = formatDateKey(context.startTime);
+  const hasUserSignal = !!normalizedUsername && normalizedArchiveTitle.includes(normalizedUsername);
+  const hasDateSignal = !!dateKey && normalizedArchiveTitle.includes(dateKey);
+  return hasUserSignal || hasDateSignal || normalizedTitle.length >= 10;
+};
+
+const remotePartMatchesLocalGroup = (context: LocalFileContext, remotePart: RemoteVideoPart) => {
+  const localIdentity = parseRecorderIdentity(context.localFile.fileName);
+  const localTitle = normalizeMatchText(localIdentity?.title || context.title);
+  const localTitleAliases = Array.from(
+    new Set(
+      [
+        localTitle,
+        normalizeMatchText(localIdentity?.title),
+        normalizeMatchText(context.title),
+        normalizeMatchText(context.localFile.stem),
+      ].filter(Boolean),
+    ),
+  );
+  const localRoomId = localIdentity?.roomId || context.roomId;
+  const localDateKey = localIdentity?.date || formatDateKey(context.startTime);
+  const normalizedUsername = normalizeMatchText(context.username);
+  const remoteArchiveTitle = normalizeMatchText(remotePart.archiveTitle);
+  const { titleSearchMatched, streamerSearchMatched, dualSearchMatched } = getSearchSignals(
+    remotePart.searchKeywords,
+    localTitleAliases,
+    normalizedUsername,
+  );
+  const archiveHasTitle = localTitleAliases.some(
+    (title) => title.length >= 6 && remoteArchiveTitle.includes(title),
+  );
+  const archiveHasUser = !!normalizedUsername && remoteArchiveTitle.includes(normalizedUsername);
+  const archiveHasDate = !!localDateKey && remoteArchiveTitle.includes(localDateKey);
+  if (dualSearchMatched && archiveHasTitle) {
+    return true;
+  }
+  if (
+    archiveHasTitle &&
+    (titleSearchMatched || streamerSearchMatched) &&
+    (archiveHasUser || archiveHasDate || localTitle.length >= 10)
+  ) {
+    return true;
+  }
+
+  for (const value of remotePart.values) {
+    const remoteIdentity = parseRecorderIdentity(value.raw);
+    if (!remoteIdentity) continue;
+
+    if (
+      localIdentity &&
+      recorderIdentitiesMatch(localIdentity, remoteIdentity, { requireTime: false })
+    ) {
+      return true;
+    }
+
+    const sameRoom = !!localRoomId && remoteIdentity.roomId === localRoomId;
+    const sameDate = !!localDateKey && remoteIdentity.date === localDateKey;
+    const sameTitle = !!localTitle && normalizeMatchText(remoteIdentity.title) === localTitle;
+    const roomCompatible = sameRoom || !remoteIdentity.roomId || localTitle.length >= 10;
+    if (sameDate && sameTitle && roomCompatible) {
+      return true;
+    }
+  }
+
+  return archiveMatchesLocalGroup(context, remotePart.archiveTitle);
 };
 
 const buildUnuploadedGroups = async (
@@ -629,11 +1208,11 @@ const buildUnuploadedGroups = async (
     let matchedAids = Array.from(aidMap.keys());
     let titleMatchedArchiveTitle: string | undefined;
     if (matchedAids.length === 0) {
-      const normalizedGroupTitle = normalizeMatchText(first.title);
       const titleAidMap = new Map<number, RemoteVideoPart>();
       for (const remotePart of remoteParts) {
-        if (!normalizedGroupTitle) continue;
-        if (normalizeMatchText(remotePart.archiveTitle) !== normalizedGroupTitle) continue;
+        if (!unuploaded.some((context) => remotePartMatchesLocalGroup(context, remotePart))) {
+          continue;
+        }
         titleAidMap.set(remotePart.aid, remotePart);
       }
       matchedAids = Array.from(titleAidMap.keys());
@@ -781,7 +1360,7 @@ router.get("/localUploadedFiles", async (ctx) => {
   const pages = queryBoundedNumber(query.pages, DEFAULT_ARCHIVE_PAGES, 1, 10);
   const pageSize = queryBoundedNumber(query.pageSize, 20, 1, 50);
   const rootPath = queryString(query.rootPath);
-  const useArchiveDetail = queryBoolean(query.useArchiveDetail, false);
+  const useArchiveDetail = queryBoolean(query.useArchiveDetail, true);
   const detailIntervalMs = queryBoundedNumber(
     query.detailIntervalMs,
     DEFAULT_DETAIL_INTERVAL_MS,
@@ -790,19 +1369,35 @@ router.get("/localUploadedFiles", async (ctx) => {
   );
   const rootResult = await resolveScanRoots(rootPath);
   const scanResult = await scanVideoFiles(rootResult.roots);
+  const searchKeywords = buildArchiveSearchKeywords(scanResult.files);
   const remoteResult = await collectRemoteVideoParts(
     uid,
     pages,
     pageSize,
     useArchiveDetail,
     detailIntervalMs,
+    searchKeywords,
   );
+  const localMatchHints = buildLocalMatchHints(scanResult.files);
   const matches: LocalUploadedFileMatch[] = [];
 
   for (const localFile of scanResult.files) {
+    const hint = localMatchHints.get(normalizeLocalPath(localFile.localPath));
+    let bestMatch:
+      | {
+          remotePart: RemoteVideoPart;
+          match: LocalFileMatchResult;
+        }
+      | undefined;
     for (const remotePart of remoteResult.parts) {
-      const match = matchLocalFile(localFile, remotePart);
+      const match = matchLocalFile(localFile, remotePart, hint);
       if (!match) continue;
+      if (!bestMatch || match.score > bestMatch.match.score) {
+        bestMatch = { remotePart, match };
+      }
+    }
+    if (bestMatch) {
+      const { remotePart, match } = bestMatch;
       matches.push({
         localPath: localFile.localPath,
         fileName: localFile.fileName,
@@ -811,13 +1406,14 @@ router.get("/localUploadedFiles", async (ctx) => {
         mtimeMs: localFile.mtimeMs,
         aid: remotePart.aid,
         bvid: remotePart.bvid,
+        cid: remotePart.cid,
+        page: remotePart.page,
         archiveTitle: remotePart.archiveTitle,
         partTitle: remotePart.partTitle,
         remoteFilename: remotePart.remoteFilename,
         confidence: match.confidence,
         reason: match.reason,
       });
-      break;
     }
   }
   const unuploadedGroups = await buildUnuploadedGroups(
@@ -828,7 +1424,7 @@ router.get("/localUploadedFiles", async (ctx) => {
   const logs = [
     `检测参数：稿件列表 ${pages} 页，每页 ${pageSize} 条，分P详情${
       useArchiveDetail ? `开启，间隔 ${detailIntervalMs}ms` : "关闭"
-    }`,
+    }，搜索关键词 ${searchKeywords.length} 个`,
     `扫描目录：${rootResult.roots.join("；") || "未找到可扫描目录"}`,
     `本地视频扫描完成：${scanResult.files.length} 个视频文件`,
     ...remoteResult.logs,

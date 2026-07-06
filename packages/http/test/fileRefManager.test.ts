@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import FileRefManager from "../src/services/webhook/fileRefManager.js";
 import * as shared from "@biliLive-tools/shared/utils/index.js";
+import path from "node:path";
 
 // Mock trashItem
 // vi.mock("@biliLive-tools/shared/utils/index.js", async (importOriginal) => {
@@ -52,6 +53,27 @@ describe("FileRefManager", () => {
       expect(manager.getRefCount("/path/to/file2.mp4")).toBe(1);
       expect(manager.shouldDelete("/path/to/file1.mp4")).toBe(false);
       expect(manager.shouldDelete("/path/to/file2.mp4")).toBe(true);
+    });
+
+    it("应该把同一路径的不同表示合并到同一个引用", async () => {
+      const absolutePath = path.resolve("tmp", "Video File.mp4");
+      const equivalentPath =
+        process.platform === "win32"
+          ? absolutePath.toUpperCase().replace(/\\/g, "/")
+          : path.relative(process.cwd(), absolutePath);
+
+      manager.addRef(absolutePath, true);
+      manager.addRef(equivalentPath, false);
+
+      expect(manager.getRefCount(absolutePath)).toBe(2);
+      expect(manager.getRefCount(equivalentPath)).toBe(2);
+
+      await manager.releaseRef(equivalentPath);
+      expect(manager.getRefCount(absolutePath)).toBe(1);
+
+      await manager.releaseRef(absolutePath);
+      expect(manager.getRefCount(equivalentPath)).toBe(0);
+      expect(trashItemSpy).toHaveBeenCalledWith(absolutePath);
     });
   });
 

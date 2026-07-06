@@ -66,6 +66,10 @@ export interface RoomConfig {
   uploadToSameMedia: boolean;
   /** 同时上传无弹幕视频预设 */
   noDanmuVideoPreset: string;
+  /** 上传时自动追加直播间链接到简介 */
+  appendLiveRoomLinkToDesc: boolean;
+  /** 上传时自动追加主播和直播标题相关标签 */
+  appendLiveInfoTags: boolean;
   /** 限制只在某一段时间处理视频 */
   limitVideoConvertTime?: boolean;
   /** 允许视频处理时间 */
@@ -180,6 +184,9 @@ export class ConfigManager {
     const uploadNoDanmu = this.getRoomSetting("uploadNoDanmu", roomSetting) ?? false;
     const uploadToSameMedia = this.getRoomSetting("uploadToSameMedia", roomSetting) ?? false;
     const noDanmuVideoPreset = this.getRoomSetting("noDanmuVideoPreset", roomSetting) || "default";
+    const appendLiveRoomLinkToDesc =
+      this.getRoomSetting("appendLiveRoomLinkToDesc", roomSetting) ?? true;
+    const appendLiveInfoTags = this.getRoomSetting("appendLiveInfoTags", roomSetting) ?? true;
 
     // 如果没有开启断播续传，那么不需要合并part
     if (!mergePart) partMergeMinute = -1;
@@ -232,6 +239,8 @@ export class ConfigManager {
       uploadNoDanmu,
       uploadToSameMedia,
       noDanmuVideoPreset,
+      appendLiveRoomLinkToDesc,
+      appendLiveInfoTags,
       videoHandleTime: limitVideoConvertTime ? videoHandleTime : undefined,
       partTitleTemplate: this.getRoomSetting("partTitleTemplate", roomSetting) || "{{filename}}",
       afterUploadDeletAction: this.getRoomSetting("afterUploadDeletAction", roomSetting) ?? "none",

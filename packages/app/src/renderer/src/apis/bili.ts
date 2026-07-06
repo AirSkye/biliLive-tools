@@ -72,6 +72,8 @@ export type LocalUploadedFileMatch = {
   mtimeMs: number;
   aid: number;
   bvid?: string;
+  cid?: number;
+  page?: number;
   archiveTitle: string;
   partTitle?: string;
   remoteFilename?: string;

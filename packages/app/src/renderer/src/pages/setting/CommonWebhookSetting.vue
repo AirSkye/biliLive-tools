@@ -378,6 +378,38 @@
 
   <n-form-item>
     <template #label>
+      <Tip text="简介追加直播间" tip="上传时自动在简介末尾追加本场直播间链接"></Tip>
+    </template>
+    <n-switch
+      v-model:value="data.appendLiveRoomLinkToDesc"
+      :disabled="globalFieldsObj.appendLiveRoomLinkToDesc"
+    />
+    <n-checkbox
+      v-if="isRoom"
+      v-model:checked="globalFieldsObj.appendLiveRoomLinkToDesc"
+      class="global-checkbox"
+      >全局</n-checkbox
+    >
+  </n-form-item>
+
+  <n-form-item>
+    <template #label>
+      <Tip text="追加直播标签" tip="上传时自动补充主播名、房间号和直播标题相关标签"></Tip>
+    </template>
+    <n-switch
+      v-model:value="data.appendLiveInfoTags"
+      :disabled="globalFieldsObj.appendLiveInfoTags"
+    />
+    <n-checkbox
+      v-if="isRoom"
+      v-model:checked="globalFieldsObj.appendLiveInfoTags"
+      class="global-checkbox"
+      >全局</n-checkbox
+    >
+  </n-form-item>
+
+  <n-form-item>
+    <template #label>
       <Tip text="断播续传" tip="开启后，会将某主播一场直播上传到同一个视频中"></Tip>
     </template>
     <n-switch v-model:value="data.autoPartMerge" :disabled="globalFieldsObj.autoPartMerge" />
@@ -604,6 +636,8 @@ const data = defineModel<AppRoomConfig>("data", {
     videoHandleTime: ["00:00:00", "23:59:59"],
     uploadHandleTime: ["00:00:00", "23:59:59"],
     afterUploadDeletAction: "none",
+    appendLiveRoomLinkToDesc: true,
+    appendLiveInfoTags: true,
   }),
 });
 

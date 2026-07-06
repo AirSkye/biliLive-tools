@@ -26,6 +26,7 @@ export abstract class AbstractTask {
   emitter = new TypedEmitter<TaskEvents>();
   limitTime?: [] | [string, string];
   extra?: Record<string, any>;
+  manualStart: boolean;
   on: TypedEmitter<TaskEvents>["on"];
   emit: TypedEmitter<TaskEvents>["emit"];
 
@@ -42,6 +43,7 @@ export abstract class AbstractTask {
     this.progress = 0;
     this.action = ["pause", "kill"];
     this.custsomProgressMsg = "";
+    this.manualStart = false;
     this.on = this.emitter.on.bind(this.emitter);
     this.emit = this.emitter.emit.bind(this.emitter);
   }
