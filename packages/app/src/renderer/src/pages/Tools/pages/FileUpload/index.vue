@@ -11,6 +11,29 @@
       <n-button :loading="detectingLocalUploadedFiles" @click="detectLocalUploadedFiles">
         检测已上传未删除
       </n-button>
+      <div class="local-detect-controls">
+        <span>页数</span>
+        <n-input-number
+          v-model:value="localDetectOptions.pages"
+          size="small"
+          :min="1"
+          :max="10"
+          :precision="0"
+          style="width: 82px"
+        />
+        <n-checkbox v-model:checked="localDetectOptions.useArchiveDetail">分P详情</n-checkbox>
+        <span v-if="localDetectOptions.useArchiveDetail">间隔</span>
+        <n-input-number
+          v-if="localDetectOptions.useArchiveDetail"
+          v-model:value="localDetectOptions.detailIntervalMs"
+          size="small"
+          :min="0"
+          :max="10000"
+          :step="500"
+          :precision="0"
+          style="width: 110px"
+        />
+      </div>
       <n-checkbox v-model:checked="options.removeOriginAfterUploadCheck">
         审核通过后移除源文件
       </n-checkbox>
@@ -151,7 +174,7 @@
 </template>
 
 <script setup lang="ts">
-import { toReactive } from "@vueuse/core";
+import { toReactive, useLocalStorage } from "@vueuse/core";
 import { NButton, useNotification } from "naive-ui";
 import type { DataTableColumns, DataTableRowKey } from "naive-ui";
 
@@ -305,6 +328,11 @@ const localUploadedFilesVisible = ref(false);
 const detectingLocalUploadedFiles = ref(false);
 const localUploadedFilesResult = ref<LocalUploadedFilesResult | null>(null);
 const localDetectLogs = ref<string[]>([]);
+const localDetectOptions = useLocalStorage("file-upload-local-detect-options", {
+  pages: 3,
+  useArchiveDetail: false,
+  detailIntervalMs: 1500,
+});
 const localUploadedRows = computed(() => localUploadedFilesResult.value?.matches ?? []);
 type LocalUnuploadedSortKey =
   | "startTimeDesc"
@@ -596,10 +624,20 @@ const detectLocalUploadedFiles = async () => {
   selectedLocalUploadGroupIds.value = [];
   localDetectLogs.value = [];
   pushLocalDetectLog("开始检测本地视频和B站稿件");
-  pushLocalDetectLog("正在扫描本地视频目录并拉取B站稿件列表...");
+  pushLocalDetectLog(
+    `正在扫描本地视频目录并拉取B站稿件列表，页数 ${localDetectOptions.value.pages}，分P详情${
+      localDetectOptions.value.useArchiveDetail
+        ? `开启，间隔 ${localDetectOptions.value.detailIntervalMs}ms`
+        : "关闭"
+    }...`,
+  );
   startLocalDetectLogTimer();
   try {
-    const result = await biliApi.detectLocalUploadedFiles(userInfo.value.uid!);
+    const result = await biliApi.detectLocalUploadedFiles(userInfo.value.uid!, {
+      pages: localDetectOptions.value.pages,
+      useArchiveDetail: localDetectOptions.value.useArchiveDetail,
+      detailIntervalMs: localDetectOptions.value.detailIntervalMs,
+    });
     stopLocalDetectLogTimer();
     localUploadedFilesResult.value = result;
     for (const item of result.logs ?? []) pushLocalDetectLog(item);
@@ -718,6 +756,14 @@ const fileChange = (files: any) => {
   align-items: center;
   gap: 8px;
   margin-bottom: 12px;
+  color: #666;
+}
+
+.local-detect-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
   color: #666;
 }
 

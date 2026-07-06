@@ -27,6 +27,9 @@ const router = new Router({
 const VIDEO_EXTENSIONS = new Set([".mp4", ".flv", ".ts", ".mkv", ".webm", ".m4v", ".mov"]);
 const MAX_SCAN_FILES = 20000;
 const DEFAULT_WEBHOOK_ROOM_ID = "__global__";
+const DETAIL_FAILURE_LIMIT = 5;
+const DEFAULT_ARCHIVE_PAGES = 3;
+const DEFAULT_DETAIL_INTERVAL_MS = 1500;
 
 type LocalVideoFile = {
   localPath: string;
@@ -134,9 +137,21 @@ const queryNumber = (value: unknown, fallback: number) => {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 };
 
+const queryBoundedNumber = (value: unknown, fallback: number, min: number, max: number) => {
+  const parsed = queryNumber(value, fallback);
+  return Math.min(Math.max(parsed, min), max);
+};
+
 const queryString = (value: unknown) => {
   const data = getQueryValue(value);
   return typeof data === "string" && data.trim() ? data.trim() : undefined;
+};
+
+const queryBoolean = (value: unknown, fallback = false) => {
+  const data = getQueryValue(value);
+  if (typeof data === "boolean") return data;
+  if (typeof data !== "string") return fallback;
+  return ["1", "true", "yes"].includes(data.trim().toLowerCase());
 };
 
 const normalizeMatchText = (value?: string | null) => {
@@ -147,6 +162,50 @@ const normalizeMatchText = (value?: string | null) => {
     .replace(/\s+/g, "")
     .replace(/[\[\]【】()（）{}<>《》「」『』._-]/g, "");
 };
+
+const formatDateKey = (timestamp?: number) => {
+  if (!timestamp || !Number.isFinite(timestamp)) return undefined;
+  const date = new Date(timestamp);
+  const year = date.getFullYear();
+  const month = `${date.getMonth() + 1}`.padStart(2, "0");
+  const day = `${date.getDate()}`.padStart(2, "0");
+  return `${year}${month}${day}`;
+};
+
+const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
+  const match = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
+  if (!match) return {};
+
+  const [, roomId, date, time, title] = match;
+  const year = Number(date.slice(0, 4));
+  const month = Number(date.slice(4, 6));
+  const day = Number(date.slice(6, 8));
+  const hour = Number(time.slice(0, 2));
+  const minute = Number(time.slice(2, 4));
+  const second = Number(time.slice(4, 6));
+  const startTime = new Date(year, month - 1, day, hour, minute, second).getTime();
+
+  return {
+    roomId,
+    platform: "bilibili",
+    title,
+    startTime: Number.isFinite(startTime) ? startTime : undefined,
+  };
+};
+
+const parseLocalMatchMetadata = (localFile: LocalVideoFile) => {
+  const metadata = parseRecorderFileName(localFile.stem);
+  const parentName = path.basename(path.dirname(localFile.localPath));
+  const parentMatch = parentName.match(/^(\d+)-(.+)$/);
+  const username = parentMatch?.[2];
+  return {
+    ...metadata,
+    username: metadata.username || username,
+    dateKey: formatDateKey(metadata.startTime),
+  };
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const resolveScanRoots = async (rootPath?: string) => {
   const config = appConfig.getAll();
@@ -230,7 +289,13 @@ const scanVideoFiles = async (roots: string[]) => {
   return { files, errors, truncated: files.length >= MAX_SCAN_FILES };
 };
 
-const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: number) => {
+const collectRemoteVideoParts = async (
+  uid: number,
+  pages: number,
+  pageSize: number,
+  useArchiveDetail = false,
+  detailIntervalMs = DEFAULT_DETAIL_INTERVAL_MS,
+) => {
   const archives = new Map<number, any>();
   const errors: string[] = [];
   const warnings: string[] = [];
@@ -255,17 +320,46 @@ const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: num
   }
 
   const parts: RemoteVideoPart[] = [];
+  if (!useArchiveDetail) {
+    logs.push("本轮使用稿件列表信息匹配，未请求稿件详情接口");
+  } else {
+    logs.push(`本轮启用稿件详情接口匹配，详情请求间隔 ${detailIntervalMs}ms`);
+  }
+  let consecutiveDetailFailures = 0;
+  let skipArchiveDetail = false;
+  let skippedDetailCount = 0;
+  let detailRequestCount = 0;
   for (const [aid, item] of archives) {
     let detail: any | null = null;
-    try {
-      detail = await biliApi.getPlatformArchiveDetail(aid, uid);
-    } catch (error) {
-      warnings.push(`稿件详情接口不可用，已使用列表信息继续匹配：${aid}`);
-      logs.push(`稿件 ${aid} 详情接口不可用，已使用列表信息继续匹配`);
+    if (useArchiveDetail && !skipArchiveDetail) {
+      try {
+        if (detailRequestCount > 0 && detailIntervalMs > 0) {
+          await sleep(detailIntervalMs);
+        }
+        detailRequestCount += 1;
+        detail = await biliApi.getPlatformArchiveDetail(aid, uid);
+        consecutiveDetailFailures = 0;
+      } catch (error) {
+        consecutiveDetailFailures += 1;
+        warnings.push(`稿件详情接口不可用，已使用列表信息继续匹配：${aid}`);
+        logs.push(`稿件 ${aid} 详情接口不可用，已使用列表信息继续匹配`);
+        if (consecutiveDetailFailures >= DETAIL_FAILURE_LIMIT) {
+          skipArchiveDetail = true;
+          logs.push(
+            `稿件详情接口连续失败 ${DETAIL_FAILURE_LIMIT} 次，本轮后续稿件改用列表信息匹配`,
+          );
+        }
+      }
+    } else {
+      if (useArchiveDetail) skippedDetailCount += 1;
     }
 
     const archive = detail?.archive ?? item?.Archive ?? {};
-    const videos = Array.isArray(detail?.videos) ? detail.videos : [];
+    const videos = Array.isArray(detail?.videos)
+      ? detail.videos
+      : Array.isArray(item?.Videos)
+        ? item.Videos
+        : [];
     const archiveTitle = String(archive?.title ?? item?.Archive?.title ?? "");
     const bvid = archive?.bvid ?? item?.Archive?.bvid;
     const addPart = (video?: any) => {
@@ -301,6 +395,9 @@ const collectRemoteVideoParts = async (uid: number, pages: number, pageSize: num
       for (const video of videos) addPart(video);
     }
   }
+  if (skippedDetailCount > 0) {
+    warnings.push(`已跳过 ${skippedDetailCount} 个稿件详情请求，改用稿件列表信息匹配`);
+  }
 
   return { parts, archiveCount: archives.size, errors, warnings, logs };
 };
@@ -326,6 +423,23 @@ const matchLocalFile = (localFile: LocalVideoFile, remotePart: RemoteVideoPart) 
     }
   }
 
+  const localMetadata = parseLocalMatchMetadata(localFile);
+  const localTitle = normalizeMatchText(localMetadata.title);
+  const localUsername = normalizeMatchText(localMetadata.username);
+  const archiveTitle = normalizeMatchText(remotePart.archiveTitle);
+  if (localTitle.length >= 6 && archiveTitle.includes(localTitle)) {
+    const hasUserSignal = !!localUsername && archiveTitle.includes(localUsername);
+    const hasDateSignal = !!localMetadata.dateKey && archiveTitle.includes(localMetadata.dateKey);
+    if (hasUserSignal || hasDateSignal || localTitle.length >= 10) {
+      return {
+        confidence: hasUserSignal || hasDateSignal ? ("high" as const) : ("medium" as const),
+        reason: `录制标题匹配稿件标题${hasUserSignal ? "，主播一致" : ""}${
+          hasDateSignal ? "，日期一致" : ""
+        }`,
+      };
+    }
+  }
+
   return null;
 };
 
@@ -342,27 +456,6 @@ const normalizeRecordStem = (value?: string | null) => {
     .replace(/后处理$/i, "")
     .replace(/鍚堝苟$/i, "")
     .replace(/合并$/i, "");
-};
-
-const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
-  const match = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
-  if (!match) return {};
-
-  const [, roomId, date, time, title] = match;
-  const year = Number(date.slice(0, 4));
-  const month = Number(date.slice(4, 6));
-  const day = Number(date.slice(6, 8));
-  const hour = Number(time.slice(0, 2));
-  const minute = Number(time.slice(2, 4));
-  const second = Number(time.slice(4, 6));
-  const startTime = new Date(year, month - 1, day, hour, minute, second).getTime();
-
-  return {
-    roomId,
-    platform: "bilibili",
-    title,
-    startTime: Number.isFinite(startTime) ? startTime : undefined,
-  };
 };
 
 const buildRecordLookup = () => {
@@ -685,12 +778,25 @@ router.get("/localUploadedFiles", async (ctx) => {
     return;
   }
 
-  const pages = Math.min(queryNumber(query.pages, 3), 10);
-  const pageSize = Math.min(queryNumber(query.pageSize, 20), 50);
+  const pages = queryBoundedNumber(query.pages, DEFAULT_ARCHIVE_PAGES, 1, 10);
+  const pageSize = queryBoundedNumber(query.pageSize, 20, 1, 50);
   const rootPath = queryString(query.rootPath);
+  const useArchiveDetail = queryBoolean(query.useArchiveDetail, false);
+  const detailIntervalMs = queryBoundedNumber(
+    query.detailIntervalMs,
+    DEFAULT_DETAIL_INTERVAL_MS,
+    0,
+    10000,
+  );
   const rootResult = await resolveScanRoots(rootPath);
   const scanResult = await scanVideoFiles(rootResult.roots);
-  const remoteResult = await collectRemoteVideoParts(uid, pages, pageSize);
+  const remoteResult = await collectRemoteVideoParts(
+    uid,
+    pages,
+    pageSize,
+    useArchiveDetail,
+    detailIntervalMs,
+  );
   const matches: LocalUploadedFileMatch[] = [];
 
   for (const localFile of scanResult.files) {
@@ -720,6 +826,9 @@ router.get("/localUploadedFiles", async (ctx) => {
     remoteResult.parts,
   );
   const logs = [
+    `检测参数：稿件列表 ${pages} 页，每页 ${pageSize} 条，分P详情${
+      useArchiveDetail ? `开启，间隔 ${detailIntervalMs}ms` : "关闭"
+    }`,
     `扫描目录：${rootResult.roots.join("；") || "未找到可扫描目录"}`,
     `本地视频扫描完成：${scanResult.files.length} 个视频文件`,
     ...remoteResult.logs,

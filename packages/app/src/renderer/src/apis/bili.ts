@@ -132,6 +132,8 @@ const detectLocalUploadedFiles = async (
     rootPath?: string;
     pages?: number;
     pageSize?: number;
+    useArchiveDetail?: boolean;
+    detailIntervalMs?: number;
   } = {},
 ): Promise<LocalUploadedFilesResult> => {
   const res = await request.get("/bili/localUploadedFiles", {
