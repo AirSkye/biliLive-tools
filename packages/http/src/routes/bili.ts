@@ -597,19 +597,6 @@ const normalizePartIdentity = (value?: string | null) => {
   return normalized;
 };
 
-const recorderIdentitiesMatch = (
-  left: ParsedRecorderIdentity,
-  right: ParsedRecorderIdentity,
-  { requireTime }: { requireTime: boolean },
-) => {
-  const sameDate = left.date === right.date;
-  const sameTime = !requireTime || left.time === right.time;
-  const sameSequence = !left.sequence || !right.sequence || left.sequence === right.sequence;
-  const sameTitle = normalizeMatchText(left.title) === normalizeMatchText(right.title);
-  const sameRoom = !left.roomId || !right.roomId || left.roomId === right.roomId;
-  return sameDate && sameTime && sameSequence && sameTitle && sameRoom;
-};
-
 const formatDateKey = (timestamp?: number) => {
   if (!timestamp || !Number.isFinite(timestamp)) return undefined;
   const date = new Date(timestamp);
@@ -1685,81 +1672,33 @@ const hasWebhookUploadConfig = (roomId?: string) => {
   }
 };
 
-const archiveMatchesLocalGroup = (context: LocalFileContext, archiveTitle: string) => {
-  const normalizedArchiveTitle = normalizeMatchText(archiveTitle);
-  const normalizedTitle = normalizeMatchText(context.title);
-  if (!normalizedTitle || !normalizedArchiveTitle.includes(normalizedTitle)) return false;
-
-  const normalizedUsername = normalizeMatchText(context.username);
-  const dateKey = formatDateKey(context.startTime);
-  const hasUserSignal = !!normalizedUsername && normalizedArchiveTitle.includes(normalizedUsername);
-  const hasDateSignal = !!dateKey && normalizedArchiveTitle.includes(dateKey);
-  return hasUserSignal || hasDateSignal || normalizedTitle.length >= 10;
-};
-
 const remotePartMatchesLocalGroup = (context: LocalFileContext, remotePart: RemoteVideoPart) => {
   const localIdentity = parseRecorderIdentity(context.localFile.fileName);
-  const localTitle = normalizeMatchText(localIdentity?.title || context.title);
-  const localTitleAliases = Array.from(
-    new Set(
-      [
-        localTitle,
-        normalizeMatchText(localIdentity?.title),
-        normalizeMatchText(context.title),
-        normalizeMatchText(context.localFile.stem),
-      ].filter(Boolean),
-    ),
-  );
   const localRoomId = localIdentity?.roomId || context.roomId;
   const localDateKey = localIdentity?.date || formatDateKey(context.startTime);
   const normalizedUsername = normalizeMatchText(context.username);
   const remoteArchiveTitle = normalizeMatchText(remotePart.archiveTitle);
-  const { titleSearchMatched, streamerSearchMatched, dualSearchMatched } = getSearchSignals(
+  if (!localDateKey) return false;
+
+  const { streamerSearchMatched } = getSearchSignals(
     remotePart.searchKeywords,
-    localTitleAliases,
+    [],
     normalizedUsername,
-  );
-  const archiveHasTitle = localTitleAliases.some(
-    (title) => title.length >= 6 && remoteArchiveTitle.includes(title),
   );
   const archiveHasUser = !!normalizedUsername && remoteArchiveTitle.includes(normalizedUsername);
   const archiveHasDate = !!localDateKey && remoteArchiveTitle.includes(localDateKey);
-  if (dualSearchMatched && archiveHasTitle) {
-    return true;
-  }
-  if (
-    archiveHasTitle &&
-    (titleSearchMatched || streamerSearchMatched) &&
-    (archiveHasUser || archiveHasDate || localTitle.length >= 10)
-  ) {
-    return true;
-  }
+  let hasSameStreamer = streamerSearchMatched || archiveHasUser;
+  let hasSameDate = archiveHasDate;
 
   for (const value of remotePart.values) {
     const remoteIdentity = parseRecorderIdentity(value.raw);
     if (!remoteIdentity) continue;
 
-    if (
-      localIdentity &&
-      recorderIdentitiesMatch(localIdentity, remoteIdentity, { requireTime: false })
-    ) {
-      return true;
-    }
-
-    const sameRoom = !!localRoomId && remoteIdentity.roomId === localRoomId;
-    const sameDate = !!localDateKey && remoteIdentity.date === localDateKey;
-    const sameSequence =
-      !localIdentity?.sequence ||
-      !remoteIdentity.sequence ||
-      localIdentity.sequence === remoteIdentity.sequence;
-    const sameTitle = !!localTitle && normalizeMatchText(remoteIdentity.title) === localTitle;
-    const roomCompatible = sameRoom || !remoteIdentity.roomId || localTitle.length >= 10;
-    if (sameDate && sameSequence && sameTitle && roomCompatible) {
-      return true;
-    }
+    if (remoteIdentity.date === localDateKey) hasSameDate = true;
+    if (localRoomId && remoteIdentity.roomId === localRoomId) hasSameStreamer = true;
   }
 
-  return archiveMatchesLocalGroup(context, remotePart.archiveTitle);
+  return hasSameStreamer && hasSameDate;
 };
 
 const buildUnuploadedGroups = async (
@@ -2325,7 +2264,16 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
     groups?: Array<
       Pick<
         LocalUploadOptions,
-        "roomId" | "platform" | "username" | "title" | "startTime" | "aid" | "files"
+        | "roomId"
+        | "platform"
+        | "username"
+        | "title"
+        | "startTime"
+        | "aid"
+        | "files"
+        | "burnDanmu"
+        | "uploadRawWhenNoDanmu"
+        | "mergeSegments"
       > & {
         uploadMode?: "auto" | "new" | "append";
       }
@@ -2378,9 +2326,10 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
       startTime: group.startTime,
       aid: group.aid,
       uploadMode: group.uploadMode ?? "auto",
-      burnDanmu: data.options?.burnDanmu ?? false,
-      uploadRawWhenNoDanmu: data.options?.uploadRawWhenNoDanmu ?? true,
-      mergeSegments: data.options?.mergeSegments ?? false,
+      burnDanmu: group.burnDanmu ?? data.options?.burnDanmu ?? false,
+      uploadRawWhenNoDanmu:
+        group.uploadRawWhenNoDanmu ?? data.options?.uploadRawWhenNoDanmu ?? true,
+      mergeSegments: group.mergeSegments ?? data.options?.mergeSegments ?? false,
       files: group.files,
     };
 

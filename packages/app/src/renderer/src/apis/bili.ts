@@ -340,6 +340,9 @@ const uploadLocalUnuploaded = async (data: {
     startTime?: number;
     aid?: number;
     uploadMode?: "auto" | "new" | "append";
+    burnDanmu?: boolean;
+    uploadRawWhenNoDanmu?: boolean;
+    mergeSegments?: boolean;
     files: LocalUploadCandidateFile[];
   }>;
   options: {
