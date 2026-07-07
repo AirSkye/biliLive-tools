@@ -82,6 +82,8 @@ export type LocalUploadedFileMatch = {
 };
 
 export type LocalUploadedFilesResult = {
+  historyId?: string;
+  detectedAt?: number;
   roots: string[];
   scannedFileCount: number;
   archiveCount: number;
@@ -92,6 +94,71 @@ export type LocalUploadedFilesResult = {
   errors: string[];
   warnings: string[];
   logs: string[];
+};
+
+export type LocalUploadedFilesHistorySummary = {
+  id: string;
+  uid: number;
+  createdAt: number;
+  options: {
+    pages: number;
+    pageSize: number;
+    rootPath?: string;
+    useArchiveDetail: boolean;
+    detailIntervalMs: number;
+  };
+  scannedFileCount: number;
+  archiveCount: number;
+  remotePartCount: number;
+  matchCount: number;
+  initialMatchCount: number;
+  unuploadedGroupCount: number;
+  deletedCount: number;
+};
+
+export type LocalUploadedFilesHistoryItem = {
+  id: string;
+  uid: number;
+  createdAt: number;
+  options: LocalUploadedFilesHistorySummary["options"];
+  result: LocalUploadedFilesResult;
+  initialMatchCount: number;
+  deletedCount: number;
+};
+
+export type LocalUploadedFileDeletionRecord = LocalUploadedFileMatch & {
+  id: string;
+  uid?: number;
+  historyId?: string;
+  deletedAt: number;
+};
+
+export type LocalUploadedFilesDetectionProgress = {
+  id: string;
+  status: "running" | "completed" | "error";
+  stage:
+    | "prepare"
+    | "scan"
+    | "archives"
+    | "search"
+    | "details"
+    | "matching"
+    | "grouping"
+    | "completed"
+    | "error";
+  stageLabel: string;
+  message: string;
+  current?: string;
+  processed: number;
+  total: number;
+  remaining: number;
+  percent: number;
+  logs: string[];
+  result?: LocalUploadedFilesResult;
+  error?: string;
+  startedAt: number;
+  updatedAt: number;
+  completedAt?: number;
 };
 
 export type LocalUploadCandidateFile = {
@@ -141,6 +208,78 @@ const detectLocalUploadedFiles = async (
   const res = await request.get("/bili/localUploadedFiles", {
     params: { uid, ...options },
   });
+  return res.data;
+};
+
+const getLocalUploadedFilesHistory = async (
+  uid: number,
+): Promise<{
+  items: LocalUploadedFilesHistorySummary[];
+  latest: LocalUploadedFilesHistorySummary | null;
+}> => {
+  const res = await request.get("/bili/localUploadedFiles/history", {
+    params: { uid },
+  });
+  return res.data;
+};
+
+const getLocalUploadedFilesHistoryItem = async (
+  id: string,
+  uid?: number,
+): Promise<LocalUploadedFilesHistoryItem> => {
+  const res = await request.get(`/bili/localUploadedFiles/history/${id}`, {
+    params: { uid },
+  });
+  return res.data;
+};
+
+const getLocalUploadedFileDeletions = async (
+  uid: number,
+  options: {
+    historyId?: string;
+    limit?: number;
+  } = {},
+): Promise<{
+  items: LocalUploadedFileDeletionRecord[];
+}> => {
+  const res = await request.get("/bili/localUploadedFiles/deletions", {
+    params: { uid, ...options },
+  });
+  return res.data;
+};
+
+const recordLocalUploadedFileDeletions = async (data: {
+  uid?: number;
+  historyId?: string;
+  items: LocalUploadedFileMatch[];
+}): Promise<{
+  items: LocalUploadedFileDeletionRecord[];
+}> => {
+  const res = await request.post("/bili/localUploadedFiles/deletions", data);
+  return res.data;
+};
+
+const startLocalUploadedFilesDetection = async (
+  uid: number,
+  options: {
+    rootPath?: string;
+    pages?: number;
+    pageSize?: number;
+    useArchiveDetail?: boolean;
+    detailIntervalMs?: number;
+  } = {},
+): Promise<LocalUploadedFilesDetectionProgress> => {
+  const res = await request.post("/bili/localUploadedFiles/detect", {
+    uid,
+    ...options,
+  });
+  return res.data;
+};
+
+const getLocalUploadedFilesDetection = async (
+  id: string,
+): Promise<LocalUploadedFilesDetectionProgress> => {
+  const res = await request.get(`/bili/localUploadedFiles/detect/${id}`);
   return res.data;
 };
 
@@ -284,6 +423,12 @@ const bili = {
   getSessionId,
   getPlatformArchiveDetail,
   detectLocalUploadedFiles,
+  getLocalUploadedFilesHistory,
+  getLocalUploadedFilesHistoryItem,
+  getLocalUploadedFileDeletions,
+  recordLocalUploadedFileDeletions,
+  startLocalUploadedFilesDetection,
+  getLocalUploadedFilesDetection,
   qrcode,
   loginCancel,
   loginPoll,

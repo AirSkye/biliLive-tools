@@ -8,6 +8,7 @@ import { Live, Part } from "../src/services/webhook/Live.js";
 import { DEFAULT_BILIUP_CONFIG } from "@biliLive-tools/shared/presets/videoPreset.js";
 import * as utils from "@biliLive-tools/shared/utils/index.js";
 import * as syncTask from "@biliLive-tools/shared/task/sync.js";
+import * as videoTask from "@biliLive-tools/shared/task/video.js";
 import biliApi from "@biliLive-tools/shared/task/bili.js";
 
 import type { Options } from "../src/types/webhook.js";
@@ -265,10 +266,13 @@ describe("WebhookHandler", () => {
       audioCodec: "copy",
     };
 
-    const createInputFile = async () => {
+    const createInputFile = async (size = 1024) => {
       const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bili-webhook-plan-"));
       const input = path.join(tempDir, "source.flv");
-      await fs.writeFile(input, Buffer.alloc(1024));
+      await fs.writeFile(input, Buffer.alloc(Math.min(size, 1024)));
+      if (size > 1024) {
+        await fs.truncate(input, size);
+      }
       return { tempDir, input };
     };
 
@@ -292,6 +296,44 @@ describe("WebhookHandler", () => {
         expect(plan.migrated).toBe(false);
         expect(plan.message).toContain("不迁移");
       } finally {
+        await fs.remove(tempDir);
+      }
+    });
+
+    it("输出目录是软链接或目录联接时应按真实落盘路径检测空间", async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bili-webhook-link-"));
+      const linkDir = path.join(tempDir, "linked-room");
+      const physicalDir = path.join(tempDir, "physical-room");
+      const input = path.join(tempDir, "source.flv");
+      await fs.ensureDir(linkDir);
+      await fs.ensureDir(physicalDir);
+      await fs.writeFile(input, Buffer.alloc(1024));
+      const realpathSpy = vi.spyOn(fs, "realpath").mockImplementation(async (target: any) => {
+        if (path.resolve(String(target)) === path.resolve(linkDir)) {
+          return physicalDir;
+        }
+        return String(target);
+      });
+
+      try {
+        vi.mocked(checkDiskSpace).mockClear();
+        vi.mocked(checkDiskSpace).mockResolvedValue({
+          diskPath: physicalDir,
+          free: 1024 * 1024 * 1024,
+        });
+
+        const output = path.join(linkDir, "source.mp4");
+        const plan = await (webhookHandler as any).planFfmpegOutput(input, output, copyPreset, {
+          roomId: "123",
+          username: "主播",
+        });
+
+        expect(checkDiskSpace).toHaveBeenCalledWith(physicalDir);
+        expect(plan.output).toBe(output);
+        expect(plan.savePath).toBe(linkDir);
+        expect(plan.autoRun).toBe(true);
+      } finally {
+        realpathSpy.mockRestore();
         await fs.remove(tempDir);
       }
     });
@@ -359,6 +401,56 @@ describe("WebhookHandler", () => {
         expect(plan.message).toContain("空间不足");
         expect(plan.message).toContain("手动开始");
       } finally {
+        await fs.remove(tempDir);
+      }
+    });
+
+    it("预设码率误存为bps时应按Kbps估算，避免预计输出膨胀到TB", async () => {
+      const { tempDir, input } = await createInputFile(1024 * 1024 * 1024);
+      const metaSpy = vi.spyOn(videoTask, "readVideoMeta").mockResolvedValue({
+        format: {
+          duration: 60 * 60,
+          bit_rate: 8_000_000,
+        },
+        streams: [],
+      } as any);
+      try {
+        const estimatedBytes = await (webhookHandler as any).estimateFfmpegOutputBytes(input, {
+          encoder: "libx264",
+          bitrateControl: "VBR",
+          bitrate: 8_000_000,
+          audioCodec: "copy",
+        });
+
+        expect(estimatedBytes).toBeLessThan(10 * 1024 * 1024 * 1024);
+        expect(estimatedBytes).toBeGreaterThan(3 * 1024 * 1024 * 1024);
+      } finally {
+        metaSpy.mockRestore();
+        await fs.remove(tempDir);
+      }
+    });
+
+    it("ffprobe返回异常超长时长时应回退到源文件大小估算", async () => {
+      const sourceSize = 1024 * 1024 * 1024;
+      const { tempDir, input } = await createInputFile(sourceSize);
+      const metaSpy = vi.spyOn(videoTask, "readVideoMeta").mockResolvedValue({
+        format: {
+          duration: 60 * 60 * 24 * 365,
+          bit_rate: 8_000_000,
+        },
+        streams: [],
+      } as any);
+      try {
+        const estimatedBytes = await (webhookHandler as any).estimateFfmpegOutputBytes(input, {
+          encoder: "libx264",
+          bitrateControl: "VBR",
+          bitrate: 8000,
+          audioCodec: "copy",
+        });
+
+        expect(estimatedBytes).toBe(Math.ceil(sourceSize * 1.3));
+      } finally {
+        metaSpy.mockRestore();
         await fs.remove(tempDir);
       }
     });

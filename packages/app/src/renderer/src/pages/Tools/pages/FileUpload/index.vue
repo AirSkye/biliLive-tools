@@ -8,8 +8,11 @@
       <n-button @click="addVideo"> 添加 </n-button>
       <n-button type="primary" @click="upload" title="立即上传(ctrl+enter)"> 立即上传 </n-button>
       <n-button type="primary" @click="appendVideoVisible = true"> 续传 </n-button>
-      <n-button :loading="detectingLocalUploadedFiles" @click="detectLocalUploadedFiles">
-        检测已上传未删除
+      <n-button
+        :loading="detectingLocalUploadedFiles || loadingLocalDetectHistory"
+        @click="openLocalUploadedFilesPanel"
+      >
+        打开检测结果
       </n-button>
       <div class="local-detect-controls">
         <span>页数</span>
@@ -70,11 +73,57 @@
       :trap-focus="false"
       :auto-focus="false"
     >
+      <div class="local-history-toolbar">
+        <n-select
+          v-model:value="selectedLocalDetectHistoryId"
+          :options="localDetectHistoryOptions"
+          clearable
+          placeholder="选择历史检测结果"
+          style="min-width: 320px"
+          @update:value="loadSelectedLocalDetectHistory"
+        />
+        <n-button
+          size="small"
+          type="primary"
+          :loading="detectingLocalUploadedFiles"
+          @click="runLocalUploadedFilesScan"
+        >
+          重新扫描
+        </n-button>
+        <n-button
+          size="small"
+          :loading="loadingLocalDetectHistory"
+          @click="refreshLocalDetectHistory"
+        >
+          刷新历史
+        </n-button>
+      </div>
       <div v-if="localUploadedFilesResult" class="detect-summary">
         <span>扫描文件：{{ localUploadedFilesResult.scannedFileCount }}</span>
         <span>稿件：{{ localUploadedFilesResult.archiveCount }}</span>
         <span>分P：{{ localUploadedFilesResult.remotePartCount }}</span>
         <span>匹配：{{ localUploadedFilesResult.matches.length }}</span>
+      </div>
+      <div v-if="localDetectProgress" class="detect-progress">
+        <div class="detect-progress__header">
+          <span>{{ localDetectProgress.stageLabel || "检测中" }}</span>
+          <span v-if="localDetectProgress.total > 0">
+            {{ localDetectProgress.processed }}/{{ localDetectProgress.total }}，剩余
+            {{ localDetectProgress.remaining }}，{{ localDetectProgress.percent }}%
+          </span>
+        </div>
+        <n-progress
+          v-if="localDetectProgress.total > 0"
+          type="line"
+          :percentage="localDetectProgress.percent"
+          :show-indicator="false"
+        />
+        <div class="detect-progress__message">
+          {{ localDetectProgress.message }}
+        </div>
+        <div v-if="localDetectProgress.current" class="detect-progress__current">
+          当前：{{ localDetectProgress.current }}
+        </div>
       </div>
       <n-alert
         v-if="localUploadedFilesResult?.truncated"
@@ -98,22 +147,19 @@
         {{ (localUploadedFilesResult.warnings ?? []).slice(0, 5).join("；") }}
       </n-alert>
       <div v-if="localDetectLogs.length" class="detect-log">
-        <div
-          v-for="(item, index) in localDetectLogs"
-          :key="index"
-          class="detect-log__line"
-        >
+        <div v-for="(item, index) in localDetectLogs" :key="index" class="detect-log__line">
           {{ item }}
         </div>
       </div>
-      <div
-        v-if="detectingLocalUploadedFiles && !localUploadedFilesResult"
-        class="detect-loading"
-      >
+      <div v-if="detectingLocalUploadedFiles && !localUploadedFilesResult" class="detect-loading">
         <n-spin size="small" />
         <span>检测中...</span>
       </div>
-      <n-tabs v-if="localUploadedFilesResult" type="line" animated>
+      <n-tabs
+        v-if="localUploadedFilesResult || localDeletionHistoryRows.length"
+        type="line"
+        animated
+      >
         <n-tab-pane name="uploaded" tab="已上传未删除">
           <div class="local-upload-toolbar">
             <n-button
@@ -136,10 +182,7 @@
               一键删除
             </n-button>
           </div>
-          <n-empty
-            v-if="localUploadedRows.length === 0"
-            description="没有检测到疑似残留文件"
-          />
+          <n-empty v-if="localUploadedRows.length === 0" description="没有检测到疑似残留文件" />
           <n-data-table
             v-else
             v-model:checked-row-keys="selectedLocalUploadedFileKeys"
@@ -180,16 +223,34 @@
               上传选中
             </n-button>
           </div>
-          <n-empty
-            v-if="localUnuploadedRows.length === 0"
-            description="没有检测到本地未上传文件"
-          />
+          <n-empty v-if="localUnuploadedRows.length === 0" description="没有检测到本地未上传文件" />
           <n-data-table
             v-else
             v-model:checked-row-keys="selectedLocalUploadGroupIds"
             :row-key="getLocalUnuploadedRowKey"
             :columns="localUnuploadedColumns"
             :data="localUnuploadedRows"
+            :pagination="{ pageSize: 8 }"
+            size="small"
+          />
+        </n-tab-pane>
+        <n-tab-pane name="deletions" tab="历史删除">
+          <div class="local-upload-toolbar">
+            <span>删除记录：{{ localDeletionHistoryRows.length }}</span>
+            <n-button
+              size="small"
+              :loading="loadingLocalDetectHistory"
+              @click="loadLocalDeletionHistory"
+            >
+              刷新
+            </n-button>
+          </div>
+          <n-empty v-if="localDeletionHistoryRows.length === 0" description="没有历史删除记录" />
+          <n-data-table
+            v-else
+            :row-key="getLocalDeletionRowKey"
+            :columns="localDeletionColumns"
+            :data="localDeletionHistoryRows"
             :pagination="{ pageSize: 8 }"
             size="small"
           />
@@ -214,6 +275,9 @@ import hotkeys from "hotkeys-js";
 
 import { deepRaw } from "@renderer/utils";
 import type {
+  LocalUploadedFileDeletionRecord,
+  LocalUploadedFilesDetectionProgress,
+  LocalUploadedFilesHistorySummary,
   LocalUploadedFileMatch,
   LocalUploadedFilesResult,
   LocalUnuploadedGroup,
@@ -353,13 +417,24 @@ const clear = () => {
 
 const localUploadedFilesVisible = ref(false);
 const detectingLocalUploadedFiles = ref(false);
+const loadingLocalDetectHistory = ref(false);
 const localUploadedFilesResult = ref<LocalUploadedFilesResult | null>(null);
+const localDetectProgress = ref<LocalUploadedFilesDetectionProgress | null>(null);
 const localDetectLogs = ref<string[]>([]);
+const localDetectHistoryItems = ref<LocalUploadedFilesHistorySummary[]>([]);
+const selectedLocalDetectHistoryId = ref<string | null>(null);
+const localDeletionHistoryRows = ref<LocalUploadedFileDeletionRecord[]>([]);
 const localDetectOptions = useLocalStorage("file-upload-local-detect-options", {
   pages: 3,
   useArchiveDetail: true,
   detailIntervalMs: 1500,
 });
+const localDetectHistoryOptions = computed(() =>
+  localDetectHistoryItems.value.map((item) => ({
+    label: `${new Date(item.createdAt).toLocaleString()} | 残留 ${item.matchCount}/${item.initialMatchCount} | 未上传 ${item.unuploadedGroupCount} | 已删 ${item.deletedCount}`,
+    value: item.id,
+  })),
+);
 const localUploadedRows = computed(() => localUploadedFilesResult.value?.matches ?? []);
 const selectedLocalUploadedFileKeys = ref<DataTableRowKey[]>([]);
 const deletingLocalUploadedFiles = ref(false);
@@ -409,30 +484,129 @@ const localUploadOptions = reactive({
 });
 const getLocalUploadedRowKey = (row: LocalUploadedFileMatch) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
+const getLocalDeletionRowKey = (row: LocalUploadedFileDeletionRecord) => row.id;
 
-let localDetectLogTimer: number | undefined;
+let localDetectPollingRunId = 0;
+let localDetectLogCursor = 0;
 const pushLocalDetectLog = (message: string) => {
   localDetectLogs.value.push(`[${new Date().toLocaleTimeString()}] ${message}`);
+  if (localDetectLogs.value.length > 1200) {
+    localDetectLogs.value.splice(0, localDetectLogs.value.length - 1200);
+  }
 };
-const stopLocalDetectLogTimer = () => {
-  if (localDetectLogTimer === undefined) return;
-  window.clearInterval(localDetectLogTimer);
-  localDetectLogTimer = undefined;
+const waitLocalDetectPoll = (ms: number) =>
+  new Promise((resolve) => window.setTimeout(resolve, ms));
+const syncLocalDetectProgress = (progress: LocalUploadedFilesDetectionProgress) => {
+  localDetectProgress.value = progress;
+  const logs = progress.logs ?? [];
+  for (const item of logs.slice(localDetectLogCursor)) pushLocalDetectLog(item);
+  localDetectLogCursor = logs.length;
 };
-const startLocalDetectLogTimer = () => {
-  const messages = [
-    "仍在扫描本地视频目录和读取B站稿件列表...",
-    "仍在比对文件名、视频原始标题和分P信息...",
-    "检测仍在进行，视频文件较多时会稍慢...",
-  ];
-  let index = 0;
-  stopLocalDetectLogTimer();
-  localDetectLogTimer = window.setInterval(() => {
-    pushLocalDetectLog(messages[index % messages.length]);
-    index += 1;
-  }, 5000);
+const resetLocalDetectView = () => {
+  localDetectProgress.value = null;
+  localUnuploadedSearchKeyword.value = "";
+  selectedLocalUploadedFileKeys.value = [];
+  selectedLocalUploadGroupIds.value = [];
+  localDetectLogs.value = [];
+  localDetectLogCursor = 0;
 };
-onBeforeUnmount(stopLocalDetectLogTimer);
+const selectDefaultLocalUnuploadedGroups = () => {
+  selectedLocalUploadGroupIds.value = localUnuploadedRows.value
+    .filter((row) => row.roomId && row.hasWebhookUploadConfig)
+    .map((row) => row.id);
+};
+const applyLocalUploadedFilesResult = (result: LocalUploadedFilesResult) => {
+  localUploadedFilesResult.value = result;
+  selectedLocalDetectHistoryId.value = result.historyId ?? selectedLocalDetectHistoryId.value;
+  selectDefaultLocalUnuploadedGroups();
+};
+const loadLocalDetectHistoryList = async () => {
+  if (!userInfo.value.uid) return null;
+  const data = await biliApi.getLocalUploadedFilesHistory(userInfo.value.uid);
+  localDetectHistoryItems.value = data.items;
+  return data.latest;
+};
+const loadLocalDeletionHistory = async () => {
+  if (!userInfo.value.uid) return;
+  const data = await biliApi.getLocalUploadedFileDeletions(userInfo.value.uid, { limit: 300 });
+  localDeletionHistoryRows.value = data.items;
+};
+const loadLocalDetectHistoryById = async (id: string) => {
+  if (!userInfo.value.uid) return;
+  const item = await biliApi.getLocalUploadedFilesHistoryItem(id, userInfo.value.uid);
+  selectedLocalDetectHistoryId.value = item.id;
+  applyLocalUploadedFilesResult(item.result);
+  localDetectProgress.value = {
+    id: item.id,
+    status: "completed",
+    stage: "completed",
+    stageLabel: "历史检测结果",
+    message: `已加载 ${new Date(item.createdAt).toLocaleString()} 的检测结果`,
+    current: "历史缓存",
+    processed: 1,
+    total: 1,
+    remaining: 0,
+    percent: 100,
+    logs: [],
+    result: item.result,
+    startedAt: item.createdAt,
+    updatedAt: item.createdAt,
+    completedAt: item.createdAt,
+  };
+  localDetectLogs.value = (item.result.logs ?? []).map(
+    (message) => `[${new Date(item.createdAt).toLocaleTimeString()}] ${message}`,
+  );
+  localDetectLogCursor = item.result.logs?.length ?? 0;
+};
+const refreshLocalDetectHistory = async () => {
+  loadingLocalDetectHistory.value = true;
+  try {
+    await Promise.all([loadLocalDetectHistoryList(), loadLocalDeletionHistory()]);
+  } finally {
+    loadingLocalDetectHistory.value = false;
+  }
+};
+const loadSelectedLocalDetectHistory = async (id: string | null) => {
+  if (!id) return;
+  loadingLocalDetectHistory.value = true;
+  try {
+    await loadLocalDetectHistoryById(id);
+  } catch (error) {
+    pushLocalDetectLog(`加载历史失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    loadingLocalDetectHistory.value = false;
+  }
+};
+const openLocalUploadedFilesPanel = async () => {
+  if (!userInfo.value.uid) {
+    notice.error({
+      title: `请点击左侧头像处先进行登录`,
+      duration: 1000,
+    });
+    return;
+  }
+  localUploadedFilesVisible.value = true;
+  resetLocalDetectView();
+  loadingLocalDetectHistory.value = true;
+  try {
+    const latest = await loadLocalDetectHistoryList();
+    await loadLocalDeletionHistory();
+    if (latest) {
+      await loadLocalDetectHistoryById(latest.id);
+    } else {
+      localUploadedFilesResult.value = null;
+      selectedLocalDetectHistoryId.value = null;
+      pushLocalDetectLog("没有历史检测结果，请点击“重新扫描”生成一次检测结果");
+    }
+  } catch (error) {
+    pushLocalDetectLog(`加载历史失败：${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    loadingLocalDetectHistory.value = false;
+  }
+};
+onBeforeUnmount(() => {
+  localDetectPollingRunId += 1;
+});
 
 const formatFileSize = (size: number) => {
   if (size >= 1024 * 1024 * 1024) return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
@@ -462,12 +636,15 @@ const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
 
   deletingLocalUploadedFiles.value = true;
   const deletedPaths = new Set<string>();
+  const deletedRows: LocalUploadedFileMatch[] = [];
   const failed: string[] = [];
+  const historyId = localUploadedFilesResult.value?.historyId;
   try {
     for (const row of rows) {
       try {
         await fileBrowserApi.removeFile(row.localPath);
         deletedPaths.add(row.localPath);
+        deletedRows.push(row);
         pushLocalDetectLog(`已删除残留文件：${row.fileName}`);
       } catch (error) {
         failed.push(`${row.fileName}：${error instanceof Error ? error.message : String(error)}`);
@@ -482,6 +659,27 @@ const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
     selectedLocalUploadedFileKeys.value = selectedLocalUploadedFileKeys.value.filter(
       (key) => !deletedPaths.has(String(key)),
     );
+
+    if (deletedRows.length > 0) {
+      try {
+        const recordResult = await biliApi.recordLocalUploadedFileDeletions({
+          uid: userInfo.value.uid,
+          historyId,
+          items: deletedRows,
+        });
+        localDeletionHistoryRows.value = [
+          ...recordResult.items,
+          ...localDeletionHistoryRows.value.filter(
+            (item) => !recordResult.items.some((record) => record.id === item.id),
+          ),
+        ];
+        await loadLocalDetectHistoryList();
+      } catch (error) {
+        pushLocalDetectLog(
+          `写入删除历史失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    }
 
     if (deletedPaths.size > 0) {
       notice.success({
@@ -676,6 +874,60 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   },
 ];
 
+const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = [
+  {
+    title: "删除时间",
+    key: "deletedAt",
+    width: 170,
+    sorter: (left, right) => left.deletedAt - right.deletedAt,
+    render: (row) => new Date(row.deletedAt).toLocaleString(),
+  },
+  {
+    title: "本地文件",
+    key: "fileName",
+    minWidth: 220,
+    render: (row) => h("span", { title: row.localPath }, row.fileName),
+  },
+  {
+    title: "大小",
+    key: "size",
+    width: 110,
+    sorter: (left, right) => left.size - right.size,
+    render: (row) => formatFileSize(row.size),
+  },
+  {
+    title: "稿件",
+    key: "archiveTitle",
+    minWidth: 220,
+    render: (row) => h("span", { title: `AV${row.aid}` }, row.archiveTitle || `AV${row.aid}`),
+  },
+  {
+    title: "分P",
+    key: "partTitle",
+    minWidth: 160,
+    render: (row) => row.partTitle || row.remoteFilename || "-",
+  },
+  {
+    title: "原因",
+    key: "reason",
+    minWidth: 160,
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 110,
+    render: (row) =>
+      h(
+        NButton,
+        {
+          size: "small",
+          onClick: () => openLocalFolder(row.localPath),
+        },
+        { default: () => "打开目录" },
+      ),
+  },
+];
+
 const uploadSelectedLocalGroups = async () => {
   const selectedIds = new Set(selectedLocalUploadGroupIds.value.map((item) => String(item)));
   const groups = localUnuploadedRows.value
@@ -724,7 +976,7 @@ const uploadSelectedLocalGroups = async () => {
   }
 };
 
-const detectLocalUploadedFiles = async () => {
+const runLocalUploadedFilesScan = async () => {
   const hasLogin = !!userInfo.value.uid;
   if (!hasLogin) {
     notice.error({
@@ -737,10 +989,9 @@ const detectLocalUploadedFiles = async () => {
   detectingLocalUploadedFiles.value = true;
   localUploadedFilesVisible.value = true;
   localUploadedFilesResult.value = null;
-  localUnuploadedSearchKeyword.value = "";
-  selectedLocalUploadedFileKeys.value = [];
-  selectedLocalUploadGroupIds.value = [];
-  localDetectLogs.value = [];
+  selectedLocalDetectHistoryId.value = null;
+  resetLocalDetectView();
+  const pollingRunId = ++localDetectPollingRunId;
   pushLocalDetectLog("开始检测本地视频和B站稿件");
   pushLocalDetectLog(
     `正在扫描本地视频目录并拉取B站稿件列表，页数 ${localDetectOptions.value.pages}，分P详情${
@@ -749,20 +1000,37 @@ const detectLocalUploadedFiles = async () => {
         : "关闭"
     }...`,
   );
-  startLocalDetectLogTimer();
   try {
-    const result = await biliApi.detectLocalUploadedFiles(userInfo.value.uid!, {
+    let progress = await biliApi.startLocalUploadedFilesDetection(userInfo.value.uid!, {
       pages: localDetectOptions.value.pages,
       useArchiveDetail: localDetectOptions.value.useArchiveDetail,
       detailIntervalMs: localDetectOptions.value.detailIntervalMs,
     });
-    stopLocalDetectLogTimer();
-    localUploadedFilesResult.value = result;
-    for (const item of result.logs ?? []) pushLocalDetectLog(item);
+    syncLocalDetectProgress(progress);
+    while (progress.status === "running" && pollingRunId === localDetectPollingRunId) {
+      await waitLocalDetectPoll(1000);
+      progress = await biliApi.getLocalUploadedFilesDetection(progress.id);
+      syncLocalDetectProgress(progress);
+    }
+    if (pollingRunId !== localDetectPollingRunId) return;
+    if (progress.status === "error") {
+      throw new Error(progress.error || progress.message || "检测失败");
+    }
+    const result = progress.result;
+    if (!result) {
+      throw new Error("检测已结束，但没有返回结果");
+    }
+    applyLocalUploadedFilesResult(result);
+    const existingLogs = new Set(
+      localDetectLogs.value.map((item) => item.replace(/^\[[^\]]+\]\s*/, "")),
+    );
+    for (const item of result.logs ?? []) {
+      if (existingLogs.has(item)) continue;
+      pushLocalDetectLog(item);
+      existingLogs.add(item);
+    }
     for (const item of result.warnings ?? []) pushLocalDetectLog(`提示：${item}`);
-    selectedLocalUploadGroupIds.value = localUnuploadedRows.value
-      .filter((row) => row.roomId && row.hasWebhookUploadConfig)
-      .map((row) => row.id);
+    await Promise.all([loadLocalDetectHistoryList(), loadLocalDeletionHistory()]);
     pushLocalDetectLog("检测完成");
   } catch (error) {
     pushLocalDetectLog(`检测失败：${error instanceof Error ? error.message : String(error)}`);
@@ -772,8 +1040,9 @@ const detectLocalUploadedFiles = async () => {
       duration: 3000,
     });
   } finally {
-    stopLocalDetectLogTimer();
-    detectingLocalUploadedFiles.value = false;
+    if (pollingRunId === localDetectPollingRunId) {
+      detectingLocalUploadedFiles.value = false;
+    }
   }
 };
 
@@ -869,6 +1138,31 @@ const fileChange = (files: any) => {
   word-break: break-all;
 }
 
+.detect-progress {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  padding: 8px 10px;
+  border: 1px solid rgba(24, 160, 88, 0.18);
+  border-radius: 6px;
+  background: rgba(24, 160, 88, 0.06);
+  color: #333;
+  font-size: 12px;
+}
+
+.detect-progress__header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 600;
+}
+
+.detect-progress__message,
+.detect-progress__current {
+  color: #555;
+  word-break: break-all;
+}
+
 .detect-loading {
   display: flex;
   align-items: center;
@@ -883,6 +1177,14 @@ const fileChange = (files: any) => {
   align-items: center;
   gap: 8px;
   color: #666;
+}
+
+.local-history-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
 }
 
 .local-upload-toolbar {

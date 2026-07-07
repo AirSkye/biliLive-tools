@@ -107,6 +107,9 @@ type PreparedLocalUploadPart = {
 const SAME_MEDIA_UPLOAD_ORDER: Array<"handled" | "raw"> = ["handled", "raw"];
 const FFMPEG_SPACE_BUFFER_RATIO = 0.15;
 const FFMPEG_MIN_SPACE_BUFFER = 512 * 1024 * 1024;
+const FFMPEG_SOURCE_FALLBACK_RATIO = 1.3;
+const FFMPEG_MAX_BITRATE_ESTIMATE_SOURCE_RATIO = 8;
+const FFMPEG_MAX_REASONABLE_VIDEO_BITRATE_KBPS = 200_000;
 const checkDiskSpace = checkDiskSpaceModule as unknown as (directoryPath: string) => Promise<{
   diskPath: string;
   free: number;
@@ -281,6 +284,43 @@ export class WebhookHandler {
       .slice(0, 80);
   }
 
+  private normalizeVideoBitrateKbps(value?: number | string | null) {
+    const bitrate = Number(value);
+    if (!Number.isFinite(bitrate) || bitrate <= 0) return 0;
+
+    // UI 和 ffmpeg 参数使用 Kbps，但旧配置/外部导入偶尔会存成 bps。
+    if (
+      bitrate > FFMPEG_MAX_REASONABLE_VIDEO_BITRATE_KBPS &&
+      bitrate / 1000 <= FFMPEG_MAX_REASONABLE_VIDEO_BITRATE_KBPS
+    ) {
+      return bitrate / 1000;
+    }
+
+    return bitrate;
+  }
+
+  private getSafeFfmpegEstimateBytes(sourceBytes: number, estimatedBytes: number) {
+    const fallbackBytes = Math.ceil(sourceBytes * FFMPEG_SOURCE_FALLBACK_RATIO);
+    if (!Number.isFinite(estimatedBytes) || estimatedBytes <= 0) {
+      return fallbackBytes;
+    }
+
+    const maxReasonableBytes = Math.max(
+      fallbackBytes,
+      sourceBytes * FFMPEG_MAX_BITRATE_ESTIMATE_SOURCE_RATIO,
+    );
+    if (estimatedBytes > maxReasonableBytes) {
+      log.warn("转码输出大小估算异常，使用源文件大小兜底", {
+        sourceBytes,
+        estimatedBytes,
+        maxReasonableBytes,
+      });
+      return fallbackBytes;
+    }
+
+    return Math.ceil(estimatedBytes);
+  }
+
   private async estimateFfmpegOutputBytes(input: string, preset: FfmpegOptions) {
     const stat = await fs.stat(input);
     const sourceBytes = stat.size;
@@ -293,8 +333,9 @@ export class WebhookHandler {
       try {
         const meta = await readVideoMeta(input);
         const duration = Number(meta?.format?.duration ?? 0);
+        const bitrateKbps = this.normalizeVideoBitrateKbps(preset.bitrate);
         if (Number.isFinite(duration) && duration > 0) {
-          const videoBytes = (Number(preset.bitrate) * 1000 * duration) / 8;
+          const videoBytes = (bitrateKbps * 1000 * duration) / 8;
           const audioKbps =
             preset.audioCodec && preset.audioCodec !== "copy"
               ? 192
@@ -302,18 +343,66 @@ export class WebhookHandler {
                 ? Math.min(320, Number(meta.format.bit_rate) / 1000)
                 : 192;
           const audioBytes = (audioKbps * 1000 * duration) / 8;
-          return Math.ceil((videoBytes + audioBytes) * 1.15);
+          return this.getSafeFfmpegEstimateBytes(sourceBytes, (videoBytes + audioBytes) * 1.15);
         }
       } catch (error) {
         log.warn("估算转码输出大小失败，使用源文件大小兜底", error);
       }
     }
 
-    return Math.ceil(sourceBytes * 1.3);
+    return Math.ceil(sourceBytes * FFMPEG_SOURCE_FALLBACK_RATIO);
+  }
+
+  private async resolveDiskSpacePath(directoryPath: string) {
+    const resolvedPath = path.resolve(directoryPath);
+    let existingPath = resolvedPath;
+
+    while (!(await fs.pathExists(existingPath))) {
+      const parent = path.dirname(existingPath);
+      if (parent === existingPath) {
+        return resolvedPath;
+      }
+      existingPath = parent;
+    }
+
+    try {
+      return await fs.realpath(existingPath);
+    } catch (error) {
+      log.warn("解析磁盘真实路径失败，使用原路径检测空间", {
+        directoryPath,
+        existingPath,
+        error,
+      });
+      return existingPath;
+    }
+  }
+
+  private async checkPhysicalDiskSpace(directoryPath: string) {
+    const diskSpacePath = await this.resolveDiskSpacePath(directoryPath);
+    const resolvedPath = path.resolve(directoryPath);
+    try {
+      return {
+        diskSpacePath,
+        disk: await checkDiskSpace(diskSpacePath),
+      };
+    } catch (error) {
+      if (diskSpacePath !== resolvedPath) {
+        log.warn("读取真实路径磁盘空间失败，回退到原路径", {
+          directoryPath,
+          diskSpacePath,
+          error,
+        });
+        return {
+          diskSpacePath: resolvedPath,
+          disk: await checkDiskSpace(resolvedPath),
+        };
+      }
+      throw error;
+    }
   }
 
   private async listCandidateOutputRoots(currentOutputDir: string) {
-    const currentRoot = path.parse(path.resolve(currentOutputDir)).root;
+    const currentRoot = path.parse(await this.resolveDiskSpacePath(currentOutputDir)).root;
     const roots: string[] = [];
     const appendRoot = async (root: string) => {
       if (!root || roots.includes(root)) return;
@@ -380,7 +469,7 @@ export class WebhookHandler {
       estimatedBytes +
       Math.max(Math.ceil(estimatedBytes * FFMPEG_SPACE_BUFFER_RATIO), FFMPEG_MIN_SPACE_BUFFER);
     const outputDir = path.dirname(output);
-    const disk = await checkDiskSpace(outputDir);
+    const { disk } = await this.checkPhysicalDiskSpace(outputDir);
 
     if (disk.free >= requiredBytes) {
       return {

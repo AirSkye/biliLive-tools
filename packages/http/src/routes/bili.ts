@@ -15,7 +15,7 @@ import {
   replaceExtName,
 } from "@biliLive-tools/shared/utils/index.js";
 import type { BiliupConfig, PartTitleFormatOptions } from "@biliLive-tools/types";
-import { appConfig, handler } from "../index.js";
+import { appConfig, config as globalConfig, handler } from "../index.js";
 import type { LocalUploadOptions } from "../services/webhook/webhook.js";
 import type { LiveHistory } from "@biliLive-tools/shared/db/model/recordHistory.js";
 import type { Streamer } from "@biliLive-tools/shared/db/model/streamer.js";
@@ -171,6 +171,113 @@ type LocalFileMatchResult = {
   score: number;
 };
 
+type LocalUploadedFilesResult = {
+  historyId?: string;
+  detectedAt?: number;
+  roots: string[];
+  scannedFileCount: number;
+  archiveCount: number;
+  remotePartCount: number;
+  truncated: boolean;
+  matches: LocalUploadedFileMatch[];
+  unuploadedGroups: LocalUnuploadedGroup[];
+  errors: string[];
+  warnings: string[];
+  logs: string[];
+};
+
+type LocalDetectStatus = "running" | "completed" | "error";
+
+type LocalDetectStage =
+  | "prepare"
+  | "scan"
+  | "archives"
+  | "search"
+  | "details"
+  | "matching"
+  | "grouping"
+  | "completed"
+  | "error";
+
+type LocalDetectProgress = {
+  id: string;
+  status: LocalDetectStatus;
+  stage: LocalDetectStage;
+  stageLabel: string;
+  message: string;
+  current?: string;
+  processed: number;
+  total: number;
+  remaining: number;
+  percent: number;
+  logs: string[];
+  result?: LocalUploadedFilesResult;
+  error?: string;
+  startedAt: number;
+  updatedAt: number;
+  completedAt?: number;
+};
+
+type LocalDetectProgressPatch = Partial<
+  Pick<LocalDetectProgress, "stage" | "stageLabel" | "message" | "current" | "processed" | "total">
+> & {
+  log?: string;
+};
+
+type LocalDetectProgressReporter = (patch: LocalDetectProgressPatch) => void;
+
+const MAX_LOCAL_DETECT_LOGS = 1200;
+const LOCAL_DETECT_JOB_TTL_MS = 1000 * 60 * 30;
+const localDetectJobs = new Map<string, LocalDetectProgress>();
+const LOCAL_DETECT_HISTORY_FILE = "localUploadedFilesHistory.json";
+const LOCAL_DETECT_HISTORY_LIMIT = 30;
+const LOCAL_DETECT_DELETION_LIMIT = 3000;
+
+type LocalDetectOptions = {
+  pages: number;
+  pageSize: number;
+  rootPath?: string;
+  useArchiveDetail: boolean;
+  detailIntervalMs: number;
+};
+
+type LocalDetectHistoryItem = {
+  id: string;
+  uid: number;
+  createdAt: number;
+  options: LocalDetectOptions;
+  result: LocalUploadedFilesResult;
+  initialMatchCount: number;
+  deletedCount: number;
+};
+
+type LocalDetectHistorySummary = {
+  id: string;
+  uid: number;
+  createdAt: number;
+  options: LocalDetectOptions;
+  scannedFileCount: number;
+  archiveCount: number;
+  remotePartCount: number;
+  matchCount: number;
+  initialMatchCount: number;
+  unuploadedGroupCount: number;
+  deletedCount: number;
+};
+
+type LocalUploadedFileDeletionRecord = LocalUploadedFileMatch & {
+  id: string;
+  uid?: number;
+  historyId?: string;
+  deletedAt: number;
+};
+
+type LocalDetectHistoryStore = {
+  version: 1;
+  histories: LocalDetectHistoryItem[];
+  deletions: LocalUploadedFileDeletionRecord[];
+};
+
 const getQueryValue = (value: unknown) => {
   if (Array.isArray(value)) return value[0];
   return value;
@@ -196,6 +303,191 @@ const queryBoolean = (value: unknown, fallback = false) => {
   if (typeof data === "boolean") return data;
   if (typeof data !== "string") return fallback;
   return ["1", "true", "yes"].includes(data.trim().toLowerCase());
+};
+
+const clampProgressNumber = (value: unknown, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(0, Math.floor(parsed));
+};
+
+const touchLocalDetectProgress = (
+  progress: LocalDetectProgress,
+  patch: LocalDetectProgressPatch,
+) => {
+  if (patch.stage) progress.stage = patch.stage;
+  if (patch.stageLabel !== undefined) progress.stageLabel = patch.stageLabel;
+  if (patch.message !== undefined) progress.message = patch.message;
+  if (patch.current !== undefined) progress.current = patch.current;
+  if (patch.total !== undefined) progress.total = clampProgressNumber(patch.total, progress.total);
+  if (patch.processed !== undefined) {
+    progress.processed = clampProgressNumber(patch.processed, progress.processed);
+  }
+  if (patch.log) {
+    progress.logs.push(patch.log);
+    if (progress.logs.length > MAX_LOCAL_DETECT_LOGS) {
+      progress.logs.splice(0, progress.logs.length - MAX_LOCAL_DETECT_LOGS);
+    }
+  }
+
+  progress.processed = Math.min(progress.processed, progress.total || progress.processed);
+  progress.remaining = progress.total > 0 ? Math.max(progress.total - progress.processed, 0) : 0;
+  progress.percent =
+    progress.total > 0 ? Math.min(100, Math.floor((progress.processed / progress.total) * 100)) : 0;
+  progress.updatedAt = Date.now();
+};
+
+const createLocalDetectProgress = (): LocalDetectProgress => {
+  const now = Date.now();
+  return {
+    id: uuid(),
+    status: "running",
+    stage: "prepare",
+    stageLabel: "准备检测",
+    message: "等待开始检测",
+    processed: 0,
+    total: 0,
+    remaining: 0,
+    percent: 0,
+    logs: [],
+    startedAt: now,
+    updatedAt: now,
+  };
+};
+
+const cleanupLocalDetectJobs = () => {
+  const now = Date.now();
+  for (const [id, job] of localDetectJobs) {
+    const finishedAt = job.completedAt ?? job.updatedAt;
+    if (job.status !== "running" && now - finishedAt > LOCAL_DETECT_JOB_TTL_MS) {
+      localDetectJobs.delete(id);
+    }
+  }
+};
+
+const formatProgressCount = (processed: number, total: number) => {
+  return total > 0
+    ? `${processed}/${total}，剩余 ${Math.max(total - processed, 0)}`
+    : `${processed}`;
+};
+
+const getLocalDetectHistoryFile = () => {
+  const basePath =
+    globalConfig?.userDataPath ||
+    (appConfig?.filepath ? path.dirname(appConfig.filepath) : process.cwd());
+  return path.join(basePath, LOCAL_DETECT_HISTORY_FILE);
+};
+
+const createEmptyLocalDetectHistoryStore = (): LocalDetectHistoryStore => ({
+  version: 1,
+  histories: [],
+  deletions: [],
+});
+
+const readLocalDetectHistoryStore = async (): Promise<LocalDetectHistoryStore> => {
+  const filePath = getLocalDetectHistoryFile();
+  if (!(await fs.pathExists(filePath))) {
+    return createEmptyLocalDetectHistoryStore();
+  }
+  try {
+    const data = (await fs.readJson(filePath)) as Partial<LocalDetectHistoryStore>;
+    return {
+      version: 1,
+      histories: Array.isArray(data.histories) ? data.histories : [],
+      deletions: Array.isArray(data.deletions) ? data.deletions : [],
+    };
+  } catch (error) {
+    return createEmptyLocalDetectHistoryStore();
+  }
+};
+
+const writeLocalDetectHistoryStore = async (store: LocalDetectHistoryStore) => {
+  const filePath = getLocalDetectHistoryFile();
+  await fs.ensureDir(path.dirname(filePath));
+  await fs.writeJson(
+    filePath,
+    {
+      version: 1,
+      histories: store.histories.slice(0, LOCAL_DETECT_HISTORY_LIMIT),
+      deletions: store.deletions.slice(0, LOCAL_DETECT_DELETION_LIMIT),
+    },
+    { spaces: 2 },
+  );
+};
+
+const summarizeLocalDetectHistory = (item: LocalDetectHistoryItem): LocalDetectHistorySummary => ({
+  id: item.id,
+  uid: item.uid,
+  createdAt: item.createdAt,
+  options: item.options,
+  scannedFileCount: item.result.scannedFileCount,
+  archiveCount: item.result.archiveCount,
+  remotePartCount: item.result.remotePartCount,
+  matchCount: item.result.matches.length,
+  initialMatchCount: item.initialMatchCount ?? item.result.matches.length,
+  unuploadedGroupCount: item.result.unuploadedGroups.length,
+  deletedCount: item.deletedCount ?? 0,
+});
+
+const saveLocalDetectHistory = async (
+  uid: number,
+  options: LocalDetectOptions,
+  result: LocalUploadedFilesResult,
+) => {
+  const store = await readLocalDetectHistoryStore();
+  const id = uuid();
+  const createdAt = Date.now();
+  const savedResult: LocalUploadedFilesResult = {
+    ...result,
+    historyId: id,
+    detectedAt: createdAt,
+  };
+  const item: LocalDetectHistoryItem = {
+    id,
+    uid,
+    createdAt,
+    options,
+    result: savedResult,
+    initialMatchCount: savedResult.matches.length,
+    deletedCount: 0,
+  };
+  store.histories = [item, ...store.histories.filter((history) => history.id !== id)].slice(
+    0,
+    LOCAL_DETECT_HISTORY_LIMIT,
+  );
+  await writeLocalDetectHistoryStore(store);
+  return savedResult;
+};
+
+const recordLocalUploadedFileDeletions = async (data: {
+  uid?: number;
+  historyId?: string;
+  items: LocalUploadedFileMatch[];
+}) => {
+  const store = await readLocalDetectHistoryStore();
+  const deletedAt = Date.now();
+  const records = data.items.map((item) => ({
+    ...item,
+    id: uuid(),
+    uid: data.uid,
+    historyId: data.historyId,
+    deletedAt,
+  }));
+  store.deletions = [...records, ...store.deletions].slice(0, LOCAL_DETECT_DELETION_LIMIT);
+
+  if (data.historyId) {
+    const history = store.histories.find((item) => item.id === data.historyId);
+    if (history) {
+      const deletedPaths = new Set(records.map((item) => normalizeLocalPath(item.localPath)));
+      history.result.matches = history.result.matches.filter(
+        (item) => !deletedPaths.has(normalizeLocalPath(item.localPath)),
+      );
+      history.deletedCount = (history.deletedCount ?? 0) + records.length;
+    }
+  }
+
+  await writeLocalDetectHistoryStore(store);
+  return records;
 };
 
 const normalizeMatchText = (value?: string | null) => {
@@ -525,11 +817,20 @@ const resolveScanRoots = async (rootPath?: string) => {
   return { roots, errors };
 };
 
-const scanVideoFiles = async (roots: string[]) => {
+const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressReporter) => {
   const files: LocalVideoFile[] = [];
   const errors: string[] = [];
 
-  for (const root of roots) {
+  for (const [rootIndex, root] of roots.entries()) {
+    progress?.({
+      stage: "scan",
+      stageLabel: "扫描本地视频",
+      total: roots.length,
+      processed: rootIndex,
+      current: root,
+      message: `正在扫描目录 ${rootIndex + 1}/${roots.length}：${root}`,
+      log: `扫描目录 ${rootIndex + 1}/${roots.length}：${root}`,
+    });
     const stack = [root];
     while (stack.length > 0 && files.length < MAX_SCAN_FILES) {
       const current = stack.pop()!;
@@ -565,6 +866,26 @@ const scanVideoFiles = async (roots: string[]) => {
             normalizedBase: normalizeMatchText(fileName),
             normalizedStem: normalizeMatchText(stem),
           });
+          if (files.length === 1 || files.length % 25 === 0) {
+            progress?.({
+              stage: "scan",
+              stageLabel: "扫描本地视频",
+              total: roots.length,
+              processed: rootIndex,
+              current: filePath,
+              message: `已发现 ${files.length} 个视频，当前：${fileName}`,
+              log: `本地扫描进度：已发现 ${files.length} 个视频，当前 ${fileName}`,
+            });
+          } else {
+            progress?.({
+              stage: "scan",
+              stageLabel: "扫描本地视频",
+              total: roots.length,
+              processed: rootIndex,
+              current: filePath,
+              message: `已发现 ${files.length} 个视频，当前：${fileName}`,
+            });
+          }
         } catch (error) {
           errors.push(`读取文件信息失败：${filePath}`);
         }
@@ -572,6 +893,15 @@ const scanVideoFiles = async (roots: string[]) => {
         if (files.length >= MAX_SCAN_FILES) break;
       }
     }
+    progress?.({
+      stage: "scan",
+      stageLabel: "扫描本地视频",
+      total: roots.length,
+      processed: rootIndex + 1,
+      current: root,
+      message: `目录扫描完成：${root}`,
+      log: `目录扫描完成：${root}，累计 ${files.length} 个视频`,
+    });
   }
 
   return { files, errors, truncated: files.length >= MAX_SCAN_FILES };
@@ -584,11 +914,20 @@ const collectRemoteVideoParts = async (
   useArchiveDetail = false,
   detailIntervalMs = DEFAULT_DETAIL_INTERVAL_MS,
   searchKeywords: ArchiveSearchKeyword[] = [],
+  progress?: LocalDetectProgressReporter,
 ) => {
   const archives = new Map<number, RemoteArchiveItem>();
   const errors: string[] = [];
   const warnings: string[] = [];
   const logs: string[] = [];
+  const pushLog = (message: string, patch: LocalDetectProgressPatch = {}) => {
+    logs.push(message);
+    progress?.({
+      message,
+      ...patch,
+      log: message,
+    });
+  };
 
   const addArchive = (item: any, source: string, searchKeyword?: ArchiveSearchKeyword) => {
     const aid = Number(item?.Archive?.aid);
@@ -618,10 +957,24 @@ const collectRemoteVideoParts = async (
 
   const collectPagedArchives = async () => {
     for (let pn = 1; pn <= pages; pn++) {
+      progress?.({
+        stage: "archives",
+        stageLabel: "读取稿件列表",
+        total: pages,
+        processed: pn - 1,
+        current: `稿件列表第 ${pn} 页`,
+        message: `正在读取B站投稿中心列表第 ${pn}/${pages} 页`,
+      });
       try {
         const data = await biliApi.getArchives({ pn, ps: pageSize }, uid);
         const pageItems = data?.arc_audits ?? [];
-        logs.push(`已读取B站稿件列表第 ${pn} 页：${pageItems.length} 条`);
+        pushLog(`已读取B站稿件列表第 ${pn} 页：${pageItems.length} 条`, {
+          stage: "archives",
+          stageLabel: "读取稿件列表",
+          total: pages,
+          processed: pn,
+          current: `稿件列表第 ${pn} 页`,
+        });
         for (const item of pageItems) {
           addArchive(item, `列表第 ${pn} 页`);
         }
@@ -629,7 +982,13 @@ const collectRemoteVideoParts = async (
         if (total > 0 && pn * pageSize >= total) break;
       } catch (error) {
         errors.push(`获取稿件列表第 ${pn} 页失败`);
-        logs.push(`获取B站稿件列表第 ${pn} 页失败，检测已停止继续拉取远端列表`);
+        pushLog(`获取B站稿件列表第 ${pn} 页失败，检测已停止继续拉取远端列表`, {
+          stage: "archives",
+          stageLabel: "读取稿件列表",
+          total: pages,
+          processed: pn,
+          current: `稿件列表第 ${pn} 页`,
+        });
         break;
       }
     }
@@ -639,8 +998,15 @@ const collectRemoteVideoParts = async (
     if (searchKeywords.length === 0) return;
     const titleCount = searchKeywords.filter((item) => item.type === "title").length;
     const streamerCount = searchKeywords.filter((item) => item.type === "streamer").length;
-    logs.push(
+    pushLog(
       `开始按本地标题/主播搜索稿件：标题 ${titleCount} 个，主播 ${streamerCount} 个，并发 ${ARCHIVE_SEARCH_CONCURRENCY}`,
+      {
+        stage: "search",
+        stageLabel: "搜索稿件",
+        total: searchKeywords.length,
+        processed: 0,
+        current: "等待搜索关键词",
+      },
     );
 
     const results: Array<{
@@ -648,19 +1014,46 @@ const collectRemoteVideoParts = async (
       pageItems?: any[];
       error?: unknown;
     }> = new Array(searchKeywords.length);
+    let completedSearchCount = 0;
     await runLimited(searchKeywords, ARCHIVE_SEARCH_CONCURRENCY, async (keyword, index) => {
+      const label = keyword.type === "streamer" ? "主播" : "标题";
+      let finishMessage = "";
+      progress?.({
+        stage: "search",
+        stageLabel: "搜索稿件",
+        total: searchKeywords.length,
+        processed: completedSearchCount,
+        current: `${label}：${keyword.keyword}`,
+        message: `正在搜索${label}“${keyword.keyword}”`,
+      });
       try {
         const data = await biliApi.getArchives(
           { pn: 1, ps: 10, keyword: keyword.keyword } as any,
           uid,
         );
+        const pageItems = data?.arc_audits ?? [];
         results[index] = {
           keyword,
-          pageItems: data?.arc_audits ?? [],
+          pageItems,
         };
+        finishMessage = `搜索${label}“${keyword.keyword}”：${pageItems.length} 条`;
       } catch (error) {
         results[index] = { keyword, error };
+        finishMessage = `搜索${label}“${keyword.keyword}”失败，已跳过`;
       }
+      completedSearchCount += 1;
+      const searchProgressPatch: LocalDetectProgressPatch = {
+        stage: "search",
+        stageLabel: "搜索稿件",
+        total: searchKeywords.length,
+        processed: completedSearchCount,
+        current: `${label}：${keyword.keyword}`,
+        message:
+          finishMessage ||
+          `搜索进度 ${formatProgressCount(completedSearchCount, searchKeywords.length)}：${label}“${keyword.keyword}”`,
+      };
+      if (finishMessage) searchProgressPatch.log = finishMessage;
+      progress?.(searchProgressPatch);
     });
 
     for (const result of results) {
@@ -684,7 +1077,13 @@ const collectRemoteVideoParts = async (
       return hasTitle && hasStreamer;
     }).length;
     if (dualSearchArchiveCount > 0) {
-      logs.push(`搜索结果合并完成：${dualSearchArchiveCount} 个稿件同时命中标题和主播搜索`);
+      pushLog(`搜索结果合并完成：${dualSearchArchiveCount} 个稿件同时命中标题和主播搜索`, {
+        stage: "search",
+        stageLabel: "搜索稿件",
+        total: searchKeywords.length,
+        processed: searchKeywords.length,
+        current: "搜索结果合并",
+      });
     }
   };
 
@@ -692,9 +1091,21 @@ const collectRemoteVideoParts = async (
 
   const parts: RemoteVideoPart[] = [];
   if (!useArchiveDetail) {
-    logs.push("本轮使用稿件列表信息匹配，未请求稿件详情接口");
+    pushLog("本轮使用稿件列表信息匹配，未请求稿件详情接口", {
+      stage: "details",
+      stageLabel: "读取分P详情",
+      total: archives.size,
+      processed: archives.size,
+      current: "列表信息",
+    });
   } else {
-    logs.push(`本轮启用稿件详情接口匹配，详情请求间隔 ${detailIntervalMs}ms`);
+    pushLog(`本轮启用稿件详情接口匹配，详情请求间隔 ${detailIntervalMs}ms`, {
+      stage: "details",
+      stageLabel: "读取分P详情",
+      total: archives.size,
+      processed: 0,
+      current: "准备读取详情",
+    });
   }
   let consecutivePrivateDetailFailures = 0;
   let skipPrivateDetail = false;
@@ -717,8 +1128,13 @@ const collectRemoteVideoParts = async (
     if (forceForSearch) {
       if (searchPrivateDetailAttempts >= SEARCH_PRIVATE_DETAIL_LIMIT) {
         if (!searchPrivateDetailLimitLogged) {
-          logs.push(
+          pushLog(
             `搜索命中稿件私有详情尝试达到 ${SEARCH_PRIVATE_DETAIL_LIMIT} 个，后续改用公开/列表信息`,
+            {
+              stage: "details",
+              stageLabel: "读取分P详情",
+              current: `AV${aid}`,
+            },
           );
           searchPrivateDetailLimitLogged = true;
         }
@@ -732,25 +1148,64 @@ const collectRemoteVideoParts = async (
     consecutivePrivateDetailFailures = 0;
     return data;
   };
-  for (const [aid, archiveItem] of archives) {
+  const archiveEntries = Array.from(archives);
+  for (const [archiveIndex, [aid, archiveItem]] of archiveEntries.entries()) {
     const item = archiveItem.item;
+    const archiveTitleForProgress = String(item?.Archive?.title ?? `AV${aid}`);
+    progress?.({
+      stage: "details",
+      stageLabel: "读取分P详情",
+      total: archiveEntries.length,
+      processed: archiveIndex,
+      current: `AV${aid} ${archiveTitleForProgress}`,
+      message: `${
+        useArchiveDetail ? "正在处理稿件详情" : "正在使用列表信息生成匹配项"
+      } ${formatProgressCount(archiveIndex, archiveEntries.length)}：AV${aid} ${archiveTitleForProgress}`,
+    });
     let detail: any | null = null;
     let publicDetail: Awaited<ReturnType<typeof fetchPublicArchiveDetail>> | null = null;
     let privateDetailTried = false;
     const isSearchHit = archiveItem.searchKeywords.length > 0;
     if (useArchiveDetail) {
       if (isSearchHit) {
-        logs.push(`稿件 ${aid} 来自搜索命中，优先尝试私有详情接口`);
+        pushLog(`稿件 ${aid} 来自搜索命中，优先尝试私有详情接口`, {
+          stage: "details",
+          stageLabel: "读取分P详情",
+          total: archiveEntries.length,
+          processed: archiveIndex,
+          current: `AV${aid} ${archiveTitleForProgress}`,
+        });
         try {
           privateDetailTried = searchPrivateDetailAttempts < SEARCH_PRIVATE_DETAIL_LIMIT;
+          progress?.({
+            stage: "details",
+            stageLabel: "读取分P详情",
+            total: archiveEntries.length,
+            processed: archiveIndex,
+            current: `AV${aid} ${archiveTitleForProgress}`,
+            message: `正在请求私有稿件详情：AV${aid}`,
+          });
           detail = await fetchPrivateDetail(aid, true);
         } catch (error) {
           consecutivePrivateDetailFailures += 1;
-          logs.push(`搜索命中稿件 ${aid} 私有详情不可用，继续尝试公开详情`);
+          pushLog(`搜索命中稿件 ${aid} 私有详情不可用，继续尝试公开详情`, {
+            stage: "details",
+            stageLabel: "读取分P详情",
+            total: archiveEntries.length,
+            processed: archiveIndex,
+            current: `AV${aid} ${archiveTitleForProgress}`,
+          });
           if (consecutivePrivateDetailFailures >= DETAIL_FAILURE_LIMIT) {
             skipPrivateDetail = true;
-            logs.push(
+            pushLog(
               `私有稿件详情接口连续失败 ${DETAIL_FAILURE_LIMIT} 次，非搜索命中稿件将跳过私有兜底`,
+              {
+                stage: "details",
+                stageLabel: "读取分P详情",
+                total: archiveEntries.length,
+                processed: archiveIndex,
+                current: `AV${aid} ${archiveTitleForProgress}`,
+              },
             );
           }
         }
@@ -758,6 +1213,13 @@ const collectRemoteVideoParts = async (
 
       try {
         if (!detail) {
+          pushLog(`稿件 ${aid} 正在请求公开视频分P接口`, {
+            stage: "details",
+            stageLabel: "读取分P详情",
+            total: archiveEntries.length,
+            processed: archiveIndex,
+            current: `AV${aid} ${archiveTitleForProgress}`,
+          });
           await waitDetailInterval();
           publicDetail = await fetchPublicArchiveDetail({
             aid,
@@ -768,22 +1230,61 @@ const collectRemoteVideoParts = async (
       } catch (publicError) {
         if (privateDetailTried) {
           warnings.push(`稿件分P详情不可用，已使用列表信息继续判断未上传：${aid}`);
-          logs.push(`稿件 ${aid} 公开详情和私有详情均不可用，无法做分P级匹配`);
+          pushLog(`稿件 ${aid} 公开详情和私有详情均不可用，无法做分P级匹配`, {
+            stage: "details",
+            stageLabel: "读取分P详情",
+            total: archiveEntries.length,
+            processed: archiveIndex,
+            current: `AV${aid} ${archiveTitleForProgress}`,
+          });
         } else if (skipPrivateDetail) {
           skippedPrivateDetailCount += 1;
-          logs.push(`稿件 ${aid} 公开分P信息不可用，私有详情已临时跳过`);
+          pushLog(`稿件 ${aid} 公开分P信息不可用，私有详情已临时跳过`, {
+            stage: "details",
+            stageLabel: "读取分P详情",
+            total: archiveEntries.length,
+            processed: archiveIndex,
+            current: `AV${aid} ${archiveTitleForProgress}`,
+          });
         } else {
-          logs.push(`稿件 ${aid} 公开分P信息不可用，尝试私有详情接口`);
+          pushLog(`稿件 ${aid} 公开分P信息不可用，尝试私有详情接口`, {
+            stage: "details",
+            stageLabel: "读取分P详情",
+            total: archiveEntries.length,
+            processed: archiveIndex,
+            current: `AV${aid} ${archiveTitleForProgress}`,
+          });
           try {
+            progress?.({
+              stage: "details",
+              stageLabel: "读取分P详情",
+              total: archiveEntries.length,
+              processed: archiveIndex,
+              current: `AV${aid} ${archiveTitleForProgress}`,
+              message: `正在请求私有稿件详情：AV${aid}`,
+            });
             detail = await fetchPrivateDetail(aid, false);
           } catch (error) {
             consecutivePrivateDetailFailures += 1;
             warnings.push(`稿件分P详情不可用，已使用列表信息继续判断未上传：${aid}`);
-            logs.push(`稿件 ${aid} 私有详情接口不可用，无法做分P级匹配`);
+            pushLog(`稿件 ${aid} 私有详情接口不可用，无法做分P级匹配`, {
+              stage: "details",
+              stageLabel: "读取分P详情",
+              total: archiveEntries.length,
+              processed: archiveIndex,
+              current: `AV${aid} ${archiveTitleForProgress}`,
+            });
             if (consecutivePrivateDetailFailures >= DETAIL_FAILURE_LIMIT) {
               skipPrivateDetail = true;
-              logs.push(
+              pushLog(
                 `私有稿件详情接口连续失败 ${DETAIL_FAILURE_LIMIT} 次，本轮后续仅在公开详情失败时跳过私有兜底`,
+                {
+                  stage: "details",
+                  stageLabel: "读取分P详情",
+                  total: archiveEntries.length,
+                  processed: archiveIndex,
+                  current: `AV${aid} ${archiveTitleForProgress}`,
+                },
               );
             }
           }
@@ -840,13 +1341,28 @@ const collectRemoteVideoParts = async (
     } else {
       for (const video of videos) addPart(video);
     }
+    progress?.({
+      stage: "details",
+      stageLabel: "读取分P详情",
+      total: archiveEntries.length,
+      processed: archiveIndex + 1,
+      current: `AV${aid} ${archiveTitle}`,
+      message: `稿件详情处理进度 ${formatProgressCount(archiveIndex + 1, archiveEntries.length)}：AV${aid}`,
+    });
   }
   if (skippedPrivateDetailCount > 0) {
     warnings.push(`已跳过 ${skippedPrivateDetailCount} 个私有稿件详情请求，改用稿件列表信息匹配`);
   }
   if (useArchiveDetail) {
-    logs.push(
+    pushLog(
       `分P详情读取完成：公开接口 ${publicDetailCount} 个，私有接口 ${privateDetailCount} 个`,
+      {
+        stage: "details",
+        stageLabel: "读取分P详情",
+        total: archiveEntries.length,
+        processed: archiveEntries.length,
+        current: "分P详情读取完成",
+      },
     );
   }
 
@@ -1049,6 +1565,7 @@ const parseLocalFileMetadata = async (
 const buildLocalFileContexts = async (
   localFiles: LocalVideoFile[],
   matches: LocalUploadedFileMatch[],
+  progress?: LocalDetectProgressReporter,
 ) => {
   const recordLookup = buildRecordLookup();
   const matchMap = new Map(matches.map((item) => [normalizeLocalPath(item.localPath), item]));
@@ -1058,7 +1575,15 @@ const buildLocalFileContexts = async (
   }
   const contexts: LocalFileContext[] = [];
 
-  for (const localFile of localFiles) {
+  for (const [index, localFile] of localFiles.entries()) {
+    progress?.({
+      stage: "grouping",
+      stageLabel: "识别未上传分组",
+      total: localFiles.length,
+      processed: index,
+      current: localFile.localPath,
+      message: `正在识别本地视频归属 ${formatProgressCount(index, localFiles.length)}：${localFile.fileName}`,
+    });
     const normalizedPath = normalizeLocalPath(localFile.localPath);
     const danmuFiles = await findDanmuFiles(localFile.localPath);
     const record = findRecordByLocalFile(localFile, recordLookup);
@@ -1092,6 +1617,27 @@ const buildLocalFileContexts = async (
       endTime: record?.record_end_time,
       ...danmuFiles,
     });
+
+    if (index === 0 || (index + 1) % 25 === 0 || index === localFiles.length - 1) {
+      progress?.({
+        stage: "grouping",
+        stageLabel: "识别未上传分组",
+        total: localFiles.length,
+        processed: index + 1,
+        current: localFile.localPath,
+        message: `本地视频归属识别进度 ${formatProgressCount(index + 1, localFiles.length)}：${localFile.fileName}`,
+        log: `本地视频归属识别 ${index + 1}/${localFiles.length}：${localFile.fileName}`,
+      });
+    } else {
+      progress?.({
+        stage: "grouping",
+        stageLabel: "识别未上传分组",
+        total: localFiles.length,
+        processed: index + 1,
+        current: localFile.localPath,
+        message: `本地视频归属识别进度 ${formatProgressCount(index + 1, localFiles.length)}：${localFile.fileName}`,
+      });
+    }
   }
 
   return contexts;
@@ -1183,8 +1729,9 @@ const buildUnuploadedGroups = async (
   localFiles: LocalVideoFile[],
   matches: LocalUploadedFileMatch[],
   remoteParts: RemoteVideoPart[],
+  progress?: LocalDetectProgressReporter,
 ): Promise<LocalUnuploadedGroup[]> => {
-  const contexts = await buildLocalFileContexts(localFiles, matches);
+  const contexts = await buildLocalFileContexts(localFiles, matches, progress);
   const grouped = new Map<string, LocalFileContext[]>();
   for (const context of contexts) {
     const list = grouped.get(context.groupKey) ?? [];
@@ -1272,7 +1819,195 @@ const buildUnuploadedGroups = async (
     });
   }
 
+  progress?.({
+    stage: "grouping",
+    stageLabel: "识别未上传分组",
+    total: localFiles.length,
+    processed: localFiles.length,
+    current: "未上传分组完成",
+    message: `未上传分组识别完成：${groups.length} 组`,
+    log: `未上传分组识别完成：${groups.length} 组`,
+  });
+
   return groups.sort((left, right) => right.startTime - left.startTime);
+};
+
+const runLocalUploadedFilesDetection = async (
+  uid: number,
+  options: LocalDetectOptions,
+  progress?: LocalDetectProgressReporter,
+): Promise<LocalUploadedFilesResult> => {
+  const logs: string[] = [];
+  const pushLog = (message: string, patch: LocalDetectProgressPatch = {}) => {
+    logs.push(message);
+    progress?.({
+      message,
+      ...patch,
+      log: message,
+    });
+  };
+
+  pushLog(
+    `检测参数：稿件列表 ${options.pages} 页，每页 ${options.pageSize} 条，分P详情${
+      options.useArchiveDetail ? `开启，间隔 ${options.detailIntervalMs}ms` : "关闭"
+    }`,
+    {
+      stage: "prepare",
+      stageLabel: "准备检测",
+      total: 0,
+      processed: 0,
+      current: "检测参数",
+    },
+  );
+
+  const rootResult = await resolveScanRoots(options.rootPath);
+  pushLog(`扫描目录：${rootResult.roots.join("；") || "未找到可扫描目录"}`, {
+    stage: "scan",
+    stageLabel: "扫描本地视频",
+    total: rootResult.roots.length,
+    processed: 0,
+    current: rootResult.roots.join("；") || "未找到可扫描目录",
+  });
+  const scanResult = await scanVideoFiles(rootResult.roots, progress);
+  pushLog(`本地视频扫描完成：${scanResult.files.length} 个视频文件`, {
+    stage: "scan",
+    stageLabel: "扫描本地视频",
+    total: rootResult.roots.length,
+    processed: rootResult.roots.length,
+    current: "本地扫描完成",
+  });
+
+  const searchKeywords = buildArchiveSearchKeywords(scanResult.files);
+  pushLog(`搜索关键词生成完成：${searchKeywords.length} 个，将按本地标题和主播名搜索投稿中心`, {
+    stage: "search",
+    stageLabel: "搜索稿件",
+    total: searchKeywords.length,
+    processed: 0,
+    current: "搜索关键词",
+  });
+  const remoteResult = await collectRemoteVideoParts(
+    uid,
+    options.pages,
+    options.pageSize,
+    options.useArchiveDetail,
+    options.detailIntervalMs,
+    searchKeywords,
+    progress,
+  );
+
+  const localMatchHints = buildLocalMatchHints(scanResult.files);
+  const matches: LocalUploadedFileMatch[] = [];
+  for (const [index, localFile] of scanResult.files.entries()) {
+    progress?.({
+      stage: "matching",
+      stageLabel: "比对本地视频",
+      total: scanResult.files.length,
+      processed: index,
+      current: localFile.localPath,
+      message: `正在比对本地视频 ${formatProgressCount(index, scanResult.files.length)}：${localFile.fileName}`,
+    });
+    const hint = localMatchHints.get(normalizeLocalPath(localFile.localPath));
+    let bestMatch:
+      | {
+          remotePart: RemoteVideoPart;
+          match: LocalFileMatchResult;
+        }
+      | undefined;
+    for (const remotePart of remoteResult.parts) {
+      const match = matchLocalFile(localFile, remotePart, hint);
+      if (!match) continue;
+      if (!bestMatch || match.score > bestMatch.match.score) {
+        bestMatch = { remotePart, match };
+      }
+    }
+    if (bestMatch) {
+      const { remotePart, match } = bestMatch;
+      matches.push({
+        localPath: localFile.localPath,
+        fileName: localFile.fileName,
+        root: localFile.root,
+        size: localFile.size,
+        mtimeMs: localFile.mtimeMs,
+        aid: remotePart.aid,
+        bvid: remotePart.bvid,
+        cid: remotePart.cid,
+        page: remotePart.page,
+        archiveTitle: remotePart.archiveTitle,
+        partTitle: remotePart.partTitle,
+        remoteFilename: remotePart.remoteFilename,
+        confidence: match.confidence,
+        reason: match.reason,
+      });
+    }
+    if (index === 0 || (index + 1) % 25 === 0 || index === scanResult.files.length - 1) {
+      progress?.({
+        stage: "matching",
+        stageLabel: "比对本地视频",
+        total: scanResult.files.length,
+        processed: index + 1,
+        current: localFile.localPath,
+        message: `本地视频比对进度 ${formatProgressCount(index + 1, scanResult.files.length)}：${localFile.fileName}`,
+        log: `本地视频比对 ${index + 1}/${scanResult.files.length}：${localFile.fileName}`,
+      });
+    } else {
+      progress?.({
+        stage: "matching",
+        stageLabel: "比对本地视频",
+        total: scanResult.files.length,
+        processed: index + 1,
+        current: localFile.localPath,
+        message: `本地视频比对进度 ${formatProgressCount(index + 1, scanResult.files.length)}：${localFile.fileName}`,
+      });
+    }
+  }
+
+  pushLog(`本地视频比对完成：疑似已上传未删除 ${matches.length} 个`, {
+    stage: "matching",
+    stageLabel: "比对本地视频",
+    total: scanResult.files.length,
+    processed: scanResult.files.length,
+    current: "本地视频比对完成",
+  });
+
+  const unuploadedGroups = await buildUnuploadedGroups(
+    scanResult.files,
+    matches,
+    remoteResult.parts,
+    progress,
+  );
+  const resultLogs = [
+    ...logs,
+    ...remoteResult.logs,
+    `B站稿件读取完成：${remoteResult.archiveCount} 个稿件，${remoteResult.parts.length} 个可匹配项`,
+    `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+  ];
+  if (scanResult.truncated) {
+    resultLogs.push(`本地视频数量达到扫描上限 ${MAX_SCAN_FILES}，结果可能不完整`);
+  }
+
+  progress?.({
+    stage: "completed",
+    stageLabel: "检测完成",
+    total: 1,
+    processed: 1,
+    current: "检测完成",
+    message: `检测完成：已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+    log: `检测完成：已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+  });
+
+  const result: LocalUploadedFilesResult = {
+    roots: rootResult.roots,
+    scannedFileCount: scanResult.files.length,
+    archiveCount: remoteResult.archiveCount,
+    remotePartCount: remoteResult.parts.length,
+    truncated: scanResult.truncated,
+    matches,
+    unuploadedGroups,
+    errors: [...rootResult.errors, ...scanResult.errors, ...remoteResult.errors],
+    warnings: remoteResult.warnings,
+    logs: resultLogs,
+  };
+  return saveLocalDetectHistory(uid, options, result);
 };
 
 // 验证视频上传参数
@@ -1367,86 +2102,155 @@ router.get("/localUploadedFiles", async (ctx) => {
     0,
     10000,
   );
-  const rootResult = await resolveScanRoots(rootPath);
-  const scanResult = await scanVideoFiles(rootResult.roots);
-  const searchKeywords = buildArchiveSearchKeywords(scanResult.files);
-  const remoteResult = await collectRemoteVideoParts(
-    uid,
+  ctx.body = await runLocalUploadedFilesDetection(uid, {
     pages,
     pageSize,
+    rootPath,
     useArchiveDetail,
     detailIntervalMs,
-    searchKeywords,
-  );
-  const localMatchHints = buildLocalMatchHints(scanResult.files);
-  const matches: LocalUploadedFileMatch[] = [];
+  });
+});
 
-  for (const localFile of scanResult.files) {
-    const hint = localMatchHints.get(normalizeLocalPath(localFile.localPath));
-    let bestMatch:
-      | {
-          remotePart: RemoteVideoPart;
-          match: LocalFileMatchResult;
-        }
-      | undefined;
-    for (const remotePart of remoteResult.parts) {
-      const match = matchLocalFile(localFile, remotePart, hint);
-      if (!match) continue;
-      if (!bestMatch || match.score > bestMatch.match.score) {
-        bestMatch = { remotePart, match };
-      }
-    }
-    if (bestMatch) {
-      const { remotePart, match } = bestMatch;
-      matches.push({
-        localPath: localFile.localPath,
-        fileName: localFile.fileName,
-        root: localFile.root,
-        size: localFile.size,
-        mtimeMs: localFile.mtimeMs,
-        aid: remotePart.aid,
-        bvid: remotePart.bvid,
-        cid: remotePart.cid,
-        page: remotePart.page,
-        archiveTitle: remotePart.archiveTitle,
-        partTitle: remotePart.partTitle,
-        remoteFilename: remotePart.remoteFilename,
-        confidence: match.confidence,
-        reason: match.reason,
-      });
-    }
-  }
-  const unuploadedGroups = await buildUnuploadedGroups(
-    scanResult.files,
-    matches,
-    remoteResult.parts,
-  );
-  const logs = [
-    `检测参数：稿件列表 ${pages} 页，每页 ${pageSize} 条，分P详情${
-      useArchiveDetail ? `开启，间隔 ${detailIntervalMs}ms` : "关闭"
-    }，搜索关键词 ${searchKeywords.length} 个`,
-    `扫描目录：${rootResult.roots.join("；") || "未找到可扫描目录"}`,
-    `本地视频扫描完成：${scanResult.files.length} 个视频文件`,
-    ...remoteResult.logs,
-    `B站稿件读取完成：${remoteResult.archiveCount} 个稿件，${remoteResult.parts.length} 个可匹配项`,
-    `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
-  ];
-  if (scanResult.truncated) {
-    logs.push(`本地视频数量达到扫描上限 ${MAX_SCAN_FILES}，结果可能不完整`);
-  }
-
+router.get("/localUploadedFiles/history", async (ctx) => {
+  const uid = queryNumber(ctx.request.query.uid, 0);
+  const store = await readLocalDetectHistoryStore();
+  const items = store.histories
+    .filter((item) => !uid || item.uid === uid)
+    .map(summarizeLocalDetectHistory);
   ctx.body = {
-    roots: rootResult.roots,
-    scannedFileCount: scanResult.files.length,
-    archiveCount: remoteResult.archiveCount,
-    remotePartCount: remoteResult.parts.length,
-    truncated: scanResult.truncated,
-    matches,
-    unuploadedGroups,
-    errors: [...rootResult.errors, ...scanResult.errors, ...remoteResult.errors],
-    warnings: remoteResult.warnings,
-    logs,
+    items,
+    latest: items[0] ?? null,
   };
+});
+
+router.get("/localUploadedFiles/history/:id", async (ctx) => {
+  const uid = queryNumber(ctx.request.query.uid, 0);
+  const store = await readLocalDetectHistoryStore();
+  const item = store.histories.find(
+    (history) => history.id === ctx.params.id && (!uid || history.uid === uid),
+  );
+  if (!item) {
+    ctx.body = "history not found";
+    ctx.status = 404;
+    return;
+  }
+  ctx.body = item;
+});
+
+router.get("/localUploadedFiles/deletions", async (ctx) => {
+  const uid = queryNumber(ctx.request.query.uid, 0);
+  const historyId = queryString(ctx.request.query.historyId);
+  const limit = queryBoundedNumber(ctx.request.query.limit, 200, 1, LOCAL_DETECT_DELETION_LIMIT);
+  const store = await readLocalDetectHistoryStore();
+  ctx.body = {
+    items: store.deletions
+      .filter((item) => (!uid || item.uid === uid) && (!historyId || item.historyId === historyId))
+      .slice(0, limit),
+  };
+});
+
+router.post("/localUploadedFiles/deletions", async (ctx) => {
+  const body = (ctx.request.body ?? {}) as {
+    uid?: number;
+    historyId?: string;
+    items?: LocalUploadedFileMatch[];
+  };
+  if (!Array.isArray(body.items) || body.items.length === 0) {
+    ctx.body = "items required";
+    ctx.status = 400;
+    return;
+  }
+  const uid = queryNumber(body.uid, 0) || undefined;
+  const records = await recordLocalUploadedFileDeletions({
+    uid,
+    historyId: body.historyId,
+    items: body.items,
+  });
+  ctx.body = {
+    items: records,
+  };
+});
+
+router.post("/localUploadedFiles/detect", async (ctx) => {
+  const body = (ctx.request.body ?? {}) as {
+    uid?: number;
+    rootPath?: string;
+    pages?: number;
+    pageSize?: number;
+    useArchiveDetail?: boolean;
+    detailIntervalMs?: number;
+  };
+  const uid = queryNumber(body.uid, 0);
+  if (!uid) {
+    ctx.body = "uid required";
+    ctx.status = 400;
+    return;
+  }
+
+  cleanupLocalDetectJobs();
+  const job = createLocalDetectProgress();
+  localDetectJobs.set(job.id, job);
+  const pages = queryBoundedNumber(body.pages, DEFAULT_ARCHIVE_PAGES, 1, 10);
+  const pageSize = queryBoundedNumber(body.pageSize, 20, 1, 50);
+  const rootPath = queryString(body.rootPath);
+  const useArchiveDetail =
+    typeof body.useArchiveDetail === "boolean" ? body.useArchiveDetail : true;
+  const detailIntervalMs = queryBoundedNumber(
+    body.detailIntervalMs,
+    DEFAULT_DETAIL_INTERVAL_MS,
+    0,
+    10000,
+  );
+
+  void runLocalUploadedFilesDetection(
+    uid,
+    {
+      pages,
+      pageSize,
+      rootPath,
+      useArchiveDetail,
+      detailIntervalMs,
+    },
+    (patch) => touchLocalDetectProgress(job, patch),
+  )
+    .then((result) => {
+      job.status = "completed";
+      job.result = result;
+      job.completedAt = Date.now();
+      touchLocalDetectProgress(job, {
+        stage: "completed",
+        stageLabel: "检测完成",
+        total: 1,
+        processed: 1,
+        current: "检测完成",
+        message: `检测完成：已上传未删除 ${result.matches.length} 个，本地未上传 ${result.unuploadedGroups.length} 组`,
+      });
+    })
+    .catch((error) => {
+      job.status = "error";
+      job.error = error instanceof Error ? error.message : String(error);
+      job.completedAt = Date.now();
+      touchLocalDetectProgress(job, {
+        stage: "error",
+        stageLabel: "检测失败",
+        current: "检测失败",
+        message: job.error,
+        log: `检测失败：${job.error}`,
+      });
+    });
+
+  ctx.body = job;
+});
+
+router.get("/localUploadedFiles/detect/:id", async (ctx) => {
+  cleanupLocalDetectJobs();
+  const job = localDetectJobs.get(ctx.params.id);
+  if (!job) {
+    ctx.body = "detect job not found";
+    ctx.status = 404;
+    return;
+  }
+  ctx.body = job;
 });
 
 router.post("/uploadLocalUnuploaded", async (ctx) => {
