@@ -152,6 +152,7 @@ type ParsedRecorderIdentity = {
   roomId?: string;
   date: string;
   time: string;
+  sequence?: string;
   title: string;
   startTime?: number;
 };
@@ -522,24 +523,26 @@ const trimGeneratedVideoSuffix = (value?: string | null) => {
 
 const parseRecorderIdentity = (value?: string | null): ParsedRecorderIdentity | null => {
   const stem = trimGeneratedVideoSuffix(value);
-  const recordMatch = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
-  const compactMatch = stem.match(/^(\d{8})-(\d{6})(?:-\d+)?-(.+)$/);
+  const recordMatch = stem.match(/^录制-(\d+)-(\d{8})-(\d{6})(?:-(\d+))?-(.+)$/);
+  const compactMatch = stem.match(/^(\d{8})-(\d{6})(?:-(\d+))?-(.+)$/);
   const readableMatch = stem.match(
-    /^(\d{4})-(\d{2})-(\d{2})[\sT_-]+(\d{2})[-:](\d{2})[-:](\d{2})(?:[-_.]\d+)?[\s_-]+(.+)$/,
+    /^(\d{4})-(\d{2})-(\d{2})[\sT_-]+(\d{2})[-:](\d{2})[-:](\d{2})(?:[-_.](\d+))?[\s_-]+(.+)$/,
   );
 
   let roomId: string | undefined;
   let date: string;
   let time: string;
+  let sequence: string | undefined;
   let title: string;
   if (recordMatch) {
-    [, roomId, date, time, title] = recordMatch;
+    [, roomId, date, time, sequence, title] = recordMatch;
   } else if (compactMatch) {
-    [, date, time, title] = compactMatch;
+    [, date, time, sequence, title] = compactMatch;
   } else if (readableMatch) {
-    const [, year, month, day, hour, minute, second, text] = readableMatch;
+    const [, year, month, day, hour, minute, second, suffix, text] = readableMatch;
     date = `${year}${month}${day}`;
     time = `${hour}${minute}${second}`;
+    sequence = suffix;
     title = text;
   } else {
     return null;
@@ -557,17 +560,34 @@ const parseRecorderIdentity = (value?: string | null): ParsedRecorderIdentity | 
     roomId,
     date,
     time,
+    sequence,
     title,
     startTime: Number.isFinite(startTime) ? startTime : undefined,
   };
+};
+
+const getRecorderIdentityKey = (identity?: ParsedRecorderIdentity | null) => {
+  if (!identity?.date || !identity.time || !identity.sequence) return undefined;
+  const roomSegment = identity.roomId ? `${identity.roomId}-` : "";
+  return `${roomSegment}${identity.date}-${identity.time}-${identity.sequence}`;
+};
+
+const buildRecorderIdentityKeys = (...values: Array<string | undefined | null>) => {
+  const keys = new Set<string>();
+  for (const value of values) {
+    const key = getRecorderIdentityKey(parseRecorderIdentity(value));
+    if (key) keys.add(key);
+  }
+  return Array.from(keys);
 };
 
 const normalizePartIdentity = (value?: string | null) => {
   const recorderIdentity = parseRecorderIdentity(value);
   if (recorderIdentity) {
     const roomSegment = recorderIdentity.roomId ? `${recorderIdentity.roomId}-` : "";
+    const sequenceSegment = recorderIdentity.sequence ? `-${recorderIdentity.sequence}` : "";
     return normalizeMatchText(
-      `录制-${roomSegment}${recorderIdentity.date}-${recorderIdentity.time}-${recorderIdentity.title}`,
+      `录制-${roomSegment}${recorderIdentity.date}-${recorderIdentity.time}${sequenceSegment}-${recorderIdentity.title}`,
     );
   }
   const normalized = normalizeMatchText(value)
@@ -584,9 +604,10 @@ const recorderIdentitiesMatch = (
 ) => {
   const sameDate = left.date === right.date;
   const sameTime = !requireTime || left.time === right.time;
+  const sameSequence = !left.sequence || !right.sequence || left.sequence === right.sequence;
   const sameTitle = normalizeMatchText(left.title) === normalizeMatchText(right.title);
   const sameRoom = !left.roomId || !right.roomId || left.roomId === right.roomId;
-  return sameDate && sameTime && sameTitle && sameRoom;
+  return sameDate && sameTime && sameSequence && sameTitle && sameRoom;
 };
 
 const formatDateKey = (timestamp?: number) => {
@@ -1447,51 +1468,26 @@ const collectRemoteVideoParts = async (
   return { parts, archiveCount: archives.size, errors, warnings, logs };
 };
 
-const normalizeOriginalTitleText = (value?: string | null) => {
-  return normalizeMatchText(trimGeneratedVideoSuffix(value))
-    .replace(/弹幕版[\da-f]*$/i, "")
-    .replace(/后处理$/i, "")
-    .replace(/合并$/i, "");
-};
-
-const buildOriginalTitleAliases = (...values: Array<string | undefined | null>) => {
-  const aliases = new Set<string>();
-  for (const value of values) {
-    const normalized = normalizeOriginalTitleText(value);
-    if (normalized) aliases.add(normalized);
-    const identityTitle = parseRecorderIdentity(value)?.title;
-    const normalizedIdentityTitle = normalizeOriginalTitleText(identityTitle);
-    if (normalizedIdentityTitle) aliases.add(normalizedIdentityTitle);
-  }
-  return Array.from(aliases);
-};
-
 const matchLocalFile = (
   localFile: LocalVideoFile,
   remotePart: RemoteVideoPart,
   hint?: LocalMatchHint,
 ) => {
-  const fallbackMetadata = hint ? null : parseLocalMatchMetadata(localFile);
-  const localOriginalTitles = buildOriginalTitleAliases(
-    parseRecorderIdentity(localFile.fileName)?.title,
-    parseRecorderIdentity(localFile.stem)?.title,
-    hint?.title,
-    fallbackMetadata?.title,
+  void hint;
+  const localKeys = buildRecorderIdentityKeys(localFile.fileName, localFile.stem);
+  const remoteKeys = new Set(
+    buildRecorderIdentityKeys(
+      ...remotePart.values.map((value) => value.raw),
+      !remotePart.partTitle && (!remotePart.page || remotePart.page === 1)
+        ? remotePart.archiveTitle
+        : undefined,
+    ),
   );
-  const remotePartTitles = buildOriginalTitleAliases(
-    remotePart.partTitle,
-    !remotePart.partTitle && (!remotePart.page || remotePart.page === 1)
-      ? remotePart.archiveTitle
-      : undefined,
-  );
-  if (
-    localOriginalTitles.length > 0 &&
-    remotePartTitles.some((title) => localOriginalTitles.includes(title))
-  ) {
+  if (localKeys.length > 0 && localKeys.some((key) => remoteKeys.has(key))) {
     return {
       score: 100,
       confidence: "high" as const,
-      reason: `原始标题匹配分P标题${remotePart.page ? ` P${remotePart.page}` : ""}`,
+      reason: `录制标识匹配分P标题${remotePart.page ? ` P${remotePart.page}` : ""}`,
     };
   }
 
@@ -1752,9 +1748,13 @@ const remotePartMatchesLocalGroup = (context: LocalFileContext, remotePart: Remo
 
     const sameRoom = !!localRoomId && remoteIdentity.roomId === localRoomId;
     const sameDate = !!localDateKey && remoteIdentity.date === localDateKey;
+    const sameSequence =
+      !localIdentity?.sequence ||
+      !remoteIdentity.sequence ||
+      localIdentity.sequence === remoteIdentity.sequence;
     const sameTitle = !!localTitle && normalizeMatchText(remoteIdentity.title) === localTitle;
     const roomCompatible = sameRoom || !remoteIdentity.roomId || localTitle.length >= 10;
-    if (sameDate && sameTitle && roomCompatible) {
+    if (sameDate && sameSequence && sameTitle && roomCompatible) {
       return true;
     }
   }
