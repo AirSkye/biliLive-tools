@@ -97,6 +97,19 @@ export type LocalUploadedFilesResult = {
   logs: string[];
 };
 
+export type LocalSelectedStreamer = {
+  roomId: string;
+  platform?: string;
+};
+
+export type LocalUploadStreamerOption = {
+  key: string;
+  roomId: string;
+  platform: string;
+  name: string;
+  hasWebhookUploadConfig: boolean;
+};
+
 export type LocalUploadedFilesHistorySummary = {
   id: string;
   uid: number;
@@ -108,6 +121,7 @@ export type LocalUploadedFilesHistorySummary = {
     useArchiveDetail: boolean;
     detailIntervalMs: number;
     minVideoSizeMb?: number;
+    selectedStreamers?: LocalSelectedStreamer[];
   };
   scannedFileCount: number;
   archiveCount: number;
@@ -163,6 +177,24 @@ export type LocalUploadedFilesDetectionProgress = {
   completedAt?: number;
 };
 
+type LocalUploadedFilesDetectOptions = {
+  rootPath?: string;
+  pages?: number;
+  pageSize?: number;
+  useArchiveDetail?: boolean;
+  detailIntervalMs?: number;
+  minVideoSizeMb?: number;
+  selectedStreamers?: LocalSelectedStreamer[];
+};
+
+const buildLocalDetectParams = (uid: number, options: LocalUploadedFilesDetectOptions) => ({
+  uid,
+  ...options,
+  selectedStreamers: options.selectedStreamers?.length
+    ? JSON.stringify(options.selectedStreamers)
+    : undefined,
+});
+
 export type LocalUploadCandidateFile = {
   path: string;
   fileName: string;
@@ -199,18 +231,18 @@ export type LocalUnuploadedGroup = {
 
 const detectLocalUploadedFiles = async (
   uid: number,
-  options: {
-    rootPath?: string;
-    pages?: number;
-    pageSize?: number;
-    useArchiveDetail?: boolean;
-    detailIntervalMs?: number;
-    minVideoSizeMb?: number;
-  } = {},
+  options: LocalUploadedFilesDetectOptions = {},
 ): Promise<LocalUploadedFilesResult> => {
   const res = await request.get("/bili/localUploadedFiles", {
-    params: { uid, ...options },
+    params: buildLocalDetectParams(uid, options),
   });
+  return res.data;
+};
+
+const getLocalUploadStreamers = async (): Promise<{
+  items: LocalUploadStreamerOption[];
+}> => {
+  const res = await request.get("/bili/localUploadedFiles/streamers");
   return res.data;
 };
 
@@ -264,14 +296,7 @@ const recordLocalUploadedFileDeletions = async (data: {
 
 const startLocalUploadedFilesDetection = async (
   uid: number,
-  options: {
-    rootPath?: string;
-    pages?: number;
-    pageSize?: number;
-    useArchiveDetail?: boolean;
-    detailIntervalMs?: number;
-    minVideoSizeMb?: number;
-  } = {},
+  options: LocalUploadedFilesDetectOptions = {},
 ): Promise<LocalUploadedFilesDetectionProgress> => {
   const res = await request.post("/bili/localUploadedFiles/detect", {
     uid,
@@ -430,6 +455,7 @@ const bili = {
   getSessionId,
   getPlatformArchiveDetail,
   detectLocalUploadedFiles,
+  getLocalUploadStreamers,
   getLocalUploadedFilesHistory,
   getLocalUploadedFilesHistoryItem,
   getLocalUploadedFileDeletions,

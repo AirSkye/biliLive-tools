@@ -112,6 +112,19 @@ type LocalUnuploadedGroup = {
   warnings: string[];
 };
 
+type LocalUploadStreamerOption = {
+  key: string;
+  roomId: string;
+  platform: string;
+  name: string;
+  hasWebhookUploadConfig: boolean;
+};
+
+type SelectedLocalStreamer = {
+  roomId: string;
+  platform?: string;
+};
+
 type RemoteArchiveItem = {
   aid: number;
   item: any;
@@ -242,6 +255,7 @@ type LocalDetectOptions = {
   useArchiveDetail: boolean;
   detailIntervalMs: number;
   minVideoSizeMb: number;
+  selectedStreamers?: SelectedLocalStreamer[];
 };
 
 type LocalDetectHistoryItem = {
@@ -317,6 +331,41 @@ const queryBoolean = (value: unknown, fallback = false) => {
   if (typeof data === "boolean") return data;
   if (typeof data !== "string") return fallback;
   return ["1", "true", "yes"].includes(data.trim().toLowerCase());
+};
+
+const querySelectedStreamers = (value: unknown): SelectedLocalStreamer[] => {
+  const data = Array.isArray(value) ? value : getQueryValue(value);
+  if (!data) return [];
+  let list: unknown = data;
+  if (typeof data === "string") {
+    const text = data.trim();
+    if (!text) return [];
+    try {
+      list = JSON.parse(text);
+    } catch {
+      list = text.split(",").map((item) => {
+        const [platform, roomId] = item.includes(":") ? item.split(":") : ["bilibili", item];
+        return { platform, roomId };
+      });
+    }
+  }
+  if (!Array.isArray(list)) return [];
+  const items: SelectedLocalStreamer[] = [];
+  for (const item of list) {
+    if (typeof item === "string") {
+      const [platform, roomId] = item.includes(":") ? item.split(":") : ["bilibili", item];
+      if (roomId) items.push({ platform, roomId });
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const record = item as { roomId?: unknown; room_id?: unknown; platform?: unknown };
+    const roomId = String(record.roomId ?? record.room_id ?? "").trim();
+    if (!roomId) continue;
+    const selected: SelectedLocalStreamer = { roomId };
+    if (typeof record.platform === "string") selected.platform = record.platform;
+    items.push(selected);
+  }
+  return items;
 };
 
 const clampProgressNumber = (value: unknown, fallback = 0) => {
@@ -1663,6 +1712,82 @@ const buildLocalFileContexts = async (
   return contexts;
 };
 
+const buildLocalFileStreamerKeys = async (
+  localFile: LocalVideoFile,
+  recordLookup: ReturnType<typeof buildRecordLookup>,
+) => {
+  const keys = new Set<string>();
+  const appendKey = (roomId?: string | number | null, platform?: string | null) => {
+    const key = getStreamerFilterKey(roomId, platform);
+    if (key) keys.add(key);
+  };
+
+  const record = findRecordByLocalFile(localFile, recordLookup);
+  appendKey(record?.streamer?.room_id, record?.streamer?.platform);
+
+  const filenameIdentity = parseRecorderIdentity(localFile.fileName);
+  const stemIdentity = parseRecorderIdentity(localFile.stem);
+  appendKey(filenameIdentity?.roomId, "bilibili");
+  appendKey(stemIdentity?.roomId, "bilibili");
+
+  const matchMetadata = parseLocalMatchMetadata(localFile);
+  appendKey(matchMetadata.roomId, matchMetadata.platform);
+
+  if (keys.size === 0) {
+    const danmuFiles = await findDanmuFiles(localFile.localPath);
+    const metadata = await parseLocalFileMetadata(localFile, danmuFiles);
+    appendKey(metadata.roomId, metadata.platform);
+  }
+
+  return keys;
+};
+
+const filterLocalFilesBySelectedStreamers = async (
+  localFiles: LocalVideoFile[],
+  selectedStreamers: SelectedLocalStreamer[],
+  progress?: LocalDetectProgressReporter,
+) => {
+  const selectedKeys = new Set(
+    selectedStreamers
+      .map((item) => getStreamerFilterKey(item.roomId, item.platform))
+      .filter((item): item is string => !!item),
+  );
+  if (selectedKeys.size === 0) {
+    return {
+      files: localFiles,
+      skipped: 0,
+    };
+  }
+
+  const recordLookup = buildRecordLookup();
+  const files: LocalVideoFile[] = [];
+  let skipped = 0;
+  for (const [index, localFile] of localFiles.entries()) {
+    const fileKeys = await buildLocalFileStreamerKeys(localFile, recordLookup);
+    if (Array.from(fileKeys).some((key) => selectedKeys.has(key))) {
+      files.push(localFile);
+    } else {
+      skipped += 1;
+    }
+
+    if (index === 0 || (index + 1) % 50 === 0 || index === localFiles.length - 1) {
+      progress?.({
+        stage: "scan",
+        stageLabel: "按主播筛选",
+        total: localFiles.length,
+        processed: index + 1,
+        current: localFile.localPath,
+        message: `按主播筛选本地视频 ${formatProgressCount(index + 1, localFiles.length)}，保留 ${files.length} 个`,
+      });
+    }
+  }
+
+  return {
+    files,
+    skipped,
+  };
+};
+
 const hasWebhookUploadConfig = (roomId?: string) => {
   try {
     const config = handler.configManager.getConfig(roomId || DEFAULT_WEBHOOK_ROOM_ID);
@@ -1670,6 +1795,50 @@ const hasWebhookUploadConfig = (roomId?: string) => {
   } catch {
     return false;
   }
+};
+
+const normalizeStreamerPlatform = (platform?: string | null) =>
+  String(platform || "bilibili").toLowerCase();
+
+const getStreamerFilterKey = (roomId?: string | number | null, platform?: string | null) => {
+  if (!roomId) return undefined;
+  return `${normalizeStreamerPlatform(platform)}:${String(roomId)}`;
+};
+
+const normalizeSelectedStreamers = (items?: SelectedLocalStreamer[]) => {
+  const map = new Map<string, SelectedLocalStreamer>();
+  for (const item of items ?? []) {
+    if (!item?.roomId) continue;
+    const platform = normalizeStreamerPlatform(item.platform);
+    const key = getStreamerFilterKey(item.roomId, platform);
+    if (!key) continue;
+    map.set(key, {
+      roomId: String(item.roomId),
+      platform,
+    });
+  }
+  return Array.from(map.values());
+};
+
+const listLocalUploadStreamers = (): LocalUploadStreamerOption[] => {
+  const map = new Map<string, LocalUploadStreamerOption>();
+  for (const streamer of streamerService.list()) {
+    const key = getStreamerFilterKey(streamer.room_id, streamer.platform);
+    if (!key) continue;
+    if (map.has(key)) continue;
+    map.set(key, {
+      key,
+      roomId: String(streamer.room_id),
+      platform: normalizeStreamerPlatform(streamer.platform),
+      name: streamer.name,
+      hasWebhookUploadConfig: hasWebhookUploadConfig(String(streamer.room_id)),
+    });
+  }
+  return Array.from(map.values()).sort((left, right) => {
+    const nameCompare = left.name.localeCompare(right.name, "zh-Hans-CN");
+    if (nameCompare !== 0) return nameCompare;
+    return left.roomId.localeCompare(right.roomId);
+  });
 };
 
 const remotePartMatchesLocalGroup = (context: LocalFileContext, remotePart: RemoteVideoPart) => {
@@ -1836,7 +2005,9 @@ const runLocalUploadedFilesDetection = async (
   pushLog(
     `检测参数：稿件列表 ${options.pages} 页，每页 ${options.pageSize} 条，分P详情${
       options.useArchiveDetail ? `开启，间隔 ${options.detailIntervalMs}ms` : "关闭"
-    }，未上传分组合计最小大小 ${options.minVideoSizeMb || 0} MB`,
+    }，未上传分组合计最小大小 ${options.minVideoSizeMb || 0} MB，主播筛选 ${
+      options.selectedStreamers?.length ? `${options.selectedStreamers.length} 个` : "全部"
+    }`,
     {
       stage: "prepare",
       stageLabel: "准备检测",
@@ -1875,7 +2046,27 @@ const runLocalUploadedFilesDetection = async (
     });
   }
 
-  const searchKeywords = buildArchiveSearchKeywords(scanResult.files);
+  const selectedStreamers = normalizeSelectedStreamers(options.selectedStreamers);
+  const filterResult = await filterLocalFilesBySelectedStreamers(
+    scanResult.files,
+    selectedStreamers,
+    progress,
+  );
+  const localFiles = filterResult.files;
+  if (selectedStreamers.length > 0) {
+    pushLog(
+      `主播筛选完成：选中 ${selectedStreamers.length} 个主播，保留 ${localFiles.length} 个本地视频，跳过 ${filterResult.skipped} 个`,
+      {
+        stage: "scan",
+        stageLabel: "按主播筛选",
+        total: scanResult.files.length,
+        processed: scanResult.files.length,
+        current: "主播筛选完成",
+      },
+    );
+  }
+
+  const searchKeywords = buildArchiveSearchKeywords(localFiles);
   pushLog(`搜索关键词生成完成：${searchKeywords.length} 个，将按本地标题和主播名搜索投稿中心`, {
     stage: "search",
     stageLabel: "搜索稿件",
@@ -1893,16 +2084,16 @@ const runLocalUploadedFilesDetection = async (
     progress,
   );
 
-  const localMatchHints = buildLocalMatchHints(scanResult.files);
+  const localMatchHints = buildLocalMatchHints(localFiles);
   const matches: LocalUploadedFileMatch[] = [];
-  for (const [index, localFile] of scanResult.files.entries()) {
+  for (const [index, localFile] of localFiles.entries()) {
     progress?.({
       stage: "matching",
       stageLabel: "比对本地视频",
-      total: scanResult.files.length,
+      total: localFiles.length,
       processed: index,
       current: localFile.localPath,
-      message: `正在比对本地视频 ${formatProgressCount(index, scanResult.files.length)}：${localFile.fileName}`,
+      message: `正在比对本地视频 ${formatProgressCount(index, localFiles.length)}：${localFile.fileName}`,
     });
     const hint = localMatchHints.get(normalizeLocalPath(localFile.localPath));
     let bestMatch:
@@ -1937,24 +2128,24 @@ const runLocalUploadedFilesDetection = async (
         reason: match.reason,
       });
     }
-    if (index === 0 || (index + 1) % 25 === 0 || index === scanResult.files.length - 1) {
+    if (index === 0 || (index + 1) % 25 === 0 || index === localFiles.length - 1) {
       progress?.({
         stage: "matching",
         stageLabel: "比对本地视频",
-        total: scanResult.files.length,
+        total: localFiles.length,
         processed: index + 1,
         current: localFile.localPath,
-        message: `本地视频比对进度 ${formatProgressCount(index + 1, scanResult.files.length)}：${localFile.fileName}`,
-        log: `本地视频比对 ${index + 1}/${scanResult.files.length}：${localFile.fileName}`,
+        message: `本地视频比对进度 ${formatProgressCount(index + 1, localFiles.length)}：${localFile.fileName}`,
+        log: `本地视频比对 ${index + 1}/${localFiles.length}：${localFile.fileName}`,
       });
     } else {
       progress?.({
         stage: "matching",
         stageLabel: "比对本地视频",
-        total: scanResult.files.length,
+        total: localFiles.length,
         processed: index + 1,
         current: localFile.localPath,
-        message: `本地视频比对进度 ${formatProgressCount(index + 1, scanResult.files.length)}：${localFile.fileName}`,
+        message: `本地视频比对进度 ${formatProgressCount(index + 1, localFiles.length)}：${localFile.fileName}`,
       });
     }
   }
@@ -1962,13 +2153,13 @@ const runLocalUploadedFilesDetection = async (
   pushLog(`本地视频比对完成：疑似已上传未删除 ${matches.length} 个`, {
     stage: "matching",
     stageLabel: "比对本地视频",
-    total: scanResult.files.length,
-    processed: scanResult.files.length,
+    total: localFiles.length,
+    processed: localFiles.length,
     current: "本地视频比对完成",
   });
 
   const unuploadedResult = await buildUnuploadedGroups(
-    scanResult.files,
+    localFiles,
     matches,
     remoteResult.parts,
     { minTotalSizeBytes: Math.max(0, options.minVideoSizeMb || 0) * 1024 * 1024 },
@@ -1979,8 +2170,11 @@ const runLocalUploadedFilesDetection = async (
     ...logs,
     ...remoteResult.logs,
     `B站稿件读取完成：${remoteResult.archiveCount} 个稿件，${remoteResult.parts.length} 个可匹配项`,
+    selectedStreamers.length > 0
+      ? `主播筛选：选中 ${selectedStreamers.length} 个主播，保留 ${localFiles.length} 个本地视频，跳过 ${filterResult.skipped} 个`
+      : "",
     `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组，大小过滤 ${unuploadedResult.skippedSmallGroupCount} 组`,
-  ];
+  ].filter(Boolean);
   if (scanResult.truncated) {
     resultLogs.push(`本地视频数量达到扫描上限 ${MAX_SCAN_FILES}，结果可能不完整`);
   }
@@ -1997,7 +2191,7 @@ const runLocalUploadedFilesDetection = async (
 
   const result: LocalUploadedFilesResult = {
     roots: rootResult.roots,
-    scannedFileCount: scanResult.files.length,
+    scannedFileCount: localFiles.length,
     skippedSmallUnuploadedGroupCount: unuploadedResult.skippedSmallGroupCount,
     archiveCount: remoteResult.archiveCount,
     remotePartCount: remoteResult.parts.length,
@@ -2084,6 +2278,12 @@ router.get("/platformArchiveDetail", async (ctx) => {
   ctx.body = data;
 });
 
+router.get("/localUploadedFiles/streamers", async (ctx) => {
+  ctx.body = {
+    items: listLocalUploadStreamers(),
+  };
+});
+
 router.get("/localUploadedFiles", async (ctx) => {
   const query = ctx.request.query;
   const uid = queryNumber(query.uid, 0);
@@ -2104,6 +2304,7 @@ router.get("/localUploadedFiles", async (ctx) => {
     10000,
   );
   const minVideoSizeMb = queryBoundedNonNegativeNumber(query.minVideoSizeMb, 0, 0, 1024 * 10);
+  const selectedStreamers = querySelectedStreamers(query.selectedStreamers);
   ctx.body = await runLocalUploadedFilesDetection(uid, {
     pages,
     pageSize,
@@ -2111,6 +2312,7 @@ router.get("/localUploadedFiles", async (ctx) => {
     useArchiveDetail,
     detailIntervalMs,
     minVideoSizeMb,
+    selectedStreamers,
   });
 });
 
@@ -2183,6 +2385,7 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
     useArchiveDetail?: boolean;
     detailIntervalMs?: number;
     minVideoSizeMb?: number;
+    selectedStreamers?: SelectedLocalStreamer[];
   };
   const uid = queryNumber(body.uid, 0);
   if (!uid) {
@@ -2206,6 +2409,7 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
     10000,
   );
   const minVideoSizeMb = queryBoundedNonNegativeNumber(body.minVideoSizeMb, 0, 0, 1024 * 10);
+  const selectedStreamers = querySelectedStreamers(body.selectedStreamers);
 
   void runLocalUploadedFilesDetection(
     uid,
@@ -2216,6 +2420,7 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
       useArchiveDetail,
       detailIntervalMs,
       minVideoSizeMb,
+      selectedStreamers,
     },
     (patch) => touchLocalDetectProgress(job, patch),
   )

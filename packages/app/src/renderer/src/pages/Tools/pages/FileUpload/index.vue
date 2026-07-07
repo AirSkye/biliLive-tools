@@ -46,6 +46,16 @@
           :precision="0"
           style="width: 118px"
         />
+        <n-select
+          v-model:value="selectedLocalDetectStreamerKeys"
+          multiple
+          filterable
+          clearable
+          :loading="loadingLocalUploadStreamers"
+          :options="localUploadStreamerSelectOptions"
+          placeholder="按主播筛选扫描结果"
+          style="min-width: 260px"
+        />
       </div>
       <n-checkbox v-model:checked="options.removeOriginAfterUploadCheck">
         审核通过后移除源文件
@@ -222,6 +232,7 @@
             <n-checkbox v-model:checked="localUploadOptions.uploadRawWhenNoDanmu">
               弹幕不存在时上传原视频
             </n-checkbox>
+            <n-checkbox v-model:checked="localUploadOptions.burnDanmu"> 压制弹幕 </n-checkbox>
             <n-checkbox v-model:checked="localUploadOptions.mergeSegments">
               上传前选择合并分段
             </n-checkbox>
@@ -272,43 +283,6 @@
       </n-tabs>
     </n-modal>
     <n-modal
-      v-model:show="localProcessDialogVisible"
-      preset="card"
-      title="选择处理主播"
-      style="width: min(900px, 92vw)"
-      :bordered="false"
-      :trap-focus="false"
-      :auto-focus="false"
-    >
-      <div class="local-upload-toolbar">
-        <span>待处理主播：{{ localProcessStreamerRows.length }}</span>
-        <n-button size="small" @click="selectAllProcessStreamers"> 全选全部 </n-button>
-        <n-button size="small" @click="clearProcessStreamers"> 清空选择 </n-button>
-      </div>
-      <n-empty v-if="localProcessStreamerRows.length === 0" description="没有可处理的主播" />
-      <n-data-table
-        v-else
-        v-model:checked-row-keys="selectedProcessStreamerKeys"
-        :row-key="getLocalProcessStreamerRowKey"
-        :columns="localProcessStreamerColumns"
-        :data="localProcessStreamerRows"
-        :pagination="{ pageSize: 8 }"
-        size="small"
-      />
-      <template #footer>
-        <div class="local-dialog-footer">
-          <n-button @click="localProcessDialogVisible = false">取消</n-button>
-          <n-button
-            type="primary"
-            :loading="uploadingLocalUnuploaded"
-            @click="confirmLocalProcessSelection"
-          >
-            下一步
-          </n-button>
-        </div>
-      </template>
-    </n-modal>
-    <n-modal
       v-model:show="localMergeDialogVisible"
       preset="card"
       title="选择待合并分段"
@@ -350,7 +324,7 @@
 
 <script setup lang="ts">
 import { toReactive, useLocalStorage } from "@vueuse/core";
-import { NButton, NRadio, NRadioGroup, useNotification } from "naive-ui";
+import { NButton, useNotification } from "naive-ui";
 import type { DataTableColumns, DataTableRowKey } from "naive-ui";
 
 import FileSelect from "@renderer/pages/Tools/pages/FileUpload/components/FileSelect.vue";
@@ -368,6 +342,7 @@ import type {
   LocalUploadedFilesHistorySummary,
   LocalUploadedFileMatch,
   LocalUploadedFilesResult,
+  LocalUploadStreamerOption,
   LocalUnuploadedGroup,
 } from "@renderer/apis/bili";
 
@@ -518,6 +493,31 @@ const localDetectOptions = useLocalStorage("file-upload-local-detect-options", {
   detailIntervalMs: 1500,
   minVideoSizeMb: 0,
 });
+const loadingLocalUploadStreamers = ref(false);
+const localUploadStreamers = ref<LocalUploadStreamerOption[]>([]);
+const selectedLocalDetectStreamerKeys = useLocalStorage<string[]>(
+  "file-upload-local-detect-streamers",
+  [],
+);
+const localUploadStreamerSelectOptions = computed(() =>
+  localUploadStreamers.value.map((item) => ({
+    label: `${item.name || "未知"} (${item.roomId})`,
+    value: item.key,
+  })),
+);
+const localUploadStreamerByKey = computed(() => {
+  const map = new Map<string, LocalUploadStreamerOption>();
+  for (const item of localUploadStreamers.value) map.set(item.key, item);
+  return map;
+});
+const getSelectedLocalDetectStreamers = () =>
+  selectedLocalDetectStreamerKeys.value
+    .map((key) => localUploadStreamerByKey.value.get(String(key)))
+    .filter((item): item is LocalUploadStreamerOption => !!item)
+    .map((item) => ({
+      roomId: item.roomId,
+      platform: item.platform,
+    }));
 const localDetectHistoryOptions = computed(() =>
   localDetectHistoryItems.value.map((item) => ({
     label: `${new Date(item.createdAt).toLocaleString()} | 残留 ${item.matchCount}/${item.initialMatchCount} | 未上传 ${item.unuploadedGroupCount} | 已删 ${item.deletedCount}`,
@@ -577,36 +577,17 @@ const localUploadOptions = reactive({
   uploadRawWhenNoDanmu: true,
   mergeSegments: true,
 });
-type LocalProcessMode = "burn" | "raw";
-type LocalProcessStreamerRow = {
-  key: string;
-  roomId?: string;
-  username?: string;
-  groupCount: number;
-  fileCount: number;
-  totalSize: number;
-  appendCount: number;
-  newCount: number;
-  groups: LocalUnuploadedGroup[];
-};
 type PendingLocalUploadGroup = {
   row: LocalUnuploadedGroup;
   burnDanmu: boolean;
   uploadRawWhenNoDanmu: boolean;
 };
-const localProcessDialogVisible = ref(false);
 const localMergeDialogVisible = ref(false);
-const pendingLocalProcessGroups = ref<LocalUnuploadedGroup[]>([]);
 const pendingLocalUploadGroups = ref<PendingLocalUploadGroup[]>([]);
-const selectedProcessStreamerKeys = ref<DataTableRowKey[]>([]);
 const selectedMergeGroupIds = ref<DataTableRowKey[]>([]);
-const processModeByStreamerKey = reactive<Record<string, LocalProcessMode>>({});
 const getLocalUploadedRowKey = (row: LocalUploadedFileMatch) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
 const getLocalDeletionRowKey = (row: LocalUploadedFileDeletionRecord) => row.id;
-const getLocalProcessStreamerRowKey = (row: LocalProcessStreamerRow) => row.key;
-const getLocalStreamerKey = (row: LocalUnuploadedGroup) =>
-  `${row.platform || "bilibili"}:${row.roomId || row.username || "unknown"}`;
 const getEligibleLocalUnuploadedRows = () =>
   localUnuploadedRows.value.filter((row) => row.roomId && row.hasWebhookUploadConfig);
 const selectAllLocalUnuploadedGroups = () => {
@@ -615,55 +596,17 @@ const selectAllLocalUnuploadedGroups = () => {
 const clearSelectedLocalUploadGroups = () => {
   selectedLocalUploadGroupIds.value = [];
 };
-const localProcessStreamerRows = computed<LocalProcessStreamerRow[]>(() => {
-  const map = new Map<string, LocalProcessStreamerRow>();
-  for (const group of pendingLocalProcessGroups.value) {
-    const key = getLocalStreamerKey(group);
-    const item =
-      map.get(key) ??
-      ({
-        key,
-        roomId: group.roomId,
-        username: group.username,
-        groupCount: 0,
-        fileCount: 0,
-        totalSize: 0,
-        appendCount: 0,
-        newCount: 0,
-        groups: [],
-      } satisfies LocalProcessStreamerRow);
-    item.groupCount += 1;
-    item.fileCount += group.fileCount;
-    item.totalSize += group.totalSize;
-    if (group.suggestedAction === "append") item.appendCount += 1;
-    else item.newCount += 1;
-    item.groups.push(group);
-    map.set(key, item);
-  }
-  return Array.from(map.values()).sort((left, right) => right.totalSize - left.totalSize);
-});
 const localMergeRows = computed(() =>
   pendingLocalUploadGroups.value
     .map((item) => item.row)
     .filter((row) => row.mergeCandidate)
     .sort((left, right) => right.totalSize - left.totalSize),
 );
-const selectAllProcessStreamers = () => {
-  selectedProcessStreamerKeys.value = localProcessStreamerRows.value.map((row) => row.key);
-};
-const clearProcessStreamers = () => {
-  selectedProcessStreamerKeys.value = [];
-};
 const selectAllMergeGroups = () => {
   selectedMergeGroupIds.value = localMergeRows.value.map((row) => row.id);
 };
 const clearMergeGroups = () => {
   selectedMergeGroupIds.value = [];
-};
-const getProcessMode = (key: string): LocalProcessMode =>
-  processModeByStreamerKey[key] ?? (localUploadOptions.burnDanmu ? "burn" : "raw");
-const setProcessMode = (key: string, value: LocalProcessMode) => {
-  processModeByStreamerKey[key] = value;
 };
 
 let localDetectPollingRunId = 0;
@@ -687,9 +630,7 @@ const resetLocalDetectView = () => {
   localUnuploadedSearchKeyword.value = "";
   selectedLocalUploadedFileKeys.value = [];
   selectedLocalUploadGroupIds.value = [];
-  pendingLocalProcessGroups.value = [];
   pendingLocalUploadGroups.value = [];
-  selectedProcessStreamerKeys.value = [];
   selectedMergeGroupIds.value = [];
   localDetectLogs.value = [];
   localDetectLogCursor = 0;
@@ -707,6 +648,23 @@ const loadLocalDetectHistoryList = async () => {
   const data = await biliApi.getLocalUploadedFilesHistory(userInfo.value.uid);
   localDetectHistoryItems.value = data.items;
   return data.latest;
+};
+const loadLocalUploadStreamers = async () => {
+  loadingLocalUploadStreamers.value = true;
+  try {
+    const data = await biliApi.getLocalUploadStreamers();
+    localUploadStreamers.value = data.items;
+    const availableKeys = new Set(data.items.map((item) => item.key));
+    selectedLocalDetectStreamerKeys.value = selectedLocalDetectStreamerKeys.value.filter((key) =>
+      availableKeys.has(String(key)),
+    );
+  } catch (error) {
+    pushLocalDetectLog(
+      `加载主播列表失败：${error instanceof Error ? error.message : String(error)}`,
+    );
+  } finally {
+    loadingLocalUploadStreamers.value = false;
+  }
 };
 const loadLocalDeletionHistory = async () => {
   if (!userInfo.value.uid) return;
@@ -771,8 +729,11 @@ const openLocalUploadedFilesPanel = async () => {
   resetLocalDetectView();
   loadingLocalDetectHistory.value = true;
   try {
-    const latest = await loadLocalDetectHistoryList();
-    await loadLocalDeletionHistory();
+    const [latest] = await Promise.all([
+      loadLocalDetectHistoryList(),
+      loadLocalDeletionHistory(),
+      loadLocalUploadStreamers(),
+    ]);
     if (latest) {
       await loadLocalDetectHistoryById(latest.id);
     } else {
@@ -1062,56 +1023,6 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   },
 ];
 
-const localProcessStreamerColumns: DataTableColumns<LocalProcessStreamerRow> = [
-  {
-    type: "selection",
-  },
-  {
-    title: "主播/房间",
-    key: "roomId",
-    minWidth: 180,
-    render: (row) => `${row.username || "未知"}${row.roomId ? ` (${row.roomId})` : ""}`,
-  },
-  {
-    title: "分组",
-    key: "groupCount",
-    width: 130,
-    render: (row) => `${row.groupCount} 组 / ${row.fileCount} 个文件`,
-  },
-  {
-    title: "大小",
-    key: "totalSize",
-    width: 120,
-    render: (row) => formatFileSize(row.totalSize),
-  },
-  {
-    title: "建议",
-    key: "suggestion",
-    width: 140,
-    render: (row) => `续传 ${row.appendCount} / 新建 ${row.newCount}`,
-  },
-  {
-    title: "处理方式",
-    key: "processMode",
-    minWidth: 220,
-    render: (row) =>
-      h(
-        NRadioGroup,
-        {
-          value: getProcessMode(row.key),
-          size: "small",
-          "onUpdate:value": (value: LocalProcessMode) => setProcessMode(row.key, value),
-        },
-        {
-          default: () => [
-            h(NRadio, { value: "burn" }, { default: () => "压制弹幕" }),
-            h(NRadio, { value: "raw" }, { default: () => "直接上传" }),
-          ],
-        },
-      ),
-  },
-];
-
 const localMergeColumns: DataTableColumns<LocalUnuploadedGroup> = [
   {
     type: "selection",
@@ -1218,52 +1129,11 @@ const uploadSelectedLocalGroups = async () => {
     return;
   }
 
-  pendingLocalProcessGroups.value = groups;
-  pendingLocalUploadGroups.value = [];
-  selectedProcessStreamerKeys.value = [];
-  selectedMergeGroupIds.value = [];
-  for (const row of groups) {
-    const key = getLocalStreamerKey(row);
-    if (!processModeByStreamerKey[key]) {
-      processModeByStreamerKey[key] = localUploadOptions.burnDanmu ? "burn" : "raw";
-    }
-  }
-  localProcessDialogVisible.value = true;
-};
-
-const confirmLocalProcessSelection = async () => {
-  const selectedStreamerKeys = new Set(
-    selectedProcessStreamerKeys.value.map((item) => String(item)),
-  );
-  if (selectedStreamerKeys.size === 0) {
-    notice.warning({
-      title: "请选择主播",
-      content: "需要选择至少一个主播的视频进行处理",
-      duration: 3000,
-    });
-    return;
-  }
-
-  pendingLocalUploadGroups.value = pendingLocalProcessGroups.value
-    .filter((row) => selectedStreamerKeys.has(getLocalStreamerKey(row)))
-    .map((row) => {
-      const mode = getProcessMode(getLocalStreamerKey(row));
-      return {
-        row,
-        burnDanmu: mode === "burn",
-        uploadRawWhenNoDanmu: mode === "raw" ? true : localUploadOptions.uploadRawWhenNoDanmu,
-      };
-    });
-
-  if (pendingLocalUploadGroups.value.length === 0) {
-    notice.warning({
-      title: "没有可处理分组",
-      duration: 3000,
-    });
-    return;
-  }
-
-  localProcessDialogVisible.value = false;
+  pendingLocalUploadGroups.value = groups.map((row) => ({
+    row,
+    burnDanmu: localUploadOptions.burnDanmu,
+    uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
+  }));
   if (localUploadOptions.mergeSegments && localMergeRows.value.length > 0) {
     selectedMergeGroupIds.value = [];
     localMergeDialogVisible.value = true;
@@ -1275,7 +1145,6 @@ const confirmLocalProcessSelection = async () => {
 
 const cancelLocalMergeSelection = () => {
   localMergeDialogVisible.value = false;
-  localProcessDialogVisible.value = true;
 };
 
 const confirmLocalMergeSelection = async () => {
@@ -1306,8 +1175,8 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     const result = await biliApi.uploadLocalUnuploaded({
       groups,
       options: {
-        burnDanmu: false,
-        uploadRawWhenNoDanmu: true,
+        burnDanmu: localUploadOptions.burnDanmu,
+        uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
         mergeSegments: false,
       },
     });
@@ -1318,11 +1187,8 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
       duration: 3000,
     });
     selectedLocalUploadGroupIds.value = [];
-    pendingLocalProcessGroups.value = [];
     pendingLocalUploadGroups.value = [];
-    selectedProcessStreamerKeys.value = [];
     selectedMergeGroupIds.value = [];
-    localProcessDialogVisible.value = false;
     localMergeDialogVisible.value = false;
   } catch (error) {
     notice.error({
@@ -1345,6 +1211,20 @@ const runLocalUploadedFilesScan = async () => {
     return;
   }
 
+  if (localUploadStreamers.value.length === 0) {
+    await loadLocalUploadStreamers();
+  }
+  const requestedStreamerCount = selectedLocalDetectStreamerKeys.value.length;
+  const selectedStreamers = getSelectedLocalDetectStreamers();
+  if (requestedStreamerCount > 0 && selectedStreamers.length === 0) {
+    notice.warning({
+      title: "主播筛选不可用",
+      content: "已选择主播，但未能解析到有效主播列表，请刷新后重试",
+      duration: 3000,
+    });
+    return;
+  }
+
   detectingLocalUploadedFiles.value = true;
   localUploadedFilesVisible.value = true;
   localUploadedFilesResult.value = null;
@@ -1352,6 +1232,9 @@ const runLocalUploadedFilesScan = async () => {
   resetLocalDetectView();
   const pollingRunId = ++localDetectPollingRunId;
   pushLocalDetectLog("开始检测本地视频和B站稿件");
+  pushLocalDetectLog(
+    `主播筛选：${selectedStreamers.length > 0 ? `${selectedStreamers.length} 个` : "全部"}`,
+  );
   pushLocalDetectLog(
     `正在扫描本地视频目录并拉取B站稿件列表，页数 ${localDetectOptions.value.pages}，分P详情${
       localDetectOptions.value.useArchiveDetail
@@ -1365,6 +1248,7 @@ const runLocalUploadedFilesScan = async () => {
       useArchiveDetail: localDetectOptions.value.useArchiveDetail,
       detailIntervalMs: localDetectOptions.value.detailIntervalMs,
       minVideoSizeMb: localDetectOptions.value.minVideoSizeMb,
+      selectedStreamers,
     });
     syncLocalDetectProgress(progress);
     while (progress.status === "running" && pollingRunId === localDetectPollingRunId) {
