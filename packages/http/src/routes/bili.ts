@@ -176,6 +176,7 @@ type LocalUploadedFilesResult = {
   detectedAt?: number;
   roots: string[];
   scannedFileCount: number;
+  skippedSmallUnuploadedGroupCount?: number;
   archiveCount: number;
   remotePartCount: number;
   truncated: boolean;
@@ -239,6 +240,7 @@ type LocalDetectOptions = {
   rootPath?: string;
   useArchiveDetail: boolean;
   detailIntervalMs: number;
+  minVideoSizeMb: number;
 };
 
 type LocalDetectHistoryItem = {
@@ -291,6 +293,17 @@ const queryNumber = (value: unknown, fallback: number) => {
 const queryBoundedNumber = (value: unknown, fallback: number, min: number, max: number) => {
   const parsed = queryNumber(value, fallback);
   return Math.min(Math.max(parsed, min), max);
+};
+
+const queryBoundedNonNegativeNumber = (
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+) => {
+  const parsed = Number(getQueryValue(value));
+  const result = Number.isFinite(parsed) && parsed >= min ? parsed : fallback;
+  return Math.min(Math.max(result, min), max);
 };
 
 const queryString = (value: unknown) => {
@@ -597,14 +610,38 @@ const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
   };
 };
 
+const parseRoomDirectoryName = (dirName: string) => {
+  const match = dirName.match(/^(\d+)[-_](.+)$/);
+  if (!match) return null;
+  const username = match[2].trim();
+  if (!username) return null;
+  return {
+    roomId: match[1],
+    username,
+  };
+};
+
+const parseLocalPathRoomMetadata = (filePath: string, expectedRoomId?: string) => {
+  const candidates: Array<{ roomId: string; username: string }> = [];
+  let current = path.dirname(filePath);
+  while (current && current !== path.dirname(current)) {
+    const parsed = parseRoomDirectoryName(path.basename(current));
+    if (parsed) {
+      if (expectedRoomId && parsed.roomId === expectedRoomId) return parsed;
+      candidates.push(parsed);
+    }
+    current = path.dirname(current);
+  }
+  return candidates[0] ?? null;
+};
+
 const parseLocalMatchMetadata = (localFile: LocalVideoFile) => {
   const metadata = parseRecorderFileName(localFile.stem);
-  const parentName = path.basename(path.dirname(localFile.localPath));
-  const parentMatch = parentName.match(/^(\d+)-(.+)$/);
-  const username = parentMatch?.[2];
+  const pathMetadata = parseLocalPathRoomMetadata(localFile.localPath, metadata.roomId);
   return {
     ...metadata,
-    username: metadata.username || username,
+    roomId: metadata.roomId || pathMetadata?.roomId,
+    username: metadata.username || pathMetadata?.username,
     dateKey: formatDateKey(metadata.startTime),
   };
 };
@@ -820,6 +857,10 @@ const resolveScanRoots = async (rootPath?: string) => {
 const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressReporter) => {
   const files: LocalVideoFile[] = [];
   const errors: string[] = [];
+  let discoveredVideoCount = 0;
+  let followedLinkDirectoryCount = 0;
+  const visitedDirs = new Set<string>();
+  const visitedFiles = new Set<string>();
 
   for (const [rootIndex, root] of roots.entries()) {
     progress?.({
@@ -834,6 +875,11 @@ const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressRep
     const stack = [root];
     while (stack.length > 0 && files.length < MAX_SCAN_FILES) {
       const current = stack.pop()!;
+      const realCurrent = await fs.realpath(current).catch(() => current);
+      const currentKey = normalizeLocalPath(realCurrent);
+      if (visitedDirs.has(currentKey)) continue;
+      visitedDirs.add(currentKey);
+
       let entries: fs.Dirent[];
       try {
         entries = await fs.readdir(current, { withFileTypes: true });
@@ -844,16 +890,41 @@ const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressRep
 
       for (const entry of entries) {
         const filePath = path.join(current, entry.name);
-        if (entry.isDirectory()) {
+        let stat: any;
+        let isDirectory = entry.isDirectory();
+        let isFile = entry.isFile();
+        if (!isDirectory && !isFile) {
+          stat = await fs.stat(filePath).catch(() => null);
+          isDirectory = !!stat?.isDirectory();
+          isFile = !!stat?.isFile();
+        }
+        if (isDirectory) {
+          if (entry.isSymbolicLink()) {
+            followedLinkDirectoryCount += 1;
+            progress?.({
+              stage: "scan",
+              stageLabel: "扫描本地视频",
+              total: roots.length,
+              processed: rootIndex,
+              current: filePath,
+              message: `发现软链接目录，已加入扫描：${filePath}`,
+              log: `发现软链接目录，已加入扫描：${filePath}`,
+            });
+          }
           stack.push(filePath);
           continue;
         }
-        if (!entry.isFile()) continue;
+        if (!isFile) continue;
         const ext = path.extname(entry.name).toLowerCase();
         if (!VIDEO_EXTENSIONS.has(ext)) continue;
 
         try {
-          const stat = await fs.stat(filePath);
+          stat = stat ?? (await fs.stat(filePath));
+          discoveredVideoCount += 1;
+          const realFile = await fs.realpath(filePath).catch(() => filePath);
+          const fileKey = normalizeLocalPath(realFile);
+          if (visitedFiles.has(fileKey)) continue;
+          visitedFiles.add(fileKey);
           const fileName = path.basename(filePath);
           const stem = path.parse(fileName).name;
           files.push({
@@ -904,7 +975,13 @@ const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressRep
     });
   }
 
-  return { files, errors, truncated: files.length >= MAX_SCAN_FILES };
+  return {
+    files,
+    errors,
+    truncated: files.length >= MAX_SCAN_FILES,
+    discoveredVideoCount,
+    followedLinkDirectoryCount,
+  };
 };
 
 const collectRemoteVideoParts = async (
@@ -1310,10 +1387,11 @@ const collectRemoteVideoParts = async (
         : video?.part
           ? String(video.part)
           : undefined;
+      const effectivePartTitle = partTitle || (videos.length <= 1 ? archiveTitle : undefined);
       const values = [
         { label: "分P文件名", value: remoteFilename },
         { label: "分P文件名", value: remoteFilenameStem },
-        { label: "分P标题", value: partTitle },
+        { label: "分P标题", value: effectivePartTitle },
       ]
         .map((value) => ({
           label: value.label,
@@ -1328,7 +1406,7 @@ const collectRemoteVideoParts = async (
         cid: video?.cid ? Number(video.cid) : undefined,
         page: video?.page ? Number(video.page) : undefined,
         archiveTitle,
-        partTitle,
+        partTitle: effectivePartTitle,
         remoteFilename,
         values,
         sources: archiveItem.sources,
@@ -1369,101 +1447,55 @@ const collectRemoteVideoParts = async (
   return { parts, archiveCount: archives.size, errors, warnings, logs };
 };
 
+const normalizeOriginalTitleText = (value?: string | null) => {
+  return normalizeMatchText(trimGeneratedVideoSuffix(value))
+    .replace(/弹幕版[\da-f]*$/i, "")
+    .replace(/后处理$/i, "")
+    .replace(/合并$/i, "");
+};
+
+const buildOriginalTitleAliases = (...values: Array<string | undefined | null>) => {
+  const aliases = new Set<string>();
+  for (const value of values) {
+    const normalized = normalizeOriginalTitleText(value);
+    if (normalized) aliases.add(normalized);
+    const identityTitle = parseRecorderIdentity(value)?.title;
+    const normalizedIdentityTitle = normalizeOriginalTitleText(identityTitle);
+    if (normalizedIdentityTitle) aliases.add(normalizedIdentityTitle);
+  }
+  return Array.from(aliases);
+};
+
 const matchLocalFile = (
   localFile: LocalVideoFile,
   remotePart: RemoteVideoPart,
   hint?: LocalMatchHint,
 ) => {
-  const candidates: LocalFileMatchResult[] = [];
-  const addCandidate = (
-    score: number,
-    confidence: LocalFileMatchResult["confidence"],
-    reason: string,
-  ) => {
-    candidates.push({ score, confidence, reason });
-  };
-  const localBase = normalizePartIdentity(localFile.fileName);
-  const localStem = normalizePartIdentity(localFile.stem);
-  const localIdentities = [
-    parseRecorderIdentity(localFile.fileName),
-    parseRecorderIdentity(localFile.stem),
-  ].filter((item): item is ParsedRecorderIdentity => !!item);
-  for (const value of remotePart.values) {
-    const remoteIdentity = parseRecorderIdentity(value.raw);
-    if (
-      remoteIdentity &&
-      localIdentities.some((localIdentity) =>
-        recorderIdentitiesMatch(localIdentity, remoteIdentity, { requireTime: true }),
-      )
-    ) {
-      addCandidate(100, "high", `原始标题匹配 ${value.label}`);
-    }
-    if (localBase && localBase === value.normalized) {
-      addCandidate(98, "high", `文件名匹配 ${value.label}`);
-    }
-    if (localStem && localStem === value.normalized) {
-      addCandidate(96, "high", `文件名主干匹配 ${value.label}`);
-    }
-  }
-
-  if (localStem.length >= 8) {
-    for (const value of remotePart.values) {
-      if (value.normalized.length < 8) continue;
-      if (value.normalized.includes(localStem) || localStem.includes(value.normalized)) {
-        addCandidate(50, "medium", `疑似包含匹配 ${value.label}`);
-      }
-    }
-  }
-
-  const archiveTitle = normalizeMatchText(remotePart.archiveTitle);
   const fallbackMetadata = hint ? null : parseLocalMatchMetadata(localFile);
-  const normalizedTitle = hint?.normalizedTitle || normalizeMatchText(fallbackMetadata?.title);
-  const normalizedTitleAliases = hint?.normalizedTitleAliases?.length
-    ? hint.normalizedTitleAliases
-    : [normalizedTitle].filter(Boolean);
-  const normalizedUsername =
-    hint?.normalizedUsername || normalizeMatchText(fallbackMetadata?.username);
-  const dateKey = hint?.dateKey || fallbackMetadata?.dateKey;
-  const { titleSearchMatched, streamerSearchMatched, dualSearchMatched } = getSearchSignals(
-    remotePart.searchKeywords,
-    normalizedTitleAliases,
-    normalizedUsername,
+  const localOriginalTitles = buildOriginalTitleAliases(
+    parseRecorderIdentity(localFile.fileName)?.title,
+    parseRecorderIdentity(localFile.stem)?.title,
+    hint?.title,
+    fallbackMetadata?.title,
   );
-  const archiveHasTitle = normalizedTitleAliases.some(
-    (title) => title.length >= 6 && archiveTitle.includes(title),
+  const remotePartTitles = buildOriginalTitleAliases(
+    remotePart.partTitle,
+    !remotePart.partTitle && (!remotePart.page || remotePart.page === 1)
+      ? remotePart.archiveTitle
+      : undefined,
   );
-  const archiveHasDate = !!dateKey && archiveTitle.includes(dateKey);
-  const archiveHasUser = !!normalizedUsername && archiveTitle.includes(normalizedUsername);
   if (
-    archiveHasTitle &&
-    (titleSearchMatched || streamerSearchMatched || archiveHasDate || archiveHasUser)
+    localOriginalTitles.length > 0 &&
+    remotePartTitles.some((title) => localOriginalTitles.includes(title))
   ) {
-    const signals = [
-      dualSearchMatched ? "标题+主播搜索同时命中" : "",
-      !dualSearchMatched && titleSearchMatched ? "标题搜索命中" : "",
-      !dualSearchMatched && streamerSearchMatched ? "主播搜索命中" : "",
-      archiveHasUser ? "稿件标题含主播" : "",
-      archiveHasDate ? "稿件标题含日期" : "",
-    ].filter(Boolean);
-    const hasStrongSignal =
-      dualSearchMatched || streamerSearchMatched || archiveHasDate || archiveHasUser;
-    addCandidate(
-      dualSearchMatched ? 90 : hasStrongSignal ? 82 : 70,
-      hasStrongSignal ? "high" : "medium",
-      `稿件标题匹配（${signals.join("，")}）`,
-    );
+    return {
+      score: 100,
+      confidence: "high" as const,
+      reason: `原始标题匹配分P标题${remotePart.page ? ` P${remotePart.page}` : ""}`,
+    };
   }
 
-  if (!archiveHasTitle && dualSearchMatched && (archiveHasDate || archiveHasUser)) {
-    const signals = [
-      "标题+主播搜索同时命中",
-      archiveHasUser ? "稿件标题含主播" : "",
-      archiveHasDate ? "稿件标题含日期" : "",
-    ].filter(Boolean);
-    addCandidate(72, "medium", `搜索结果匹配（${signals.join("，")}）`);
-  }
-
-  return candidates.sort((left, right) => right.score - left.score)[0] ?? null;
+  return null;
 };
 
 const normalizeLocalPath = (filePath: string) => {
@@ -1541,6 +1573,7 @@ const parseLocalFileMetadata = async (
   danmuFiles: { danmuPath?: string; xmlDanmuPath?: string },
 ): Promise<ParsedLocalMetadata> => {
   const fromName = parseRecorderFileName(localFile.stem);
+  const fromPath = parseLocalPathRoomMetadata(localFile.localPath, fromName.roomId);
 
   try {
     const danmaFilePath = danmuFiles.xmlDanmuPath || danmuFiles.danmuPath;
@@ -1551,14 +1584,18 @@ const parseLocalFileMetadata = async (
     });
 
     return {
-      roomId: meta.roomId || fromName.roomId,
+      roomId: meta.roomId || fromName.roomId || fromPath?.roomId,
       platform: meta.platform && meta.platform !== "unknown" ? meta.platform : fromName.platform,
-      username: meta.username || fromName.username,
+      username: meta.username || fromName.username || fromPath?.username,
       title: meta.title || fromName.title,
       startTime: meta.startTimestamp ? meta.startTimestamp * 1000 : fromName.startTime,
     };
   } catch {
-    return fromName;
+    return {
+      ...fromName,
+      roomId: fromName.roomId || fromPath?.roomId,
+      username: fromName.username || fromPath?.username,
+    };
   }
 };
 
@@ -1571,7 +1608,7 @@ const buildLocalFileContexts = async (
   const matchMap = new Map(matches.map((item) => [normalizeLocalPath(item.localPath), item]));
   const streamerByRoomId = new Map<string, Streamer>();
   for (const streamer of streamerService.list()) {
-    streamerByRoomId.set(streamer.room_id, streamer);
+    streamerByRoomId.set(String(streamer.room_id), streamer);
   }
   const contexts: LocalFileContext[] = [];
 
@@ -1729,8 +1766,9 @@ const buildUnuploadedGroups = async (
   localFiles: LocalVideoFile[],
   matches: LocalUploadedFileMatch[],
   remoteParts: RemoteVideoPart[],
+  options: { minTotalSizeBytes?: number } = {},
   progress?: LocalDetectProgressReporter,
-): Promise<LocalUnuploadedGroup[]> => {
+): Promise<{ groups: LocalUnuploadedGroup[]; skippedSmallGroupCount: number }> => {
   const contexts = await buildLocalFileContexts(localFiles, matches, progress);
   const grouped = new Map<string, LocalFileContext[]>();
   for (const context of contexts) {
@@ -1740,6 +1778,8 @@ const buildUnuploadedGroups = async (
   }
 
   const groups: LocalUnuploadedGroup[] = [];
+  const minTotalSizeBytes = Math.max(0, options.minTotalSizeBytes ?? 0);
+  let skippedSmallGroupCount = 0;
   for (const [groupKey, groupContexts] of grouped) {
     const unuploaded = groupContexts
       .filter((item) => !item.match)
@@ -1772,6 +1812,10 @@ const buildUnuploadedGroups = async (
     const suggestedAid = suggestedAction === "append" ? matchedAids[0] : undefined;
     const matchedArchive = suggestedAid ? aidMap.get(suggestedAid) : undefined;
     const totalSize = unuploaded.reduce((sum, item) => sum + item.localFile.size, 0);
+    if (minTotalSizeBytes > 0 && totalSize < minTotalSizeBytes) {
+      skippedSmallGroupCount += 1;
+      continue;
+    }
     const danmuCount = unuploaded.filter((item) => item.danmuPath).length;
     const mergeCandidate =
       unuploaded.length > 1 &&
@@ -1825,11 +1869,14 @@ const buildUnuploadedGroups = async (
     total: localFiles.length,
     processed: localFiles.length,
     current: "未上传分组完成",
-    message: `未上传分组识别完成：${groups.length} 组`,
-    log: `未上传分组识别完成：${groups.length} 组`,
+    message: `未上传分组识别完成：${groups.length} 组，大小过滤 ${skippedSmallGroupCount} 组`,
+    log: `未上传分组识别完成：${groups.length} 组，大小过滤 ${skippedSmallGroupCount} 组`,
   });
 
-  return groups.sort((left, right) => right.startTime - left.startTime);
+  return {
+    groups: groups.sort((left, right) => right.startTime - left.startTime),
+    skippedSmallGroupCount,
+  };
 };
 
 const runLocalUploadedFilesDetection = async (
@@ -1850,7 +1897,7 @@ const runLocalUploadedFilesDetection = async (
   pushLog(
     `检测参数：稿件列表 ${options.pages} 页，每页 ${options.pageSize} 条，分P详情${
       options.useArchiveDetail ? `开启，间隔 ${options.detailIntervalMs}ms` : "关闭"
-    }`,
+    }，未上传分组合计最小大小 ${options.minVideoSizeMb || 0} MB`,
     {
       stage: "prepare",
       stageLabel: "准备检测",
@@ -1869,13 +1916,25 @@ const runLocalUploadedFilesDetection = async (
     current: rootResult.roots.join("；") || "未找到可扫描目录",
   });
   const scanResult = await scanVideoFiles(rootResult.roots, progress);
-  pushLog(`本地视频扫描完成：${scanResult.files.length} 个视频文件`, {
-    stage: "scan",
-    stageLabel: "扫描本地视频",
-    total: rootResult.roots.length,
-    processed: rootResult.roots.length,
-    current: "本地扫描完成",
-  });
+  pushLog(
+    `本地视频扫描完成：发现 ${scanResult.discoveredVideoCount} 个视频文件，进入匹配 ${scanResult.files.length} 个`,
+    {
+      stage: "scan",
+      stageLabel: "扫描本地视频",
+      total: rootResult.roots.length,
+      processed: rootResult.roots.length,
+      current: "本地扫描完成",
+    },
+  );
+  if (scanResult.followedLinkDirectoryCount > 0) {
+    pushLog(`软链接目录扫描：已跟随 ${scanResult.followedLinkDirectoryCount} 个目录链接`, {
+      stage: "scan",
+      stageLabel: "扫描本地视频",
+      total: rootResult.roots.length,
+      processed: rootResult.roots.length,
+      current: "软链接目录",
+    });
+  }
 
   const searchKeywords = buildArchiveSearchKeywords(scanResult.files);
   pushLog(`搜索关键词生成完成：${searchKeywords.length} 个，将按本地标题和主播名搜索投稿中心`, {
@@ -1969,17 +2028,19 @@ const runLocalUploadedFilesDetection = async (
     current: "本地视频比对完成",
   });
 
-  const unuploadedGroups = await buildUnuploadedGroups(
+  const unuploadedResult = await buildUnuploadedGroups(
     scanResult.files,
     matches,
     remoteResult.parts,
+    { minTotalSizeBytes: Math.max(0, options.minVideoSizeMb || 0) * 1024 * 1024 },
     progress,
   );
+  const unuploadedGroups = unuploadedResult.groups;
   const resultLogs = [
     ...logs,
     ...remoteResult.logs,
     `B站稿件读取完成：${remoteResult.archiveCount} 个稿件，${remoteResult.parts.length} 个可匹配项`,
-    `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+    `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组，大小过滤 ${unuploadedResult.skippedSmallGroupCount} 组`,
   ];
   if (scanResult.truncated) {
     resultLogs.push(`本地视频数量达到扫描上限 ${MAX_SCAN_FILES}，结果可能不完整`);
@@ -1998,6 +2059,7 @@ const runLocalUploadedFilesDetection = async (
   const result: LocalUploadedFilesResult = {
     roots: rootResult.roots,
     scannedFileCount: scanResult.files.length,
+    skippedSmallUnuploadedGroupCount: unuploadedResult.skippedSmallGroupCount,
     archiveCount: remoteResult.archiveCount,
     remotePartCount: remoteResult.parts.length,
     truncated: scanResult.truncated,
@@ -2096,18 +2158,20 @@ router.get("/localUploadedFiles", async (ctx) => {
   const pageSize = queryBoundedNumber(query.pageSize, 20, 1, 50);
   const rootPath = queryString(query.rootPath);
   const useArchiveDetail = queryBoolean(query.useArchiveDetail, true);
-  const detailIntervalMs = queryBoundedNumber(
+  const detailIntervalMs = queryBoundedNonNegativeNumber(
     query.detailIntervalMs,
     DEFAULT_DETAIL_INTERVAL_MS,
     0,
     10000,
   );
+  const minVideoSizeMb = queryBoundedNonNegativeNumber(query.minVideoSizeMb, 0, 0, 1024 * 10);
   ctx.body = await runLocalUploadedFilesDetection(uid, {
     pages,
     pageSize,
     rootPath,
     useArchiveDetail,
     detailIntervalMs,
+    minVideoSizeMb,
   });
 });
 
@@ -2179,6 +2243,7 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
     pageSize?: number;
     useArchiveDetail?: boolean;
     detailIntervalMs?: number;
+    minVideoSizeMb?: number;
   };
   const uid = queryNumber(body.uid, 0);
   if (!uid) {
@@ -2195,12 +2260,13 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
   const rootPath = queryString(body.rootPath);
   const useArchiveDetail =
     typeof body.useArchiveDetail === "boolean" ? body.useArchiveDetail : true;
-  const detailIntervalMs = queryBoundedNumber(
+  const detailIntervalMs = queryBoundedNonNegativeNumber(
     body.detailIntervalMs,
     DEFAULT_DETAIL_INTERVAL_MS,
     0,
     10000,
   );
+  const minVideoSizeMb = queryBoundedNonNegativeNumber(body.minVideoSizeMb, 0, 0, 1024 * 10);
 
   void runLocalUploadedFilesDetection(
     uid,
@@ -2210,6 +2276,7 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
       rootPath,
       useArchiveDetail,
       detailIntervalMs,
+      minVideoSizeMb,
     },
     (patch) => touchLocalDetectProgress(job, patch),
   )

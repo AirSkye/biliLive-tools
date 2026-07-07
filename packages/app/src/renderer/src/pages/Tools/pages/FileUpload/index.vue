@@ -36,6 +36,16 @@
           :precision="0"
           style="width: 110px"
         />
+        <span>未上传最小(MB)</span>
+        <n-input-number
+          v-model:value="localDetectOptions.minVideoSizeMb"
+          size="small"
+          :min="0"
+          :max="10240"
+          :step="10"
+          :precision="0"
+          style="width: 118px"
+        />
       </div>
       <n-checkbox v-model:checked="options.removeOriginAfterUploadCheck">
         审核通过后移除源文件
@@ -100,6 +110,9 @@
       </div>
       <div v-if="localUploadedFilesResult" class="detect-summary">
         <span>扫描文件：{{ localUploadedFilesResult.scannedFileCount }}</span>
+        <span v-if="localUploadedFilesResult.skippedSmallUnuploadedGroupCount">
+          未上传过滤：{{ localUploadedFilesResult.skippedSmallUnuploadedGroupCount }}
+        </span>
         <span>稿件：{{ localUploadedFilesResult.archiveCount }}</span>
         <span>分P：{{ localUploadedFilesResult.remotePartCount }}</span>
         <span>匹配：{{ localUploadedFilesResult.matches.length }}</span>
@@ -428,6 +441,7 @@ const localDetectOptions = useLocalStorage("file-upload-local-detect-options", {
   pages: 3,
   useArchiveDetail: true,
   detailIntervalMs: 1500,
+  minVideoSizeMb: 0,
 });
 const localDetectHistoryOptions = computed(() =>
   localDetectHistoryItems.value.map((item) => ({
@@ -459,7 +473,13 @@ const localUnuploadedRows = computed(() => {
   const keyword = localUnuploadedSearchKeyword.value.trim().toLowerCase();
   const rows = [...(localUploadedFilesResult.value?.unuploadedGroups ?? [])].filter((row) => {
     if (!keyword) return true;
-    return [row.title, row.username, row.roomId, ...row.files.map((file) => file.fileName)]
+    return [
+      row.title,
+      row.username,
+      row.roomId,
+      row.archiveTitle,
+      ...row.files.map((file) => file.fileName),
+    ]
       .filter(Boolean)
       .some((value) => String(value).toLowerCase().includes(keyword));
   });
@@ -833,9 +853,15 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   {
     title: "建议",
     key: "suggestedAction",
-    width: 150,
+    minWidth: 220,
     render: (row) => {
-      if (row.suggestedAction === "append") return `续传 AV${row.suggestedAid}`;
+      if (row.suggestedAction === "append") {
+        return h(
+          "span",
+          { title: row.archiveTitle || `AV${row.suggestedAid}` },
+          `续传 AV${row.suggestedAid}${row.archiveTitle ? `：${row.archiveTitle}` : ""}`,
+        );
+      }
       if (row.suggestedAction === "ambiguous") return "需确认稿件";
       return "新建稿件";
     },
@@ -998,13 +1024,14 @@ const runLocalUploadedFilesScan = async () => {
       localDetectOptions.value.useArchiveDetail
         ? `开启，间隔 ${localDetectOptions.value.detailIntervalMs}ms`
         : "关闭"
-    }...`,
+    }，未上传分组合计最小大小 ${localDetectOptions.value.minVideoSizeMb || 0} MB...`,
   );
   try {
     let progress = await biliApi.startLocalUploadedFilesDetection(userInfo.value.uid!, {
       pages: localDetectOptions.value.pages,
       useArchiveDetail: localDetectOptions.value.useArchiveDetail,
       detailIntervalMs: localDetectOptions.value.detailIntervalMs,
+      minVideoSizeMb: localDetectOptions.value.minVideoSizeMb,
     });
     syncLocalDetectProgress(progress);
     while (progress.status === "running" && pollingRunId === localDetectPollingRunId) {

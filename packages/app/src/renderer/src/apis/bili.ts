@@ -86,6 +86,7 @@ export type LocalUploadedFilesResult = {
   detectedAt?: number;
   roots: string[];
   scannedFileCount: number;
+  skippedSmallUnuploadedGroupCount?: number;
   archiveCount: number;
   remotePartCount: number;
   truncated: boolean;
@@ -106,6 +107,7 @@ export type LocalUploadedFilesHistorySummary = {
     rootPath?: string;
     useArchiveDetail: boolean;
     detailIntervalMs: number;
+    minVideoSizeMb?: number;
   };
   scannedFileCount: number;
   archiveCount: number;
@@ -203,6 +205,7 @@ const detectLocalUploadedFiles = async (
     pageSize?: number;
     useArchiveDetail?: boolean;
     detailIntervalMs?: number;
+    minVideoSizeMb?: number;
   } = {},
 ): Promise<LocalUploadedFilesResult> => {
   const res = await request.get("/bili/localUploadedFiles", {
@@ -267,6 +270,7 @@ const startLocalUploadedFilesDetection = async (
     pageSize?: number;
     useArchiveDetail?: boolean;
     detailIntervalMs?: number;
+    minVideoSizeMb?: number;
   } = {},
 ): Promise<LocalUploadedFilesDetectionProgress> => {
   const res = await request.post("/bili/localUploadedFiles/detect", {
