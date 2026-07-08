@@ -133,6 +133,8 @@ type LocalUploadStreamerOption = {
   platform: string;
   name: string;
   hasWebhookUploadConfig: boolean;
+  localSizeBytes: number;
+  localFolderCount: number;
 };
 
 type SelectedLocalStreamer = {
@@ -2067,18 +2069,24 @@ const addLocalUploadStreamerOption = (
     roomId: string | number;
     platform?: string | null;
     name?: string | null;
+    localSizeBytes?: number;
+    localFolderCount?: number;
   },
 ) => {
   const key = getStreamerFilterKey(item.roomId, item.platform);
   if (!key) return;
   const roomId = String(item.roomId);
   const name = String(item.name || "").trim() || roomId;
+  const localSizeBytes = Math.max(0, item.localSizeBytes ?? 0);
+  const localFolderCount = Math.max(0, item.localFolderCount ?? 0);
   const existing = map.get(key);
   if (existing) {
     if ((!existing.name || existing.name === existing.roomId) && name !== roomId) {
       existing.name = name;
     }
     existing.hasWebhookUploadConfig ||= hasWebhookUploadConfig(roomId);
+    existing.localSizeBytes += localSizeBytes;
+    existing.localFolderCount += localFolderCount;
     return;
   }
   map.set(key, {
@@ -2087,25 +2095,58 @@ const addLocalUploadStreamerOption = (
     platform: normalizeStreamerPlatform(item.platform),
     name,
     hasWebhookUploadConfig: hasWebhookUploadConfig(roomId),
+    localSizeBytes,
+    localFolderCount,
   });
 };
 
 const scanStreamerDirsFromRoots = async (roots: string[]) => {
-  const streamers: Array<{ roomId: string; username: string }> = [];
+  type DirectoryStreamer = {
+    roomId: string;
+    username: string;
+    localSizeBytes: number;
+    localFolderCount: number;
+  };
+  const streamers = new Map<string, DirectoryStreamer>();
   const visitedDirs = new Set<string>();
-  const maxDepth = 4;
-  const maxDirs = 8000;
+  const countedStreamerDirs = new Set<string>();
+  const maxDepth = 8;
+  const maxDirs = 12000;
   let visitedCount = 0;
 
   for (const root of roots) {
-    const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+    const stack: Array<{
+      dir: string;
+      depth: number;
+      streamer?: { roomId: string; username: string };
+    }> = [{ dir: root, depth: 0 }];
     while (stack.length > 0 && visitedCount < maxDirs) {
-      const { dir, depth } = stack.pop()!;
+      const { dir, depth, streamer } = stack.pop()!;
       const realDir = await fs.realpath(dir).catch(() => dir);
-      const key = normalizeLocalPath(realDir);
-      if (visitedDirs.has(key)) continue;
-      visitedDirs.add(key);
+      const dirKey = normalizeLocalPath(realDir);
+      if (visitedDirs.has(dirKey)) continue;
+      visitedDirs.add(dirKey);
       visitedCount += 1;
+
+      const ownStreamer = parseRoomDirectoryName(path.basename(dir));
+      const currentStreamer = ownStreamer ?? streamer;
+      if (ownStreamer && !countedStreamerDirs.has(dirKey)) {
+        countedStreamerDirs.add(dirKey);
+        const key = getStreamerFilterKey(ownStreamer.roomId, "bilibili") ?? ownStreamer.roomId;
+        const current = streamers.get(key);
+        if (current) {
+          if (!current.username || current.username === current.roomId) {
+            current.username = ownStreamer.username;
+          }
+          current.localFolderCount += 1;
+        } else {
+          streamers.set(key, {
+            ...ownStreamer,
+            localSizeBytes: 0,
+            localFolderCount: 1,
+          });
+        }
+      }
 
       let entries: fs.Dirent[];
       try {
@@ -2121,20 +2162,35 @@ const scanStreamerDirsFromRoots = async (roots: string[]) => {
           const stat = await fs.stat(fullPath).catch(() => null);
           isDirectory = !!stat?.isDirectory();
         }
-        if (!isDirectory) continue;
-
-        const parsed = parseRoomDirectoryName(entry.name);
-        if (parsed) {
-          streamers.push(parsed);
+        if (isDirectory) {
+          if (depth < maxDepth) {
+            stack.push({ dir: fullPath, depth: depth + 1, streamer: currentStreamer });
+          }
+          continue;
         }
-        if (depth < maxDepth) {
-          stack.push({ dir: fullPath, depth: depth + 1 });
+
+        if (currentStreamer) {
+          const stat = await fs.stat(fullPath).catch(() => null);
+          if (stat?.isFile()) {
+            const key =
+              getStreamerFilterKey(currentStreamer.roomId, "bilibili") ?? currentStreamer.roomId;
+            const current = streamers.get(key);
+            if (current) {
+              current.localSizeBytes += stat.size;
+            } else {
+              streamers.set(key, {
+                ...currentStreamer,
+                localSizeBytes: stat.size,
+                localFolderCount: 0,
+              });
+            }
+          }
         }
       }
     }
   }
 
-  return streamers;
+  return Array.from(streamers.values());
 };
 
 const listLocalUploadStreamers = async (): Promise<LocalUploadStreamerOption[]> => {
@@ -2154,10 +2210,14 @@ const listLocalUploadStreamers = async (): Promise<LocalUploadStreamerOption[]> 
       roomId: streamer.roomId,
       platform: "bilibili",
       name: streamer.username,
+      localSizeBytes: streamer.localSizeBytes,
+      localFolderCount: streamer.localFolderCount,
     });
   }
 
   return Array.from(map.values()).sort((left, right) => {
+    const sizeCompare = right.localSizeBytes - left.localSizeBytes;
+    if (sizeCompare !== 0) return sizeCompare;
     const nameCompare = left.name.localeCompare(right.name, "zh-Hans-CN");
     if (nameCompare !== 0) return nameCompare;
     return left.roomId.localeCompare(right.roomId);

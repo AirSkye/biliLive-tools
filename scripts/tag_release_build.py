@@ -7,6 +7,8 @@ Examples:
   py scripts/tag_release_build.py -m "fix: local detection"
   py scripts/tag_release_build.py -m "fix: quick build" --skip-verify
   py scripts/tag_release_build.py --no-commit --tag codex-build-test
+  py scripts/tag_release_build.py --resume-tag codex-build-20260708-151714
+  py scripts/tag_release_build.py --resume-latest-tag
 
 Notes:
   - This script triggers the existing release workflow by pushing a tag.
@@ -349,11 +351,63 @@ class ReleaseBuild:
         self.run_cmd(command, env=self.ssh_git_env())
         self.log(f"tag 已推送：{self.tag_name}", "OK")
 
+    def resolve_latest_tag_name(self) -> str:
+        pattern = f"{self.args.tag_prefix}-*"
+        tags: set[str] = set()
+
+        remote_tags = self.run_cmd(
+            ["git", "ls-remote", "--tags", self.args.remote, pattern],
+            allow_failure=True,
+        )
+        if remote_tags.returncode == 0:
+            for line in remote_tags.stdout.splitlines():
+                match = re.search(r"refs/tags/([^\^{}]+)$", line.strip())
+                if match:
+                    tags.add(match.group(1))
+
+        local_tags = self.run_cmd(["git", "tag", "--list", pattern], allow_failure=True)
+        if local_tags.returncode == 0:
+            for line in local_tags.stdout.splitlines():
+                tag = line.strip()
+                if tag:
+                    tags.add(tag)
+
+        if not tags:
+            raise RuntimeError(f"没有找到匹配的 tag：{pattern}")
+
+        tag = sorted(tags)[-1]
+        self.log(f"最新 tag：{tag}", "OK")
+        return tag
+
+    def resolve_resume_tag(self) -> str:
+        if self.args.resume_tag:
+            return self.args.resume_tag.strip()
+        if self.args.resume_latest_tag:
+            return self.resolve_latest_tag_name()
+        return ""
+
+    def resolve_tag_head_sha(self, tag: str) -> str:
+        local = self.run_cmd(["git", "rev-list", "-n", "1", tag], allow_failure=True)
+        if local.returncode == 0 and local.stdout.strip():
+            return local.stdout.strip()
+
+        remote = self.run_cmd(
+            ["git", "ls-remote", "--tags", self.args.remote, f"refs/tags/{tag}"],
+            allow_failure=True,
+        )
+        if remote.returncode == 0:
+            for line in remote.stdout.splitlines():
+                sha = line.split(maxsplit=1)[0].strip()
+                if sha:
+                    return sha
+
+        raise RuntimeError(f"无法解析 tag 对应提交：{tag}")
+
     @staticmethod
     def parse_github_time(value: str) -> datetime:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
-    def wait_for_run(self, run_after: datetime) -> dict[str, Any]:
+    def wait_for_run(self, run_after: datetime | None) -> dict[str, Any]:
         deadline = time.time() + self.args.timeout_minutes * 60
         encoded_workflow = urllib.parse.quote(self.args.workflow, safe="")
         encoded_tag = urllib.parse.quote(self.tag_name, safe="")
@@ -363,13 +417,16 @@ class ReleaseBuild:
             )
             for run in runs.get("workflow_runs", []):
                 created_at = self.parse_github_time(run.get("created_at", "1970-01-01T00:00:00Z"))
-                if run.get("head_sha") == self.head_sha and created_at >= run_after:
-                    self.run_id = int(run["id"])
-                    self.log(
-                        f"找到 Action Run：id={run['id']} status={run.get('status')} url={run.get('html_url')}",
-                        "OK",
-                    )
-                    return run
+                if self.head_sha and run.get("head_sha") != self.head_sha:
+                    continue
+                if run_after and created_at < run_after:
+                    continue
+                self.run_id = int(run["id"])
+                self.log(
+                    f"找到 Action Run：id={run['id']} status={run.get('status')} url={run.get('html_url')}",
+                    "OK",
+                )
+                return run
 
             self.log("等待 GitHub Actions 创建 tag push run...", "INFO")
             time.sleep(self.args.poll_seconds)
@@ -446,6 +503,37 @@ class ReleaseBuild:
 
         raise RuntimeError("超时：Release 中没有等到 Windows 下载产物")
 
+    def log_download_result(
+        self,
+        windows_assets: list[dict[str, Any]],
+        completed: dict[str, Any] | None = None,
+    ) -> None:
+        self.log("Windows 下载链接：", "OK")
+        for asset in windows_assets:
+            self.log(asset["browser_download_url"], "OK")
+        if completed:
+            self.log(f"Action：{completed.get('html_url')}", "OK")
+        self.log(f"Release：https://github.com/{self.repo_slug}/releases/tag/{self.tag_name}", "OK")
+
+    def resume_existing_tag(self, tag_name: str) -> None:
+        self.tag_name = tag_name
+        self.head_sha = self.resolve_tag_head_sha(self.tag_name)
+        self.log(f"续查已有 tag：{self.tag_name}", "INFO")
+        self.log(f"tag HEAD：{self.head_sha}", "INFO")
+        self.log("续查模式不会提交、推送分支、创建 tag，也不会重新触发 Action", "OK")
+
+        if self.args.no_wait:
+            self.log("传入 --no-wait，不等待 Action/Release", "WARN")
+            self.log(f"Action 页面：https://github.com/{self.repo_slug}/actions/workflows/{self.args.workflow}", "OK")
+            self.log(f"Release：https://github.com/{self.repo_slug}/releases/tag/{self.tag_name}", "OK")
+            return
+
+        run = self.wait_for_run(None)
+        completed = self.wait_for_run_success(run)
+        windows_assets = self.wait_for_release_assets()
+        self.log_download_result(windows_assets, completed)
+        self.log("续查完成", "OK")
+
     def run_all(self) -> None:
         os.chdir(self.repo_root)
         self.log(f"日志文件：{self.log_file}", "INFO")
@@ -458,6 +546,11 @@ class ReleaseBuild:
         self.log(f"目标分支：{self.branch}", "INFO")
         self.log(f"目标 workflow：{self.args.workflow}", "INFO")
         self.log("GitHub API token：已配置" if self.github_token else "GitHub API token：未配置，使用公开 API", "INFO")
+
+        resume_tag = self.resolve_resume_tag()
+        if resume_tag:
+            self.resume_existing_tag(resume_tag)
+            return
 
         self.verify()
         self.commit_if_needed()
@@ -481,12 +574,7 @@ class ReleaseBuild:
         run = self.wait_for_run(run_after)
         completed = self.wait_for_run_success(run)
         windows_assets = self.wait_for_release_assets()
-
-        self.log("Windows 下载链接：", "OK")
-        for asset in windows_assets:
-            self.log(asset["browser_download_url"], "OK")
-        self.log(f"Action：{completed.get('html_url')}", "OK")
-        self.log(f"Release：https://github.com/{self.repo_slug}/releases/tag/{self.tag_name}", "OK")
+        self.log_download_result(windows_assets, completed)
         self.log("流程完成", "OK")
 
 
@@ -504,6 +592,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--token", default="", help="Optional GitHub API token. Prefer env vars.")
     parser.add_argument("--tag", default="", help="Explicit tag name. Defaults to <tag-prefix>-yyyyMMdd-HHmmss.")
     parser.add_argument("--tag-prefix", default="codex-build", help="Tag prefix when --tag is omitted.")
+    parser.add_argument("--resume-tag", default="", help="Only wait an existing tag's Action/Release; no commit or push.")
+    parser.add_argument(
+        "--resume-latest-tag",
+        action="store_true",
+        help="Only wait the latest <tag-prefix>-* tag's Action/Release; no commit or push.",
+    )
     parser.add_argument("--force-tag", action="store_true", help="Delete/recreate local tag and force-push tag.")
     parser.add_argument("--skip-verify", action="store_true", help="Skip local git diff, tsc, and vitest checks.")
     parser.add_argument("--no-commit", action="store_true", help="Do not commit local changes.")

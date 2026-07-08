@@ -592,10 +592,28 @@ const selectedLocalDetectStreamerKeys = useLocalStorage<string[]>(
   [],
 );
 const localUploadStreamerSelectOptions = computed(() =>
-  localUploadStreamers.value.map((item) => ({
-    label: `${item.name || "未知"} (${item.roomId})`,
-    value: item.key,
-  })),
+  [...localUploadStreamers.value]
+    .sort((left, right) => {
+      const sizeCompare = (right.localSizeBytes ?? 0) - (left.localSizeBytes ?? 0);
+      if (sizeCompare !== 0) return sizeCompare;
+      const nameCompare = (left.name || "").localeCompare(right.name || "", "zh-Hans-CN");
+      if (nameCompare !== 0) return nameCompare;
+      return left.roomId.localeCompare(right.roomId);
+    })
+    .map((item) => {
+      const folderText =
+        item.localFolderCount > 1
+          ? ` · ${item.localFolderCount} 个目录`
+          : item.localFolderCount === 0
+            ? " · 未找到目录"
+            : "";
+      return {
+        label: `${item.name || "未知"} (${item.roomId}) · ${formatFileSize(
+          item.localSizeBytes ?? 0,
+        )}${folderText}`,
+        value: item.key,
+      };
+    }),
 );
 const localUploadStreamerByKey = computed(() => {
   const map = new Map<string, LocalUploadStreamerOption>();
@@ -880,13 +898,13 @@ onBeforeUnmount(() => {
   localDetectPollingRunId += 1;
 });
 
-const formatFileSize = (size: number) => {
+function formatFileSize(size: number) {
   if (!Number.isFinite(size) || size <= 0) return "0 B";
   if (size >= 1024 * 1024 * 1024) return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
   if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
   if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
   return `${Math.round(size)} B`;
-};
+}
 
 const formatShortReason = (reason?: string) => {
   const text = String(reason || "")

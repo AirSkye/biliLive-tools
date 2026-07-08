@@ -125,6 +125,8 @@ export type LocalUploadStreamerOption = {
   platform: string;
   name: string;
   hasWebhookUploadConfig: boolean;
+  localSizeBytes: number;
+  localFolderCount: number;
 };
 
 export type LocalUploadedFilesHistorySummary = {
