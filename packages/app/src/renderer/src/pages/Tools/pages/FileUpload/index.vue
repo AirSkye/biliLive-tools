@@ -1,99 +1,101 @@
 <!-- 上传文件 -->
 <template>
   <div>
-    <div class="flex justify-center align-center" style="margin-bottom: 20px; gap: 10px">
-      <span v-if="fileList.length !== 0" style="cursor: pointer; color: #958e8e" @click="clear"
-        >清空</span
-      >
-      <n-button @click="addVideo"> 添加 </n-button>
-      <n-button type="primary" @click="upload" title="立即上传(ctrl+enter)"> 立即上传 </n-button>
-      <n-button type="primary" @click="appendVideoVisible = true"> 续传 </n-button>
-      <n-button
-        :loading="detectingLocalUploadedFiles || loadingLocalDetectHistory"
-        @click="openLocalUploadedFilesPanel"
-      >
-        打开检测结果
-      </n-button>
-      <div class="local-detect-controls">
-        <span>页数</span>
-        <n-input-number
-          v-model:value="localDetectOptions.pages"
-          size="small"
-          :min="1"
-          :max="10"
-          :precision="0"
-          style="width: 82px"
-        />
-        <n-checkbox v-model:checked="localDetectOptions.useArchiveDetail">分P详情</n-checkbox>
-        <span v-if="localDetectOptions.useArchiveDetail">间隔</span>
-        <n-input-number
-          v-if="localDetectOptions.useArchiveDetail"
-          v-model:value="localDetectOptions.detailIntervalMs"
-          size="small"
-          :min="0"
-          :max="10000"
-          :step="500"
-          :precision="0"
-          style="width: 110px"
-        />
-        <span>未上传最小(MB)</span>
-        <n-input-number
-          v-model:value="localDetectOptions.minVideoSizeMb"
-          size="small"
-          :min="0"
-          :max="10240"
-          :step="10"
-          :precision="0"
-          style="width: 118px"
-        />
-        <n-select
-          v-model:value="selectedLocalDetectStreamerKeys"
-          multiple
-          filterable
-          clearable
-          :loading="loadingLocalUploadStreamers"
-          :options="localUploadStreamerSelectOptions"
-          placeholder="按主播筛选扫描结果"
-          style="min-width: 260px"
-        />
+    <template v-if="!localAuditOnly">
+      <div class="flex justify-center align-center" style="margin-bottom: 20px; gap: 10px">
+        <span v-if="fileList.length !== 0" style="cursor: pointer; color: #958e8e" @click="clear"
+          >清空</span
+        >
+        <n-button @click="addVideo"> 添加 </n-button>
+        <n-button type="primary" @click="upload" title="立即上传(ctrl+enter)"> 立即上传 </n-button>
+        <n-button type="primary" @click="appendVideoVisible = true"> 续传 </n-button>
+        <n-checkbox v-model:checked="options.removeOriginAfterUploadCheck">
+          审核通过后移除源文件
+        </n-checkbox>
       </div>
-      <n-checkbox v-model:checked="options.removeOriginAfterUploadCheck">
-        审核通过后移除源文件
-      </n-checkbox>
-    </div>
-    <FileSelect
-      ref="fileSelect"
-      v-model="fileList"
-      @change="fileChange"
-      inputPlaceholder="输入内容将会被用为分P标题"
-    ></FileSelect>
+      <FileSelect
+        ref="fileSelect"
+        v-model="fileList"
+        @change="fileChange"
+        inputPlaceholder="输入内容将会被用为分P标题"
+      ></FileSelect>
 
-    <n-divider />
-    <div class="" style="margin-top: 30px">
-      <BiliSetting
-        ref="biliSettingRef"
-        v-model="options.uploadPresetId"
-        @change="handlePresetOptions"
-      ></BiliSetting>
-    </div>
+      <n-divider />
+      <div class="" style="margin-top: 30px">
+        <BiliSetting
+          ref="biliSettingRef"
+          v-model="options.uploadPresetId"
+          @change="handlePresetOptions"
+        ></BiliSetting>
+      </div>
 
-    <AppendVideoDialog
-      v-model:visible="appendVideoVisible"
-      v-model="aid"
-      @confirm="appendVideo"
-    ></AppendVideoDialog>
+      <AppendVideoDialog
+        v-model:visible="appendVideoVisible"
+        v-model="aid"
+        @confirm="appendVideo"
+      ></AppendVideoDialog>
+    </template>
 
-    <n-modal
+    <component
+      :is="localAuditContainer"
+      v-if="localAuditOnly || localUploadedFilesVisible"
       v-model:show="localUploadedFilesVisible"
       preset="card"
       title="已上传未删除检测"
-      style="width: min(1100px, 92vw)"
+      :style="localAuditOnly ? undefined : 'width: min(1100px, 92vw)'"
+      :class="{ 'local-audit-panel': localAuditOnly }"
       :bordered="false"
       :mask="false"
       :trap-focus="false"
       :auto-focus="false"
     >
+      <div v-if="localAuditOnly" class="local-audit-header">
+        <h2>本地录播检测</h2>
+      </div>
       <div class="local-history-toolbar">
+        <div class="local-detect-controls">
+          <span>页数</span>
+          <n-input-number
+            v-model:value="localDetectOptions.pages"
+            size="small"
+            :min="1"
+            :max="10"
+            :precision="0"
+            style="width: 82px"
+          />
+          <n-checkbox v-model:checked="localDetectOptions.useArchiveDetail">分P详情</n-checkbox>
+          <span v-if="localDetectOptions.useArchiveDetail">间隔</span>
+          <n-input-number
+            v-if="localDetectOptions.useArchiveDetail"
+            v-model:value="localDetectOptions.detailIntervalMs"
+            size="small"
+            :min="0"
+            :max="10000"
+            :step="500"
+            :precision="0"
+            style="width: 110px"
+          />
+          <span>未上传最小合计(MB)</span>
+          <n-input-number
+            v-model:value="localDetectOptions.minVideoSizeMb"
+            size="small"
+            :min="0"
+            :max="10240"
+            :step="10"
+            :precision="0"
+            style="width: 118px"
+          />
+          <n-select
+            v-model:value="selectedLocalDetectStreamerKeys"
+            multiple
+            filterable
+            clearable
+            :loading="loadingLocalUploadStreamers"
+            :options="localUploadStreamerSelectOptions"
+            placeholder="选择主播后只扫描这些主播"
+            style="min-width: 260px"
+          />
+        </div>
         <n-select
           v-model:value="selectedLocalDetectHistoryId"
           :options="localDetectHistoryOptions"
@@ -356,7 +358,7 @@
           />
         </n-tab-pane>
       </n-tabs>
-    </n-modal>
+    </component>
     <n-modal
       v-model:show="localMergeDialogVisible"
       preset="card"
@@ -399,7 +401,7 @@
 
 <script setup lang="ts">
 import { toReactive, useLocalStorage } from "@vueuse/core";
-import { NButton, useNotification } from "naive-ui";
+import { NButton, NModal, useNotification } from "naive-ui";
 import type { DataTableColumns, DataTableRowKey } from "naive-ui";
 
 import FileSelect from "@renderer/pages/Tools/pages/FileUpload/components/FileSelect.vue";
@@ -427,6 +429,17 @@ import type {
 defineOptions({
   name: "Upload",
 });
+
+const props = withDefaults(
+  defineProps<{
+    localAuditOnly?: boolean;
+  }>(),
+  {
+    localAuditOnly: false,
+  },
+);
+const localAuditOnly = computed(() => props.localAuditOnly);
+const localAuditContainer = computed(() => (localAuditOnly.value ? "div" : NModal));
 
 const { userInfo } = storeToRefs(useUserInfoStore());
 const { handlePresetOptions, presetOptions } = useBili();
@@ -457,6 +470,7 @@ const fileList = ref<
 
 onActivated(() => {
   hotkeys("ctrl+enter", function () {
+    if (localAuditOnly.value) return;
     upload();
   });
 });
@@ -556,7 +570,7 @@ const clear = () => {
   fileList.value = [];
 };
 
-const localUploadedFilesVisible = ref(false);
+const localUploadedFilesVisible = ref(localAuditOnly.value);
 const detectingLocalUploadedFiles = ref(false);
 const loadingLocalDetectHistory = ref(false);
 const localUploadedFilesResult = ref<LocalUploadedFilesResult | null>(null);
@@ -791,7 +805,11 @@ const loadLocalDetectHistoryById = async (id: string) => {
 const refreshLocalDetectHistory = async () => {
   loadingLocalDetectHistory.value = true;
   try {
-    await Promise.all([loadLocalDetectHistoryList(), loadLocalDeletionHistory()]);
+    await Promise.all([
+      loadLocalDetectHistoryList(),
+      loadLocalDeletionHistory(),
+      loadLocalUploadStreamers(),
+    ]);
   } finally {
     loadingLocalDetectHistory.value = false;
   }
@@ -808,6 +826,10 @@ const loadSelectedLocalDetectHistory = async (id: string | null) => {
   }
 };
 const openLocalUploadedFilesPanel = async () => {
+  localUploadedFilesVisible.value = true;
+  if (localUploadStreamers.value.length === 0) {
+    await loadLocalUploadStreamers();
+  }
   if (!userInfo.value.uid) {
     notice.error({
       title: `请点击左侧头像处先进行登录`,
@@ -815,7 +837,6 @@ const openLocalUploadedFilesPanel = async () => {
     });
     return;
   }
-  localUploadedFilesVisible.value = true;
   resetLocalDetectView();
   loadingLocalDetectHistory.value = true;
   try {
@@ -837,13 +858,43 @@ const openLocalUploadedFilesPanel = async () => {
     loadingLocalDetectHistory.value = false;
   }
 };
+let localAuditPageInitialized = false;
+const ensureLocalAuditPageReady = async () => {
+  if (!localAuditOnly.value || localAuditPageInitialized) return;
+  localAuditPageInitialized = true;
+  await openLocalUploadedFilesPanel();
+};
+watch(
+  localAuditOnly,
+  (value) => {
+    if (value) {
+      localUploadedFilesVisible.value = true;
+      void ensureLocalAuditPageReady();
+      return;
+    }
+    localUploadedFilesVisible.value = false;
+  },
+  { immediate: true },
+);
 onBeforeUnmount(() => {
   localDetectPollingRunId += 1;
 });
 
 const formatFileSize = (size: number) => {
+  if (!Number.isFinite(size) || size <= 0) return "0 B";
   if (size >= 1024 * 1024 * 1024) return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
-  return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size >= 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  if (size >= 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${Math.round(size)} B`;
+};
+
+const formatShortReason = (reason?: string) => {
+  const text = String(reason || "")
+    .replace(/\r?\n/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!text) return "-";
+  return text.length > 140 ? `${text.slice(0, 140)}...` : text;
 };
 
 const openLocalFolder = (filePath: string) => {
@@ -1140,7 +1191,7 @@ const localInvalidMp4Columns: DataTableColumns<LocalInvalidMp4File> = [
     title: "原因",
     key: "reason",
     minWidth: 260,
-    render: (row) => h("span", { title: row.reason }, row.reason),
+    render: (row) => h("span", { title: row.reason }, formatShortReason(row.reason)),
   },
   {
     title: "修改时间",
@@ -1210,7 +1261,7 @@ const localDuplicateColumns: DataTableColumns<LocalDuplicateVideoFile> = [
     title: "原因",
     key: "reason",
     minWidth: 260,
-    render: (row) => h("span", { title: row.reason }, row.reason),
+    render: (row) => h("span", { title: row.reason }, formatShortReason(row.reason)),
   },
   {
     title: "修改时间",
@@ -1415,6 +1466,7 @@ const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = 
     title: "原因",
     key: "reason",
     minWidth: 160,
+    render: (row) => h("span", { title: row.reason }, formatShortReason(row.reason)),
   },
   {
     title: "操作",
@@ -1677,6 +1729,22 @@ const fileChange = (files: any) => {
 </script>
 
 <style scoped lang="less">
+.local-audit-panel {
+  height: 100%;
+  padding: 18px 22px;
+  overflow: auto;
+}
+
+.local-audit-header {
+  margin-bottom: 14px;
+}
+
+.local-audit-header h2 {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 600;
+}
+
 .detect-summary {
   display: flex;
   flex-wrap: wrap;

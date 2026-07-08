@@ -37,6 +37,12 @@ const router = createRouter({
           component: () => import("../pages/Tools/pages/FileUpload/index.vue"),
         },
         {
+          path: "/localUploadAudit",
+          name: "LocalUploadAudit",
+          component: () => import("../pages/Tools/pages/FileUpload/index.vue"),
+          props: { localAuditOnly: true },
+        },
+        {
           path: "/danmakufactory",
           name: "DanmakuFactory",
           component: () => import("../pages/Tools/pages/DanmuFactory.vue"),

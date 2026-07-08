@@ -245,6 +245,19 @@ const menuOptions = computed<MenuOption[]>(() => {
         ),
     },
     {
+      key: "LocalUploadAudit",
+      label: () =>
+        h(
+          RouterLink,
+          {
+            to: {
+              name: "LocalUploadAudit",
+            },
+          },
+          { default: () => "本地录播检测" },
+        ),
+    },
+    {
       key: "DanmakuFactory",
       label: () =>
         h(

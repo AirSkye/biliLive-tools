@@ -1080,6 +1080,20 @@ const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressRep
 const getInvalidMp4Reason = async (localFile: LocalVideoFile) => {
   if (path.extname(localFile.fileName).toLowerCase() !== ".mp4") return null;
 
+  const shortReason = (value: unknown) => {
+    const text = String(value ?? "")
+      .replace(/\r?\n/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!text) return "ffprobe 无法读取文件，文件可能损坏";
+    const normalized = text
+      .replace(/^ffprobe exited with code \d+:\s*/i, "")
+      .replace(/^ffprobe was killed with signal [^:]+:\s*/i, "")
+      .trim();
+    const summary = normalized || text;
+    return summary.length > 140 ? `${summary.slice(0, 140)}...` : summary;
+  };
+
   try {
     const meta = await readVideoMeta(localFile.localPath, { json: true });
     const formatDuration = Number(meta?.format?.duration ?? 0);
@@ -1096,7 +1110,7 @@ const getInvalidMp4Reason = async (localFile: LocalVideoFile) => {
     }
     return null;
   } catch (error) {
-    return `ffprobe 读取失败：${error instanceof Error ? error.message : String(error)}`;
+    return `ffprobe 读取失败：${shortReason(error instanceof Error ? error.message : error)}`;
   }
 };
 
@@ -2047,20 +2061,102 @@ const normalizeSelectedStreamers = (items?: SelectedLocalStreamer[]) => {
   return Array.from(map.values());
 };
 
-const listLocalUploadStreamers = (): LocalUploadStreamerOption[] => {
+const addLocalUploadStreamerOption = (
+  map: Map<string, LocalUploadStreamerOption>,
+  item: {
+    roomId: string | number;
+    platform?: string | null;
+    name?: string | null;
+  },
+) => {
+  const key = getStreamerFilterKey(item.roomId, item.platform);
+  if (!key) return;
+  const roomId = String(item.roomId);
+  const name = String(item.name || "").trim() || roomId;
+  const existing = map.get(key);
+  if (existing) {
+    if ((!existing.name || existing.name === existing.roomId) && name !== roomId) {
+      existing.name = name;
+    }
+    existing.hasWebhookUploadConfig ||= hasWebhookUploadConfig(roomId);
+    return;
+  }
+  map.set(key, {
+    key,
+    roomId,
+    platform: normalizeStreamerPlatform(item.platform),
+    name,
+    hasWebhookUploadConfig: hasWebhookUploadConfig(roomId),
+  });
+};
+
+const scanStreamerDirsFromRoots = async (roots: string[]) => {
+  const streamers: Array<{ roomId: string; username: string }> = [];
+  const visitedDirs = new Set<string>();
+  const maxDepth = 4;
+  const maxDirs = 8000;
+  let visitedCount = 0;
+
+  for (const root of roots) {
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+    while (stack.length > 0 && visitedCount < maxDirs) {
+      const { dir, depth } = stack.pop()!;
+      const realDir = await fs.realpath(dir).catch(() => dir);
+      const key = normalizeLocalPath(realDir);
+      if (visitedDirs.has(key)) continue;
+      visitedDirs.add(key);
+      visitedCount += 1;
+
+      let entries: fs.Dirent[];
+      try {
+        entries = await fs.readdir(dir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        let isDirectory = entry.isDirectory();
+        if (!isDirectory && entry.isSymbolicLink()) {
+          const stat = await fs.stat(fullPath).catch(() => null);
+          isDirectory = !!stat?.isDirectory();
+        }
+        if (!isDirectory) continue;
+
+        const parsed = parseRoomDirectoryName(entry.name);
+        if (parsed) {
+          streamers.push(parsed);
+        }
+        if (depth < maxDepth) {
+          stack.push({ dir: fullPath, depth: depth + 1 });
+        }
+      }
+    }
+  }
+
+  return streamers;
+};
+
+const listLocalUploadStreamers = async (): Promise<LocalUploadStreamerOption[]> => {
   const map = new Map<string, LocalUploadStreamerOption>();
   for (const streamer of streamerService.list()) {
-    const key = getStreamerFilterKey(streamer.room_id, streamer.platform);
-    if (!key) continue;
-    if (map.has(key)) continue;
-    map.set(key, {
-      key,
-      roomId: String(streamer.room_id),
-      platform: normalizeStreamerPlatform(streamer.platform),
+    addLocalUploadStreamerOption(map, {
+      roomId: streamer.room_id,
+      platform: streamer.platform,
       name: streamer.name,
-      hasWebhookUploadConfig: hasWebhookUploadConfig(String(streamer.room_id)),
     });
   }
+
+  const rootResult = await resolveScanRoots();
+  const directoryStreamers = await scanStreamerDirsFromRoots(rootResult.roots);
+  for (const streamer of directoryStreamers) {
+    addLocalUploadStreamerOption(map, {
+      roomId: streamer.roomId,
+      platform: "bilibili",
+      name: streamer.username,
+    });
+  }
+
   return Array.from(map.values()).sort((left, right) => {
     const nameCompare = left.name.localeCompare(right.name, "zh-Hans-CN");
     if (nameCompare !== 0) return nameCompare;
@@ -2537,7 +2633,7 @@ router.get("/platformArchiveDetail", async (ctx) => {
 
 router.get("/localUploadedFiles/streamers", async (ctx) => {
   ctx.body = {
-    items: listLocalUploadStreamers(),
+    items: await listLocalUploadStreamers(),
   };
 });
 
