@@ -4,7 +4,7 @@ import { omit } from "lodash-es";
 import path from "node:path";
 
 import { biliApi, validateBiliupConfig } from "@biliLive-tools/shared/task/bili.js";
-import { parseMeta } from "@biliLive-tools/shared/task/video.js";
+import { parseMeta, readVideoMeta } from "@biliLive-tools/shared/task/video.js";
 import { recordHistoryService, streamerService } from "@biliLive-tools/shared/db/index.js";
 import { TvQrcodeLogin } from "@renmu/bili-api";
 import {
@@ -72,6 +72,21 @@ type LocalUploadedFileMatch = {
   remoteFilename?: string;
   confidence: "high" | "medium";
   reason: string;
+};
+
+type LocalInvalidMp4File = {
+  localPath: string;
+  fileName: string;
+  root: string;
+  size: number;
+  mtimeMs: number;
+  reason: string;
+};
+
+type LocalDuplicateVideoFile = LocalInvalidMp4File & {
+  recordingKey: string;
+  primaryLocalPath: string;
+  primaryFileName: string;
 };
 
 type RecordWithStreamer = LiveHistory & {
@@ -195,6 +210,8 @@ type LocalUploadedFilesResult = {
   remotePartCount: number;
   truncated: boolean;
   matches: LocalUploadedFileMatch[];
+  invalidMp4Files?: LocalInvalidMp4File[];
+  duplicateFiles?: LocalDuplicateVideoFile[];
   unuploadedGroups: LocalUnuploadedGroup[];
   errors: string[];
   warnings: string[];
@@ -206,6 +223,7 @@ type LocalDetectStatus = "running" | "completed" | "error";
 type LocalDetectStage =
   | "prepare"
   | "scan"
+  | "validate"
   | "archives"
   | "search"
   | "details"
@@ -278,11 +296,21 @@ type LocalDetectHistorySummary = {
   remotePartCount: number;
   matchCount: number;
   initialMatchCount: number;
+  invalidMp4Count: number;
+  duplicateFileCount: number;
   unuploadedGroupCount: number;
   deletedCount: number;
 };
 
-type LocalUploadedFileDeletionRecord = LocalUploadedFileMatch & {
+type LocalDetectedDeletionItem = Partial<
+  Pick<
+    LocalUploadedFileMatch,
+    "aid" | "bvid" | "cid" | "page" | "archiveTitle" | "partTitle" | "remoteFilename" | "confidence"
+  >
+> &
+  Pick<LocalUploadedFileMatch, "localPath" | "fileName" | "root" | "size" | "mtimeMs" | "reason">;
+
+type LocalUploadedFileDeletionRecord = LocalDetectedDeletionItem & {
   id: string;
   uid?: number;
   historyId?: string;
@@ -488,6 +516,8 @@ const summarizeLocalDetectHistory = (item: LocalDetectHistoryItem): LocalDetectH
   remotePartCount: item.result.remotePartCount,
   matchCount: item.result.matches.length,
   initialMatchCount: item.initialMatchCount ?? item.result.matches.length,
+  invalidMp4Count: item.result.invalidMp4Files?.length ?? 0,
+  duplicateFileCount: item.result.duplicateFiles?.length ?? 0,
   unuploadedGroupCount: item.result.unuploadedGroups.length,
   deletedCount: item.deletedCount ?? 0,
 });
@@ -525,7 +555,7 @@ const saveLocalDetectHistory = async (
 const recordLocalUploadedFileDeletions = async (data: {
   uid?: number;
   historyId?: string;
-  items: LocalUploadedFileMatch[];
+  items: LocalDetectedDeletionItem[];
 }) => {
   const store = await readLocalDetectHistoryStore();
   const deletedAt = Date.now();
@@ -543,6 +573,12 @@ const recordLocalUploadedFileDeletions = async (data: {
     if (history) {
       const deletedPaths = new Set(records.map((item) => normalizeLocalPath(item.localPath)));
       history.result.matches = history.result.matches.filter(
+        (item) => !deletedPaths.has(normalizeLocalPath(item.localPath)),
+      );
+      history.result.invalidMp4Files = (history.result.invalidMp4Files ?? []).filter(
+        (item) => !deletedPaths.has(normalizeLocalPath(item.localPath)),
+      );
+      history.result.duplicateFiles = (history.result.duplicateFiles ?? []).filter(
         (item) => !deletedPaths.has(normalizeLocalPath(item.localPath)),
       );
       history.deletedCount = (history.deletedCount ?? 0) + records.length;
@@ -1038,6 +1074,197 @@ const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressRep
     truncated: files.length >= MAX_SCAN_FILES,
     discoveredVideoCount,
     followedLinkDirectoryCount,
+  };
+};
+
+const getInvalidMp4Reason = async (localFile: LocalVideoFile) => {
+  if (path.extname(localFile.fileName).toLowerCase() !== ".mp4") return null;
+
+  try {
+    const meta = await readVideoMeta(localFile.localPath, { json: true });
+    const formatDuration = Number(meta?.format?.duration ?? 0);
+    const videoStream = meta?.streams?.find((stream: any) => stream.codec_type === "video");
+    const streamDuration = Number(videoStream?.duration ?? 0);
+    if (!videoStream) {
+      return "ffprobe 未识别到视频流";
+    }
+    if (!Number.isFinite(formatDuration) && !Number.isFinite(streamDuration)) {
+      return "ffprobe 未读取到有效时长";
+    }
+    if (Math.max(formatDuration || 0, streamDuration || 0) <= 0) {
+      return "视频时长为 0 或不可读";
+    }
+    return null;
+  } catch (error) {
+    return `ffprobe 读取失败：${error instanceof Error ? error.message : String(error)}`;
+  }
+};
+
+const detectInvalidMp4Files = async (
+  localFiles: LocalVideoFile[],
+  progress?: LocalDetectProgressReporter,
+) => {
+  const invalidMp4Files: LocalInvalidMp4File[] = [];
+  const playableFiles: LocalVideoFile[] = [];
+  const mp4Files = localFiles.filter(
+    (localFile) => path.extname(localFile.fileName).toLowerCase() === ".mp4",
+  );
+  const mp4PathSet = new Set(mp4Files.map((localFile) => normalizeLocalPath(localFile.localPath)));
+  let checkedCount = 0;
+
+  await runLimited(mp4Files, 2, async (localFile) => {
+    const startCount = checkedCount;
+    progress?.({
+      stage: "validate",
+      stageLabel: "校验 MP4",
+      total: mp4Files.length,
+      processed: startCount,
+      current: localFile.localPath,
+      message: `正在校验 MP4 ${formatProgressCount(startCount, mp4Files.length)}：${localFile.fileName}`,
+    });
+    const reason = await getInvalidMp4Reason(localFile);
+    checkedCount += 1;
+    if (reason) {
+      invalidMp4Files.push({
+        localPath: localFile.localPath,
+        fileName: localFile.fileName,
+        root: localFile.root,
+        size: localFile.size,
+        mtimeMs: localFile.mtimeMs,
+        reason,
+      });
+      progress?.({
+        stage: "validate",
+        stageLabel: "校验 MP4",
+        total: mp4Files.length,
+        processed: checkedCount,
+        current: localFile.localPath,
+        message: `发现无效 MP4：${localFile.fileName}`,
+        log: `发现无效 MP4：${localFile.fileName}，${reason}`,
+      });
+      return;
+    }
+    if (checkedCount === 1 || checkedCount % 20 === 0 || checkedCount === mp4Files.length) {
+      progress?.({
+        stage: "validate",
+        stageLabel: "校验 MP4",
+        total: mp4Files.length,
+        processed: checkedCount,
+        current: localFile.localPath,
+        message: `MP4 校验进度 ${formatProgressCount(checkedCount, mp4Files.length)}：${localFile.fileName}`,
+      });
+    }
+  });
+
+  const invalidPathSet = new Set(
+    invalidMp4Files.map((localFile) => normalizeLocalPath(localFile.localPath)),
+  );
+  for (const localFile of localFiles) {
+    const key = normalizeLocalPath(localFile.localPath);
+    if (mp4PathSet.has(key) && invalidPathSet.has(key)) continue;
+    playableFiles.push(localFile);
+  }
+
+  progress?.({
+    stage: "validate",
+    stageLabel: "校验 MP4",
+    total: mp4Files.length,
+    processed: mp4Files.length,
+    current: "MP4 校验完成",
+    message: `MP4 校验完成：无效 ${invalidMp4Files.length} 个`,
+    log: `MP4 校验完成：检查 ${mp4Files.length} 个，无效 ${invalidMp4Files.length} 个`,
+  });
+
+  return {
+    files: playableFiles,
+    invalidMp4Files,
+  };
+};
+
+const getRecordingDedupKey = (localFile: LocalVideoFile) => {
+  return buildRecorderIdentityKeys(localFile.fileName, localFile.stem)[0];
+};
+
+const getLocalFilePriority = (localFile: LocalVideoFile) => {
+  const ext = path.extname(localFile.fileName).toLowerCase();
+  const stem = localFile.stem.toLowerCase();
+  if (ext === ".mp4" && /弹幕版|danmu|subtitle/.test(stem)) return 500;
+  if (ext === ".mp4" && /后处理|合并|handled|merged/.test(stem)) return 450;
+  if (ext === ".mp4") return 400;
+  if ([".mkv", ".mov", ".m4v", ".webm"].includes(ext)) return 300;
+  if (ext === ".flv") return 200;
+  return 100;
+};
+
+const choosePrimaryLocalRecordingFile = (files: LocalVideoFile[]) => {
+  return [...files].sort((left, right) => {
+    const priorityDiff = getLocalFilePriority(right) - getLocalFilePriority(left);
+    if (priorityDiff !== 0) return priorityDiff;
+    const mtimeDiff = right.mtimeMs - left.mtimeMs;
+    if (mtimeDiff !== 0) return mtimeDiff;
+    return right.size - left.size;
+  })[0];
+};
+
+const dedupeLocalRecordingFiles = (
+  localFiles: LocalVideoFile[],
+  progress?: LocalDetectProgressReporter,
+) => {
+  const grouped = new Map<string, LocalVideoFile[]>();
+  const passthrough: LocalVideoFile[] = [];
+  for (const localFile of localFiles) {
+    const key = getRecordingDedupKey(localFile);
+    if (!key) {
+      passthrough.push(localFile);
+      continue;
+    }
+    const files = grouped.get(key) ?? [];
+    files.push(localFile);
+    grouped.set(key, files);
+  }
+
+  const files: LocalVideoFile[] = [...passthrough];
+  const duplicateFiles: LocalDuplicateVideoFile[] = [];
+  for (const [recordingKey, groupFiles] of grouped) {
+    if (groupFiles.length === 1) {
+      files.push(groupFiles[0]);
+      continue;
+    }
+    const primary = choosePrimaryLocalRecordingFile(groupFiles);
+    files.push(primary);
+    for (const localFile of groupFiles) {
+      if (normalizeLocalPath(localFile.localPath) === normalizeLocalPath(primary.localPath)) {
+        continue;
+      }
+      duplicateFiles.push({
+        localPath: localFile.localPath,
+        fileName: localFile.fileName,
+        root: localFile.root,
+        size: localFile.size,
+        mtimeMs: localFile.mtimeMs,
+        reason: `同场录播已折叠，主候选：${primary.fileName}`,
+        recordingKey,
+        primaryLocalPath: primary.localPath,
+        primaryFileName: primary.fileName,
+      });
+    }
+  }
+
+  if (duplicateFiles.length > 0) {
+    progress?.({
+      stage: "scan",
+      stageLabel: "折叠同场文件",
+      total: localFiles.length,
+      processed: localFiles.length,
+      current: "同场文件折叠完成",
+      message: `同场文件折叠完成：主候选 ${files.length} 个，重复 ${duplicateFiles.length} 个`,
+      log: `同场文件折叠完成：主候选 ${files.length} 个，重复 ${duplicateFiles.length} 个`,
+    });
+  }
+
+  return {
+    files,
+    duplicateFiles,
   };
 };
 
@@ -2052,7 +2279,11 @@ const runLocalUploadedFilesDetection = async (
     selectedStreamers,
     progress,
   );
-  const localFiles = filterResult.files;
+  const validationResult = await detectInvalidMp4Files(filterResult.files, progress);
+  const dedupeResult = dedupeLocalRecordingFiles(validationResult.files, progress);
+  const localFiles = dedupeResult.files;
+  const invalidMp4Files = validationResult.invalidMp4Files;
+  const duplicateFiles = dedupeResult.duplicateFiles;
   if (selectedStreamers.length > 0) {
     pushLog(
       `主播筛选完成：选中 ${selectedStreamers.length} 个主播，保留 ${localFiles.length} 个本地视频，跳过 ${filterResult.skipped} 个`,
@@ -2064,6 +2295,24 @@ const runLocalUploadedFilesDetection = async (
         current: "主播筛选完成",
       },
     );
+  }
+  if (invalidMp4Files.length > 0) {
+    pushLog(`无效 MP4 已排除：${invalidMp4Files.length} 个，可在“无效 MP4”页签确认删除`, {
+      stage: "validate",
+      stageLabel: "校验 MP4",
+      total: filterResult.files.length,
+      processed: filterResult.files.length,
+      current: "无效 MP4",
+    });
+  }
+  if (duplicateFiles.length > 0) {
+    pushLog(`同场重复文件已折叠：${duplicateFiles.length} 个，不再参与匹配或上传`, {
+      stage: "scan",
+      stageLabel: "折叠同场文件",
+      total: validationResult.files.length,
+      processed: validationResult.files.length,
+      current: "同场重复文件",
+    });
   }
 
   const searchKeywords = buildArchiveSearchKeywords(localFiles);
@@ -2173,6 +2422,12 @@ const runLocalUploadedFilesDetection = async (
     selectedStreamers.length > 0
       ? `主播筛选：选中 ${selectedStreamers.length} 个主播，保留 ${localFiles.length} 个本地视频，跳过 ${filterResult.skipped} 个`
       : "",
+    invalidMp4Files.length > 0
+      ? `无效 MP4：${invalidMp4Files.length} 个，已从匹配和未上传分组中排除`
+      : "",
+    duplicateFiles.length > 0
+      ? `同场重复：${duplicateFiles.length} 个，已从匹配和未上传分组中排除`
+      : "",
     `比对完成：疑似已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组，大小过滤 ${unuploadedResult.skippedSmallGroupCount} 组`,
   ].filter(Boolean);
   if (scanResult.truncated) {
@@ -2185,8 +2440,8 @@ const runLocalUploadedFilesDetection = async (
     total: 1,
     processed: 1,
     current: "检测完成",
-    message: `检测完成：已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
-    log: `检测完成：已上传未删除 ${matches.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+    message: `检测完成：已上传未删除 ${matches.length} 个，无效 MP4 ${invalidMp4Files.length} 个，同场重复 ${duplicateFiles.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
+    log: `检测完成：已上传未删除 ${matches.length} 个，无效 MP4 ${invalidMp4Files.length} 个，同场重复 ${duplicateFiles.length} 个，本地未上传 ${unuploadedGroups.length} 组`,
   });
 
   const result: LocalUploadedFilesResult = {
@@ -2197,6 +2452,8 @@ const runLocalUploadedFilesDetection = async (
     remotePartCount: remoteResult.parts.length,
     truncated: scanResult.truncated,
     matches,
+    invalidMp4Files,
+    duplicateFiles,
     unuploadedGroups,
     errors: [...rootResult.errors, ...scanResult.errors, ...remoteResult.errors],
     warnings: remoteResult.warnings,
@@ -2358,7 +2615,7 @@ router.post("/localUploadedFiles/deletions", async (ctx) => {
   const body = (ctx.request.body ?? {}) as {
     uid?: number;
     historyId?: string;
-    items?: LocalUploadedFileMatch[];
+    items?: LocalDetectedDeletionItem[];
   };
   if (!Array.isArray(body.items) || body.items.length === 0) {
     ctx.body = "items required";
@@ -2434,7 +2691,11 @@ router.post("/localUploadedFiles/detect", async (ctx) => {
         total: 1,
         processed: 1,
         current: "检测完成",
-        message: `检测完成：已上传未删除 ${result.matches.length} 个，本地未上传 ${result.unuploadedGroups.length} 组`,
+        message: `检测完成：已上传未删除 ${result.matches.length} 个，无效 MP4 ${
+          result.invalidMp4Files?.length ?? 0
+        } 个，同场重复 ${result.duplicateFiles?.length ?? 0} 个，本地未上传 ${
+          result.unuploadedGroups.length
+        } 组`,
       });
     })
     .catch((error) => {

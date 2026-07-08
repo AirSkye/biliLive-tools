@@ -126,6 +126,8 @@
         <span>稿件：{{ localUploadedFilesResult.archiveCount }}</span>
         <span>分P：{{ localUploadedFilesResult.remotePartCount }}</span>
         <span>匹配：{{ localUploadedFilesResult.matches.length }}</span>
+        <span v-if="localInvalidMp4Rows.length">无效 MP4：{{ localInvalidMp4Rows.length }}</span>
+        <span v-if="localDuplicateRows.length">同场重复：{{ localDuplicateRows.length }}</span>
       </div>
       <div v-if="localDetectProgress" class="detect-progress">
         <div class="detect-progress__header">
@@ -216,6 +218,72 @@
             size="small"
           />
         </n-tab-pane>
+        <n-tab-pane name="invalid-mp4" tab="无效 MP4">
+          <div class="local-upload-toolbar">
+            <n-button
+              size="small"
+              type="error"
+              :loading="deletingLocalInvalidMp4Files"
+              :disabled="selectedLocalInvalidMp4FileKeys.length === 0"
+              @click="deleteSelectedLocalInvalidMp4Files"
+            >
+              删除选中
+            </n-button>
+            <n-button
+              size="small"
+              type="error"
+              secondary
+              :loading="deletingLocalInvalidMp4Files"
+              :disabled="localInvalidMp4Rows.length === 0"
+              @click="deleteAllLocalInvalidMp4Files"
+            >
+              一键删除
+            </n-button>
+          </div>
+          <n-empty v-if="localInvalidMp4Rows.length === 0" description="没有检测到无效 MP4" />
+          <n-data-table
+            v-else
+            v-model:checked-row-keys="selectedLocalInvalidMp4FileKeys"
+            :row-key="getLocalInvalidMp4RowKey"
+            :columns="localInvalidMp4Columns"
+            :data="localInvalidMp4Rows"
+            :pagination="{ pageSize: 8 }"
+            size="small"
+          />
+        </n-tab-pane>
+        <n-tab-pane name="duplicate" tab="同场重复">
+          <div class="local-upload-toolbar">
+            <n-button
+              size="small"
+              type="error"
+              :loading="deletingLocalDuplicateFiles"
+              :disabled="selectedLocalDuplicateFileKeys.length === 0"
+              @click="deleteSelectedLocalDuplicateFiles"
+            >
+              删除选中
+            </n-button>
+            <n-button
+              size="small"
+              type="error"
+              secondary
+              :loading="deletingLocalDuplicateFiles"
+              :disabled="localDuplicateRows.length === 0"
+              @click="deleteAllLocalDuplicateFiles"
+            >
+              一键删除
+            </n-button>
+          </div>
+          <n-empty v-if="localDuplicateRows.length === 0" description="没有检测到同场重复文件" />
+          <n-data-table
+            v-else
+            v-model:checked-row-keys="selectedLocalDuplicateFileKeys"
+            :row-key="getLocalDuplicateRowKey"
+            :columns="localDuplicateColumns"
+            :data="localDuplicateRows"
+            :pagination="{ pageSize: 8 }"
+            size="small"
+          />
+        </n-tab-pane>
         <n-tab-pane name="unuploaded" tab="本地未上传">
           <div class="local-upload-toolbar">
             <n-input
@@ -230,22 +298,29 @@
               style="width: 180px"
             />
             <n-checkbox v-model:checked="localUploadOptions.uploadRawWhenNoDanmu">
-              弹幕不存在时上传原视频
+              压制时弹幕不存在则上传原视频
             </n-checkbox>
-            <n-checkbox v-model:checked="localUploadOptions.burnDanmu"> 压制弹幕 </n-checkbox>
             <n-checkbox v-model:checked="localUploadOptions.mergeSegments">
               上传前选择合并分段
             </n-checkbox>
             <n-button size="small" @click="selectAllLocalUnuploadedGroups"> 全选全部 </n-button>
             <n-button size="small" @click="clearSelectedLocalUploadGroups"> 清空选择 </n-button>
             <n-button
+              size="small"
+              :loading="uploadingLocalUnuploaded"
+              :disabled="selectedLocalUploadGroupIds.length === 0"
+              @click="uploadSelectedLocalGroups('direct')"
+            >
+              直接上传选中
+            </n-button>
+            <n-button
               type="primary"
               size="small"
               :loading="uploadingLocalUnuploaded"
               :disabled="selectedLocalUploadGroupIds.length === 0"
-              @click="uploadSelectedLocalGroups"
+              @click="uploadSelectedLocalGroups('burn')"
             >
-              上传选中
+              压制上传选中
             </n-button>
           </div>
           <n-empty v-if="localUnuploadedRows.length === 0" description="没有检测到本地未上传文件" />
@@ -337,6 +412,9 @@ import hotkeys from "hotkeys-js";
 
 import { deepRaw } from "@renderer/utils";
 import type {
+  LocalDetectedDeletionItem,
+  LocalDuplicateVideoFile,
+  LocalInvalidMp4File,
   LocalUploadedFileDeletionRecord,
   LocalUploadedFilesDetectionProgress,
   LocalUploadedFilesHistorySummary,
@@ -520,13 +598,21 @@ const getSelectedLocalDetectStreamers = () =>
     }));
 const localDetectHistoryOptions = computed(() =>
   localDetectHistoryItems.value.map((item) => ({
-    label: `${new Date(item.createdAt).toLocaleString()} | 残留 ${item.matchCount}/${item.initialMatchCount} | 未上传 ${item.unuploadedGroupCount} | 已删 ${item.deletedCount}`,
+    label: `${new Date(item.createdAt).toLocaleString()} | 残留 ${item.matchCount}/${item.initialMatchCount} | 无效MP4 ${item.invalidMp4Count ?? 0} | 同场重复 ${
+      item.duplicateFileCount ?? 0
+    } | 未上传 ${item.unuploadedGroupCount} | 已删 ${item.deletedCount}`,
     value: item.id,
   })),
 );
 const localUploadedRows = computed(() => localUploadedFilesResult.value?.matches ?? []);
+const localInvalidMp4Rows = computed(() => localUploadedFilesResult.value?.invalidMp4Files ?? []);
+const localDuplicateRows = computed(() => localUploadedFilesResult.value?.duplicateFiles ?? []);
 const selectedLocalUploadedFileKeys = ref<DataTableRowKey[]>([]);
+const selectedLocalInvalidMp4FileKeys = ref<DataTableRowKey[]>([]);
+const selectedLocalDuplicateFileKeys = ref<DataTableRowKey[]>([]);
 const deletingLocalUploadedFiles = ref(false);
+const deletingLocalInvalidMp4Files = ref(false);
+const deletingLocalDuplicateFiles = ref(false);
 type LocalUnuploadedSortKey =
   | "startTimeDesc"
   | "startTimeAsc"
@@ -573,7 +659,6 @@ const localUnuploadedRows = computed(() => {
 const selectedLocalUploadGroupIds = ref<DataTableRowKey[]>([]);
 const uploadingLocalUnuploaded = ref(false);
 const localUploadOptions = reactive({
-  burnDanmu: true,
   uploadRawWhenNoDanmu: true,
   mergeSegments: true,
 });
@@ -582,10 +667,13 @@ type PendingLocalUploadGroup = {
   burnDanmu: boolean;
   uploadRawWhenNoDanmu: boolean;
 };
+type LocalUploadRunMode = "direct" | "burn";
 const localMergeDialogVisible = ref(false);
 const pendingLocalUploadGroups = ref<PendingLocalUploadGroup[]>([]);
 const selectedMergeGroupIds = ref<DataTableRowKey[]>([]);
 const getLocalUploadedRowKey = (row: LocalUploadedFileMatch) => row.localPath;
+const getLocalInvalidMp4RowKey = (row: LocalInvalidMp4File) => row.localPath;
+const getLocalDuplicateRowKey = (row: LocalDuplicateVideoFile) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
 const getLocalDeletionRowKey = (row: LocalUploadedFileDeletionRecord) => row.id;
 const getEligibleLocalUnuploadedRows = () =>
@@ -629,6 +717,8 @@ const resetLocalDetectView = () => {
   localDetectProgress.value = null;
   localUnuploadedSearchKeyword.value = "";
   selectedLocalUploadedFileKeys.value = [];
+  selectedLocalInvalidMp4FileKeys.value = [];
+  selectedLocalDuplicateFileKeys.value = [];
   selectedLocalUploadGroupIds.value = [];
   pendingLocalUploadGroups.value = [];
   selectedMergeGroupIds.value = [];
@@ -767,19 +857,40 @@ const openBiliArchive = (row: LocalUploadedFileMatch) => {
   window.api.openExternal(url);
 };
 
-const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
-  if (rows.length === 0 || deletingLocalUploadedFiles.value) return;
+const deleteLocalDetectedFiles = async (
+  rows: LocalDetectedDeletionItem[],
+  kind: "uploaded" | "invalidMp4" | "duplicate",
+) => {
+  const deleting =
+    kind === "uploaded"
+      ? deletingLocalUploadedFiles.value
+      : kind === "invalidMp4"
+        ? deletingLocalInvalidMp4Files.value
+        : deletingLocalDuplicateFiles.value;
+  if (rows.length === 0 || deleting) return;
+  const label =
+    kind === "uploaded"
+      ? "已上传残留文件"
+      : kind === "invalidMp4"
+        ? "无效 MP4 文件"
+        : "同场重复文件";
   const [confirmed] = await confirm.warning({
     title: "确认删除",
-    content: `确定删除 ${rows.length} 个已上传残留文件吗？此操作不可撤销。`,
+    content: `确定删除 ${rows.length} 个${label}吗？此操作不可撤销。`,
     positiveText: "删除",
     negativeText: "取消",
   });
   if (!confirmed) return;
 
-  deletingLocalUploadedFiles.value = true;
+  if (kind === "uploaded") {
+    deletingLocalUploadedFiles.value = true;
+  } else if (kind === "invalidMp4") {
+    deletingLocalInvalidMp4Files.value = true;
+  } else {
+    deletingLocalDuplicateFiles.value = true;
+  }
   const deletedPaths = new Set<string>();
-  const deletedRows: LocalUploadedFileMatch[] = [];
+  const deletedRows: LocalDetectedDeletionItem[] = [];
   const failed: string[] = [];
   const historyId = localUploadedFilesResult.value?.historyId;
   try {
@@ -788,20 +899,44 @@ const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
         await fileBrowserApi.removeFile(row.localPath);
         deletedPaths.add(row.localPath);
         deletedRows.push(row);
-        pushLocalDetectLog(`已删除残留文件：${row.fileName}`);
+        pushLocalDetectLog(
+          `已删除${
+            kind === "uploaded" ? "残留文件" : kind === "invalidMp4" ? "无效 MP4" : "同场重复文件"
+          }：${row.fileName}`,
+        );
       } catch (error) {
         failed.push(`${row.fileName}：${error instanceof Error ? error.message : String(error)}`);
       }
     }
 
     if (localUploadedFilesResult.value && deletedPaths.size > 0) {
-      localUploadedFilesResult.value.matches = localUploadedFilesResult.value.matches.filter(
-        (row) => !deletedPaths.has(row.localPath),
+      if (kind === "uploaded") {
+        localUploadedFilesResult.value.matches = localUploadedFilesResult.value.matches.filter(
+          (row) => !deletedPaths.has(row.localPath),
+        );
+      } else if (kind === "invalidMp4") {
+        localUploadedFilesResult.value.invalidMp4Files = (
+          localUploadedFilesResult.value.invalidMp4Files ?? []
+        ).filter((row) => !deletedPaths.has(row.localPath));
+      } else {
+        localUploadedFilesResult.value.duplicateFiles = (
+          localUploadedFilesResult.value.duplicateFiles ?? []
+        ).filter((row) => !deletedPaths.has(row.localPath));
+      }
+    }
+    if (kind === "uploaded") {
+      selectedLocalUploadedFileKeys.value = selectedLocalUploadedFileKeys.value.filter(
+        (key) => !deletedPaths.has(String(key)),
+      );
+    } else if (kind === "invalidMp4") {
+      selectedLocalInvalidMp4FileKeys.value = selectedLocalInvalidMp4FileKeys.value.filter(
+        (key) => !deletedPaths.has(String(key)),
+      );
+    } else {
+      selectedLocalDuplicateFileKeys.value = selectedLocalDuplicateFileKeys.value.filter(
+        (key) => !deletedPaths.has(String(key)),
       );
     }
-    selectedLocalUploadedFileKeys.value = selectedLocalUploadedFileKeys.value.filter(
-      (key) => !deletedPaths.has(String(key)),
-    );
 
     if (deletedRows.length > 0) {
       try {
@@ -827,7 +962,7 @@ const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
     if (deletedPaths.size > 0) {
       notice.success({
         title: "删除完成",
-        content: `已删除 ${deletedPaths.size} 个残留文件`,
+        content: `已删除 ${deletedPaths.size} 个${label}`,
         duration: 3000,
       });
     }
@@ -840,8 +975,26 @@ const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
       for (const item of failed) pushLocalDetectLog(`删除失败：${item}`);
     }
   } finally {
-    deletingLocalUploadedFiles.value = false;
+    if (kind === "uploaded") {
+      deletingLocalUploadedFiles.value = false;
+    } else if (kind === "invalidMp4") {
+      deletingLocalInvalidMp4Files.value = false;
+    } else {
+      deletingLocalDuplicateFiles.value = false;
+    }
   }
+};
+
+const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
+  await deleteLocalDetectedFiles(rows, "uploaded");
+};
+
+const deleteLocalInvalidMp4Files = async (rows: LocalInvalidMp4File[]) => {
+  await deleteLocalDetectedFiles(rows, "invalidMp4");
+};
+
+const deleteLocalDuplicateFiles = async (rows: LocalDuplicateVideoFile[]) => {
+  await deleteLocalDetectedFiles(rows, "duplicate");
 };
 
 const deleteSelectedLocalUploadedFiles = async () => {
@@ -853,6 +1006,28 @@ const deleteSelectedLocalUploadedFiles = async () => {
 
 const deleteAllLocalUploadedFiles = async () => {
   await deleteLocalUploadedFiles(localUploadedRows.value);
+};
+
+const deleteSelectedLocalInvalidMp4Files = async () => {
+  const selectedKeys = new Set(selectedLocalInvalidMp4FileKeys.value.map((item) => String(item)));
+  await deleteLocalInvalidMp4Files(
+    localInvalidMp4Rows.value.filter((row) => selectedKeys.has(getLocalInvalidMp4RowKey(row))),
+  );
+};
+
+const deleteAllLocalInvalidMp4Files = async () => {
+  await deleteLocalInvalidMp4Files(localInvalidMp4Rows.value);
+};
+
+const deleteSelectedLocalDuplicateFiles = async () => {
+  const selectedKeys = new Set(selectedLocalDuplicateFileKeys.value.map((item) => String(item)));
+  await deleteLocalDuplicateFiles(
+    localDuplicateRows.value.filter((row) => selectedKeys.has(getLocalDuplicateRowKey(row))),
+  );
+};
+
+const deleteAllLocalDuplicateFiles = async () => {
+  await deleteLocalDuplicateFiles(localDuplicateRows.value);
 };
 
 const localUploadedColumns: DataTableColumns<LocalUploadedFileMatch> = [
@@ -936,6 +1111,140 @@ const localUploadedColumns: DataTableColumns<LocalUploadedFileMatch> = [
               type: "error",
               disabled: deletingLocalUploadedFiles.value,
               onClick: () => deleteLocalUploadedFiles([row]),
+            },
+            { default: () => "删除" },
+          ),
+        ],
+      ),
+  },
+];
+
+const localInvalidMp4Columns: DataTableColumns<LocalInvalidMp4File> = [
+  {
+    type: "selection",
+  },
+  {
+    title: "本地文件",
+    key: "fileName",
+    minWidth: 260,
+    render: (row) => h("span", { title: row.localPath }, row.fileName),
+  },
+  {
+    title: "大小",
+    key: "size",
+    width: 110,
+    sorter: (left, right) => left.size - right.size,
+    render: (row) => formatFileSize(row.size),
+  },
+  {
+    title: "原因",
+    key: "reason",
+    minWidth: 260,
+    render: (row) => h("span", { title: row.reason }, row.reason),
+  },
+  {
+    title: "修改时间",
+    key: "mtimeMs",
+    width: 170,
+    sorter: (left, right) => left.mtimeMs - right.mtimeMs,
+    render: (row) => new Date(row.mtimeMs).toLocaleString(),
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 170,
+    render: (row) =>
+      h(
+        "div",
+        {
+          style: "display: flex; gap: 8px;",
+        },
+        [
+          h(
+            NButton,
+            {
+              size: "small",
+              onClick: () => openLocalFolder(row.localPath),
+            },
+            { default: () => "打开目录" },
+          ),
+          h(
+            NButton,
+            {
+              size: "small",
+              type: "error",
+              disabled: deletingLocalInvalidMp4Files.value,
+              onClick: () => deleteLocalInvalidMp4Files([row]),
+            },
+            { default: () => "删除" },
+          ),
+        ],
+      ),
+  },
+];
+
+const localDuplicateColumns: DataTableColumns<LocalDuplicateVideoFile> = [
+  {
+    type: "selection",
+  },
+  {
+    title: "重复文件",
+    key: "fileName",
+    minWidth: 260,
+    render: (row) => h("span", { title: row.localPath }, row.fileName),
+  },
+  {
+    title: "主候选",
+    key: "primaryFileName",
+    minWidth: 260,
+    render: (row) => h("span", { title: row.primaryLocalPath }, row.primaryFileName),
+  },
+  {
+    title: "大小",
+    key: "size",
+    width: 110,
+    sorter: (left, right) => left.size - right.size,
+    render: (row) => formatFileSize(row.size),
+  },
+  {
+    title: "原因",
+    key: "reason",
+    minWidth: 260,
+    render: (row) => h("span", { title: row.reason }, row.reason),
+  },
+  {
+    title: "修改时间",
+    key: "mtimeMs",
+    width: 170,
+    sorter: (left, right) => left.mtimeMs - right.mtimeMs,
+    render: (row) => new Date(row.mtimeMs).toLocaleString(),
+  },
+  {
+    title: "操作",
+    key: "actions",
+    width: 170,
+    render: (row) =>
+      h(
+        "div",
+        {
+          style: "display: flex; gap: 8px;",
+        },
+        [
+          h(
+            NButton,
+            {
+              size: "small",
+              onClick: () => openLocalFolder(row.localPath),
+            },
+            { default: () => "打开目录" },
+          ),
+          h(
+            NButton,
+            {
+              size: "small",
+              type: "error",
+              disabled: deletingLocalDuplicateFiles.value,
+              onClick: () => deleteLocalDuplicateFiles([row]),
             },
             { default: () => "删除" },
           ),
@@ -1085,13 +1394,22 @@ const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = 
     title: "稿件",
     key: "archiveTitle",
     minWidth: 220,
-    render: (row) => h("span", { title: `AV${row.aid}` }, row.archiveTitle || `AV${row.aid}`),
+    render: (row) => {
+      if (row.aid) {
+        return h("span", { title: `AV${row.aid}` }, row.archiveTitle || `AV${row.aid}`);
+      }
+      return h(
+        "span",
+        { title: row.reason },
+        row.reason.includes("同场") ? "同场重复" : "无效 MP4",
+      );
+    },
   },
   {
     title: "分P",
     key: "partTitle",
     minWidth: 160,
-    render: (row) => row.partTitle || row.remoteFilename || "-",
+    render: (row) => row.partTitle || row.remoteFilename || row.reason || "-",
   },
   {
     title: "原因",
@@ -1114,7 +1432,7 @@ const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = 
   },
 ];
 
-const uploadSelectedLocalGroups = async () => {
+const uploadSelectedLocalGroups = async (mode: LocalUploadRunMode) => {
   const selectedIds = new Set(selectedLocalUploadGroupIds.value.map((item) => String(item)));
   const groups = localUnuploadedRows.value.filter(
     (row) => selectedIds.has(row.id) && row.roomId && row.hasWebhookUploadConfig,
@@ -1129,9 +1447,10 @@ const uploadSelectedLocalGroups = async () => {
     return;
   }
 
+  const burnDanmu = mode === "burn";
   pendingLocalUploadGroups.value = groups.map((row) => ({
     row,
-    burnDanmu: localUploadOptions.burnDanmu,
+    burnDanmu,
     uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
   }));
   if (localUploadOptions.mergeSegments && localMergeRows.value.length > 0) {
@@ -1175,7 +1494,7 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     const result = await biliApi.uploadLocalUnuploaded({
       groups,
       options: {
-        burnDanmu: localUploadOptions.burnDanmu,
+        burnDanmu: pendingLocalUploadGroups.value.some((item) => item.burnDanmu),
         uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
         mergeSegments: false,
       },
@@ -1183,7 +1502,9 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     const queuedCount = result.items.filter((item) => item.status === "queued").length;
     notice.success({
       title: "已加入上传流程",
-      content: `已加入 ${queuedCount} 个分组，合并/压制/上传任务会在任务队列中执行`,
+      content: `已加入 ${queuedCount} 个分组，${
+        pendingLocalUploadGroups.value.some((item) => item.burnDanmu) ? "压制后上传" : "直接上传"
+      }任务会在队列中执行`,
       duration: 3000,
     });
     selectedLocalUploadGroupIds.value = [];

@@ -1504,7 +1504,7 @@ export class WebhookHandler {
       savePath: plan.savePath,
       override: false,
       removeOrigin: options.removeVideo,
-      autoRun: plan.autoRun,
+      autoRun: false,
       manualStart: !plan.autoRun,
     });
     task.custsomProgressMsg = plan.message;
@@ -1576,7 +1576,7 @@ export class WebhookHandler {
       ...options,
       removeOrigin: false,
       override: false,
-      autoRun: plan.autoRun,
+      autoRun: false,
       manualStart: !plan.autoRun,
     });
     task.custsomProgressMsg = plan.message;

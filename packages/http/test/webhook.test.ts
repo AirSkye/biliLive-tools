@@ -454,6 +454,118 @@ describe("WebhookHandler", () => {
         await fs.remove(tempDir);
       }
     });
+
+    it("原 webhook 弹幕压制任务应进入队列限流启动", async () => {
+      const output = path.join(os.tmpdir(), "source-弹幕版.mp4");
+      const fakeTask: any = {
+        output,
+        on: vi.fn((event: string, callback: Function) => {
+          if (event === "task-end") {
+            queueMicrotask(() => callback({ taskId: "burn-task" }));
+          }
+          return fakeTask;
+        }),
+      };
+      const planSpy = vi.spyOn(webhookHandler as any, "planFfmpegOutput").mockResolvedValue({
+        output,
+        savePath: path.dirname(output),
+        estimatedBytes: 1024,
+        requiredBytes: 2048,
+        freeBytes: 4096,
+        migrated: false,
+        autoRun: true,
+        message: "空间足够",
+      });
+      const burnSpy = vi.spyOn(videoTask, "burn").mockResolvedValue(fakeTask);
+
+      try {
+        await (webhookHandler as any).burn(
+          {
+            videoFilePath: path.join(os.tmpdir(), "source.flv"),
+            subtitleFilePath: path.join(os.tmpdir(), "source.xml"),
+          },
+          {
+            danmaOptions: {},
+            ffmpegOptions: { encoder: "libx264" },
+            hotProgressOptions: {
+              interval: 30,
+              color: "#fff",
+              fillColor: "#000",
+              height: 60,
+            },
+            hasHotProgress: false,
+          },
+        );
+
+        expect(burnSpy).toHaveBeenCalledWith(
+          expect.anything(),
+          output,
+          expect.objectContaining({
+            autoRun: false,
+            manualStart: false,
+          }),
+        );
+      } finally {
+        planSpy.mockRestore();
+        burnSpy.mockRestore();
+      }
+    });
+
+    it("原 webhook 普通转码任务应进入队列限流启动", async () => {
+      const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "bili-webhook-transcode-"));
+      const input = path.join(tempDir, "source.flv");
+      const output = path.join(tempDir, "source.mp4");
+      const fakeTask: any = {
+        output,
+        on: vi.fn((event: string, callback: Function) => {
+          if (event === "task-end") {
+            queueMicrotask(() => callback({ taskId: "transcode-task" }));
+          }
+          return fakeTask;
+        }),
+      };
+      const planSpy = vi.spyOn(webhookHandler as any, "planFfmpegOutput").mockResolvedValue({
+        output,
+        savePath: path.dirname(output),
+        estimatedBytes: 1024,
+        requiredBytes: 2048,
+        freeBytes: 4096,
+        migrated: false,
+        autoRun: true,
+        message: "空间足够",
+      });
+      const transcodeSpy = vi.spyOn(videoTask, "transcode").mockResolvedValue(fakeTask);
+      const pathExistsMock = vi.mocked(fs.pathExists);
+      const previousPathExists = pathExistsMock.getMockImplementation();
+      pathExistsMock.mockImplementation(async (target: any) => {
+        return path.resolve(String(target)) !== path.resolve(output);
+      });
+
+      try {
+        await (webhookHandler as any).transcode(
+          input,
+          { encoder: "libx264" },
+          { removeVideo: false },
+        );
+
+        expect(transcodeSpy).toHaveBeenCalledWith(
+          input,
+          path.basename(output),
+          expect.anything(),
+          expect.objectContaining({
+            autoRun: false,
+            manualStart: false,
+          }),
+        );
+      } finally {
+        planSpy.mockRestore();
+        transcodeSpy.mockRestore();
+        if (previousPathExists) {
+          pathExistsMock.mockImplementation(previousPathExists);
+        }
+        await fs.remove(tempDir);
+      }
+    });
   });
 
   describe.concurrent("getRoomSetting", () => {

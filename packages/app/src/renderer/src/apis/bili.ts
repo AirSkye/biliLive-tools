@@ -81,6 +81,21 @@ export type LocalUploadedFileMatch = {
   reason: string;
 };
 
+export type LocalInvalidMp4File = {
+  localPath: string;
+  fileName: string;
+  root: string;
+  size: number;
+  mtimeMs: number;
+  reason: string;
+};
+
+export type LocalDuplicateVideoFile = LocalInvalidMp4File & {
+  recordingKey: string;
+  primaryLocalPath: string;
+  primaryFileName: string;
+};
+
 export type LocalUploadedFilesResult = {
   historyId?: string;
   detectedAt?: number;
@@ -91,6 +106,8 @@ export type LocalUploadedFilesResult = {
   remotePartCount: number;
   truncated: boolean;
   matches: LocalUploadedFileMatch[];
+  invalidMp4Files?: LocalInvalidMp4File[];
+  duplicateFiles?: LocalDuplicateVideoFile[];
   unuploadedGroups: LocalUnuploadedGroup[];
   errors: string[];
   warnings: string[];
@@ -128,6 +145,8 @@ export type LocalUploadedFilesHistorySummary = {
   remotePartCount: number;
   matchCount: number;
   initialMatchCount: number;
+  invalidMp4Count?: number;
+  duplicateFileCount?: number;
   unuploadedGroupCount: number;
   deletedCount: number;
 };
@@ -142,7 +161,15 @@ export type LocalUploadedFilesHistoryItem = {
   deletedCount: number;
 };
 
-export type LocalUploadedFileDeletionRecord = LocalUploadedFileMatch & {
+export type LocalDetectedDeletionItem = Partial<
+  Pick<
+    LocalUploadedFileMatch,
+    "aid" | "bvid" | "cid" | "page" | "archiveTitle" | "partTitle" | "remoteFilename" | "confidence"
+  >
+> &
+  Pick<LocalUploadedFileMatch, "localPath" | "fileName" | "root" | "size" | "mtimeMs" | "reason">;
+
+export type LocalUploadedFileDeletionRecord = LocalDetectedDeletionItem & {
   id: string;
   uid?: number;
   historyId?: string;
@@ -155,6 +182,7 @@ export type LocalUploadedFilesDetectionProgress = {
   stage:
     | "prepare"
     | "scan"
+    | "validate"
     | "archives"
     | "search"
     | "details"
@@ -286,7 +314,7 @@ const getLocalUploadedFileDeletions = async (
 const recordLocalUploadedFileDeletions = async (data: {
   uid?: number;
   historyId?: string;
-  items: LocalUploadedFileMatch[];
+  items: LocalDetectedDeletionItem[];
 }): Promise<{
   items: LocalUploadedFileDeletionRecord[];
 }> => {
