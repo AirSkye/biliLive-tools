@@ -310,7 +310,7 @@
             <n-button
               size="small"
               :loading="uploadingLocalUnuploaded"
-              :disabled="selectedLocalUploadGroupIds.length === 0"
+              :disabled="uploadingLocalUnuploaded || selectedLocalUploadGroupIds.length === 0"
               @click="uploadSelectedLocalGroups('direct')"
             >
               直接上传选中
@@ -319,7 +319,7 @@
               type="primary"
               size="small"
               :loading="uploadingLocalUnuploaded"
-              :disabled="selectedLocalUploadGroupIds.length === 0"
+              :disabled="uploadingLocalUnuploaded || selectedLocalUploadGroupIds.length === 0"
               @click="uploadSelectedLocalGroups('burn')"
             >
               压制上传选中
@@ -389,6 +389,7 @@
           <n-button
             type="primary"
             :loading="uploadingLocalUnuploaded"
+            :disabled="uploadingLocalUnuploaded"
             @click="confirmLocalMergeSelection"
           >
             加入上传流程
@@ -690,6 +691,15 @@ const localUnuploadedRows = computed(() => {
 });
 const selectedLocalUploadGroupIds = ref<DataTableRowKey[]>([]);
 const uploadingLocalUnuploaded = ref(false);
+type QueuedLocalUploadRecord = {
+  key: string;
+  queuedAt: number;
+};
+const LOCAL_UPLOAD_QUEUE_TTL_MS = 1000 * 60 * 60 * 24 * 3;
+const queuedLocalUploadRecords = useLocalStorage<QueuedLocalUploadRecord[]>(
+  "file-upload-local-queued-upload-records",
+  [],
+);
 const localUploadOptions = reactive({
   uploadRawWhenNoDanmu: true,
   mergeSegments: true,
@@ -708,8 +718,32 @@ const getLocalInvalidMp4RowKey = (row: LocalInvalidMp4File) => row.localPath;
 const getLocalDuplicateRowKey = (row: LocalDuplicateVideoFile) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
 const getLocalDeletionRowKey = (row: LocalUploadedFileDeletionRecord) => row.id;
+const activeLocalUploadStatuses = new Set(["queued", "running", "completed"]);
+const getQueuedLocalUploadKeySet = () => {
+  const now = Date.now();
+  return new Set(
+    queuedLocalUploadRecords.value
+      .filter((item) => item.key && now - item.queuedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS)
+      .map((item) => item.key),
+  );
+};
+const pruneQueuedLocalUploadRecords = () => {
+  const now = Date.now();
+  const activeRecords = queuedLocalUploadRecords.value.filter(
+    (item) => item.key && now - item.queuedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS,
+  );
+  if (activeRecords.length !== queuedLocalUploadRecords.value.length) {
+    queuedLocalUploadRecords.value = activeRecords;
+  }
+  return activeRecords;
+};
+const isLocalUnuploadedGroupQueued = (row: LocalUnuploadedGroup) =>
+  activeLocalUploadStatuses.has(row.uploadStatus || "") ||
+  getQueuedLocalUploadKeySet().has(row.uploadKey);
 const getEligibleLocalUnuploadedRows = () =>
-  localUnuploadedRows.value.filter((row) => row.roomId && row.hasWebhookUploadConfig);
+  localUnuploadedRows.value.filter(
+    (row) => row.roomId && row.hasWebhookUploadConfig && !isLocalUnuploadedGroupQueued(row),
+  );
 const selectAllLocalUnuploadedGroups = () => {
   selectedLocalUploadGroupIds.value = getEligibleLocalUnuploadedRows().map((row) => row.id);
 };
@@ -1325,7 +1359,8 @@ const localDuplicateColumns: DataTableColumns<LocalDuplicateVideoFile> = [
 const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   {
     type: "selection",
-    disabled: (row) => !row.roomId || !row.hasWebhookUploadConfig,
+    disabled: (row) =>
+      !row.roomId || !row.hasWebhookUploadConfig || isLocalUnuploadedGroupQueued(row),
   },
   {
     title: "主播/房间",
@@ -1372,6 +1407,23 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
     key: "mergeCandidate",
     width: 90,
     render: (row) => (row.mergeCandidate ? "可合并" : "-"),
+  },
+  {
+    title: "状态",
+    key: "uploadStatus",
+    width: 110,
+    render: (row) => {
+      if (getQueuedLocalUploadKeySet().has(row.uploadKey) && !row.uploadStatus) {
+        return "已入队";
+      }
+      if (row.uploadStatus === "queued") return "已入队";
+      if (row.uploadStatus === "running") return "处理中";
+      if (row.uploadStatus === "completed") return "已提交";
+      if (row.uploadStatus === "error") {
+        return h("span", { title: row.uploadError || "上次入队失败" }, "失败可重试");
+      }
+      return "-";
+    },
   },
   {
     title: "时间",
@@ -1505,7 +1557,11 @@ const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = 
 const uploadSelectedLocalGroups = async (mode: LocalUploadRunMode) => {
   const selectedIds = new Set(selectedLocalUploadGroupIds.value.map((item) => String(item)));
   const groups = localUnuploadedRows.value.filter(
-    (row) => selectedIds.has(row.id) && row.roomId && row.hasWebhookUploadConfig,
+    (row) =>
+      selectedIds.has(row.id) &&
+      row.roomId &&
+      row.hasWebhookUploadConfig &&
+      !isLocalUnuploadedGroupQueued(row),
   );
 
   if (groups.length === 0) {
@@ -1545,6 +1601,7 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
   const groups = pendingLocalUploadGroups.value.map((item) => {
     const row = item.row;
     return {
+      uploadKey: row.uploadKey,
       roomId: row.roomId,
       platform: row.platform,
       username: row.username,
@@ -1570,9 +1627,39 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
       },
     });
     const queuedCount = result.items.filter((item) => item.status === "queued").length;
+    const skippedDuplicateCount = result.items.filter(
+      (item) => item.status === "skipped" && item.reason?.startsWith("duplicate:"),
+    ).length;
+    const queuedKeys = result.items
+      .filter((item) => item.status === "queued" && item.uploadKey)
+      .map((item) => item.uploadKey!);
+    const now = Date.now();
+    const queuedRecordByKey = new Map(
+      pruneQueuedLocalUploadRecords().map((item) => [item.key, item]),
+    );
+    for (const key of queuedKeys) {
+      queuedRecordByKey.set(key, { key, queuedAt: now });
+    }
+    queuedLocalUploadRecords.value = Array.from(queuedRecordByKey.values()).slice(-1000);
+    if (localUploadedFilesResult.value && queuedKeys.length > 0) {
+      const queuedKeySet = new Set(queuedKeys);
+      localUploadedFilesResult.value.unuploadedGroups =
+        localUploadedFilesResult.value.unuploadedGroups.map((row) =>
+          queuedKeySet.has(row.uploadKey)
+            ? {
+                ...row,
+                uploadStatus: "queued",
+                uploadQueuedAt: now,
+                uploadUpdatedAt: now,
+              }
+            : row,
+        );
+    }
     notice.success({
       title: "已加入上传流程",
-      content: `已加入 ${queuedCount} 个分组，${
+      content: `已加入 ${queuedCount} 个分组${
+        skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
+      }，${
         pendingLocalUploadGroups.value.some((item) => item.burnDanmu) ? "压制后上传" : "直接上传"
       }任务会在队列中执行`,
       duration: 3000,

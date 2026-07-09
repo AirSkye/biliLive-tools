@@ -241,6 +241,11 @@ export type LocalUploadCandidateFile = {
 export type LocalUnuploadedGroup = {
   id: string;
   groupKey: string;
+  uploadKey: string;
+  uploadStatus?: "queued" | "running" | "completed" | "error";
+  uploadQueuedAt?: number;
+  uploadUpdatedAt?: number;
+  uploadError?: string;
   roomId?: string;
   platform?: string;
   username?: string;
@@ -388,6 +393,7 @@ const upload = async (options: {
 
 const uploadLocalUnuploaded = async (data: {
   groups: Array<{
+    uploadKey?: string;
     roomId?: string;
     platform?: string;
     username?: string;
@@ -408,6 +414,7 @@ const uploadLocalUnuploaded = async (data: {
 }): Promise<{
   status: string;
   items: Array<{
+    uploadKey?: string;
     roomId: string;
     title?: string;
     status: "queued" | "skipped";

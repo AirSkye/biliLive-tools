@@ -1,6 +1,7 @@
 import Router from "@koa/router";
 import fs from "fs-extra";
 import { omit } from "lodash-es";
+import crypto from "node:crypto";
 import path from "node:path";
 
 import { biliApi, validateBiliupConfig } from "@biliLive-tools/shared/task/bili.js";
@@ -109,6 +110,11 @@ type LocalUploadCandidateFile = {
 type LocalUnuploadedGroup = {
   id: string;
   groupKey: string;
+  uploadKey: string;
+  uploadStatus?: LocalUploadQueueStatus;
+  uploadQueuedAt?: number;
+  uploadUpdatedAt?: number;
+  uploadError?: string;
   roomId?: string;
   platform?: string;
   username?: string;
@@ -319,11 +325,30 @@ type LocalUploadedFileDeletionRecord = LocalDetectedDeletionItem & {
   deletedAt: number;
 };
 
+type LocalUploadQueueStatus = "queued" | "running" | "completed" | "error";
+
 type LocalDetectHistoryStore = {
   version: 1;
   histories: LocalDetectHistoryItem[];
   deletions: LocalUploadedFileDeletionRecord[];
+  localUploads: LocalUploadQueueItem[];
 };
+
+type LocalUploadQueueItem = {
+  key: string;
+  roomId?: string;
+  platform?: string;
+  title?: string;
+  filePaths: string[];
+  status: LocalUploadQueueStatus;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number;
+  error?: string;
+};
+
+const LOCAL_UPLOAD_QUEUE_TTL_MS = 1000 * 60 * 60 * 24 * 3;
+const localUploadQueueItems = new Map<string, LocalUploadQueueItem>();
 
 const getQueryValue = (value: unknown) => {
   if (Array.isArray(value)) return value[0];
@@ -475,6 +500,7 @@ const createEmptyLocalDetectHistoryStore = (): LocalDetectHistoryStore => ({
   version: 1,
   histories: [],
   deletions: [],
+  localUploads: [],
 });
 
 const readLocalDetectHistoryStore = async (): Promise<LocalDetectHistoryStore> => {
@@ -488,6 +514,7 @@ const readLocalDetectHistoryStore = async (): Promise<LocalDetectHistoryStore> =
       version: 1,
       histories: Array.isArray(data.histories) ? data.histories : [],
       deletions: Array.isArray(data.deletions) ? data.deletions : [],
+      localUploads: Array.isArray(data.localUploads) ? data.localUploads : [],
     };
   } catch (error) {
     return createEmptyLocalDetectHistoryStore();
@@ -503,9 +530,75 @@ const writeLocalDetectHistoryStore = async (store: LocalDetectHistoryStore) => {
       version: 1,
       histories: store.histories.slice(0, LOCAL_DETECT_HISTORY_LIMIT),
       deletions: store.deletions.slice(0, LOCAL_DETECT_DELETION_LIMIT),
+      localUploads: store.localUploads
+        .filter((item) => Date.now() - item.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS)
+        .slice(0, 3000),
     },
     { spaces: 2 },
   );
+};
+
+const normalizeLocalUploadFilePath = (filePath: string) => normalizeLocalPath(filePath);
+
+const buildLocalUploadKey = (files: Array<{ path: string }>) => {
+  const filePaths = Array.from(
+    new Set(files.map((file) => normalizeLocalUploadFilePath(file.path)).filter(Boolean)),
+  ).sort();
+  const key = crypto.createHash("sha1").update(filePaths.join("\n")).digest("hex");
+  return { key, filePaths };
+};
+
+const isActiveLocalUploadStatus = (status?: LocalUploadQueueItem["status"]) =>
+  status === "queued" || status === "running" || status === "completed";
+
+const cleanupLocalUploadQueueStore = (store: LocalDetectHistoryStore) => {
+  const now = Date.now();
+  store.localUploads = (store.localUploads ?? []).filter(
+    (item) => now - item.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS,
+  );
+  for (const [key, item] of localUploadQueueItems) {
+    if (now - item.updatedAt > LOCAL_UPLOAD_QUEUE_TTL_MS) {
+      localUploadQueueItems.delete(key);
+    }
+  }
+};
+
+const getLocalUploadQueueItem = async (key: string) => {
+  const memoryItem = localUploadQueueItems.get(key);
+  if (memoryItem && Date.now() - memoryItem.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS) {
+    return memoryItem;
+  }
+  const store = await readLocalDetectHistoryStore();
+  cleanupLocalUploadQueueStore(store);
+  const stored = store.localUploads.find((item) => item.key === key);
+  if (stored) localUploadQueueItems.set(key, stored);
+  return stored;
+};
+
+const saveLocalUploadQueueItem = async (item: LocalUploadQueueItem) => {
+  localUploadQueueItems.set(item.key, item);
+  const store = await readLocalDetectHistoryStore();
+  cleanupLocalUploadQueueStore(store);
+  store.localUploads = [item, ...store.localUploads.filter((record) => record.key !== item.key)];
+  await writeLocalDetectHistoryStore(store);
+};
+
+const updateLocalUploadQueueStatus = async (
+  key: string,
+  status: LocalUploadQueueItem["status"],
+  error?: string,
+) => {
+  const current = localUploadQueueItems.get(key) ?? (await getLocalUploadQueueItem(key));
+  if (!current) return;
+  const now = Date.now();
+  const next: LocalUploadQueueItem = {
+    ...current,
+    status,
+    updatedAt: now,
+    completedAt: status === "completed" || status === "error" ? now : current.completedAt,
+    error,
+  };
+  await saveLocalUploadQueueItem(next);
 };
 
 const summarizeLocalDetectHistory = (item: LocalDetectHistoryItem): LocalDetectHistorySummary => ({
@@ -691,6 +784,43 @@ const formatDateKey = (timestamp?: number) => {
   const month = `${date.getMonth() + 1}`.padStart(2, "0");
   const day = `${date.getDate()}`.padStart(2, "0");
   return `${year}${month}${day}`;
+};
+
+const shiftDateKey = (dateKey: string, offsetDays: number) => {
+  if (!/^\d{8}$/.test(dateKey)) return undefined;
+  const year = Number(dateKey.slice(0, 4));
+  const month = Number(dateKey.slice(4, 6));
+  const day = Number(dateKey.slice(6, 8));
+  const date = new Date(year, month - 1, day + offsetDays);
+  return formatDateKey(date.getTime());
+};
+
+const getRecorderHour = (timestamp?: number, time?: string) => {
+  if (timestamp && Number.isFinite(timestamp)) return new Date(timestamp).getHours();
+  if (time && /^\d{6}$/.test(time)) {
+    const hour = Number(time.slice(0, 2));
+    return Number.isFinite(hour) ? hour : undefined;
+  }
+  return undefined;
+};
+
+const buildLiveDateKeyCandidates = (dateKey?: string, timestamp?: number, time?: string) => {
+  const keys = new Set<string>();
+  if (!dateKey) return keys;
+  keys.add(dateKey);
+
+  const hour = getRecorderHour(timestamp, time);
+  if (hour === undefined) return keys;
+  if (hour < 8) {
+    const previous = shiftDateKey(dateKey, -1);
+    if (previous) keys.add(previous);
+  }
+  if (hour >= 18) {
+    const next = shiftDateKey(dateKey, 1);
+    if (next) keys.add(next);
+  }
+
+  return keys;
 };
 
 const parseRecorderFileName = (stem: string): ParsedLocalMetadata => {
@@ -2100,14 +2230,84 @@ const addLocalUploadStreamerOption = (
   });
 };
 
-const scanStreamerDirsFromRoots = async (roots: string[]) => {
+type KnownLocalStreamer = {
+  roomId: string;
+  username: string;
+  platform: string;
+};
+
+const normalizeDirectoryPlatform = (value?: string | null) => {
+  const normalized = normalizeMatchText(value);
+  if (!normalized) return undefined;
+  const aliases: Record<string, string> = {
+    bilibili: "bilibili",
+    哔哩哔哩: "bilibili",
+    b站: "bilibili",
+    douyin: "douyin",
+    抖音: "douyin",
+    douyu: "douyu",
+    斗鱼: "douyu",
+    huya: "huya",
+    虎牙: "huya",
+    xhs: "xhs",
+    小红书: "xhs",
+  };
+  return aliases[normalized];
+};
+
+const buildKnownLocalStreamerIndexes = (streamers: Streamer[]) => {
+  const byName = new Map<string, KnownLocalStreamer[]>();
+  const byRoomId = new Map<string, KnownLocalStreamer[]>();
+
+  const append = (
+    map: Map<string, KnownLocalStreamer[]>,
+    key: string,
+    item: KnownLocalStreamer,
+  ) => {
+    if (!key) return;
+    const list = map.get(key) ?? [];
+    list.push(item);
+    map.set(key, list);
+  };
+
+  for (const streamer of streamers) {
+    const item: KnownLocalStreamer = {
+      roomId: String(streamer.room_id),
+      username: streamer.name,
+      platform: normalizeStreamerPlatform(streamer.platform),
+    };
+    append(byName, normalizeMatchText(streamer.name), item);
+    append(byRoomId, String(streamer.room_id), item);
+  }
+
+  const pick = (items: KnownLocalStreamer[] | undefined, platform?: string) => {
+    if (!items?.length) return null;
+    const normalizedPlatform = platform ? normalizeStreamerPlatform(platform) : undefined;
+    const filtered = normalizedPlatform
+      ? items.filter((item) => item.platform === normalizedPlatform)
+      : items;
+    if (filtered.length === 1) return filtered[0];
+    return null;
+  };
+
+  return {
+    matchDirectoryName(dirName: string, platform?: string) {
+      const normalizedName = normalizeMatchText(dirName);
+      return pick(byName.get(normalizedName), platform) ?? pick(byRoomId.get(dirName), platform);
+    },
+  };
+};
+
+const scanStreamerDirsFromRoots = async (roots: string[], knownStreamers: Streamer[]) => {
   type DirectoryStreamer = {
     roomId: string;
     username: string;
+    platform: string;
     localSizeBytes: number;
     localFolderCount: number;
   };
   const streamers = new Map<string, DirectoryStreamer>();
+  const knownStreamerIndexes = buildKnownLocalStreamerIndexes(knownStreamers);
   const visitedDirs = new Set<string>();
   const countedStreamerDirs = new Set<string>();
   const maxDepth = 8;
@@ -2118,21 +2318,32 @@ const scanStreamerDirsFromRoots = async (roots: string[]) => {
     const stack: Array<{
       dir: string;
       depth: number;
-      streamer?: { roomId: string; username: string };
+      platform?: string;
+      streamer?: KnownLocalStreamer;
     }> = [{ dir: root, depth: 0 }];
     while (stack.length > 0 && visitedCount < maxDirs) {
-      const { dir, depth, streamer } = stack.pop()!;
+      const { dir, depth, platform, streamer } = stack.pop()!;
       const realDir = await fs.realpath(dir).catch(() => dir);
       const dirKey = normalizeLocalPath(realDir);
       if (visitedDirs.has(dirKey)) continue;
       visitedDirs.add(dirKey);
       visitedCount += 1;
 
-      const ownStreamer = parseRoomDirectoryName(path.basename(dir));
+      const dirName = path.basename(dir);
+      const currentPlatform = normalizeDirectoryPlatform(dirName) ?? platform;
+      const roomDirStreamer = parseRoomDirectoryName(dirName);
+      const ownStreamer =
+        roomDirStreamer && roomDirStreamer.roomId
+          ? {
+              ...roomDirStreamer,
+              platform: currentPlatform ?? "bilibili",
+            }
+          : knownStreamerIndexes.matchDirectoryName(dirName, currentPlatform);
       const currentStreamer = ownStreamer ?? streamer;
       if (ownStreamer && !countedStreamerDirs.has(dirKey)) {
         countedStreamerDirs.add(dirKey);
-        const key = getStreamerFilterKey(ownStreamer.roomId, "bilibili") ?? ownStreamer.roomId;
+        const key =
+          getStreamerFilterKey(ownStreamer.roomId, ownStreamer.platform) ?? ownStreamer.roomId;
         const current = streamers.get(key);
         if (current) {
           if (!current.username || current.username === current.roomId) {
@@ -2164,7 +2375,12 @@ const scanStreamerDirsFromRoots = async (roots: string[]) => {
         }
         if (isDirectory) {
           if (depth < maxDepth) {
-            stack.push({ dir: fullPath, depth: depth + 1, streamer: currentStreamer });
+            stack.push({
+              dir: fullPath,
+              depth: depth + 1,
+              platform: currentPlatform,
+              streamer: currentStreamer,
+            });
           }
           continue;
         }
@@ -2173,7 +2389,8 @@ const scanStreamerDirsFromRoots = async (roots: string[]) => {
           const stat = await fs.stat(fullPath).catch(() => null);
           if (stat?.isFile()) {
             const key =
-              getStreamerFilterKey(currentStreamer.roomId, "bilibili") ?? currentStreamer.roomId;
+              getStreamerFilterKey(currentStreamer.roomId, currentStreamer.platform) ??
+              currentStreamer.roomId;
             const current = streamers.get(key);
             if (current) {
               current.localSizeBytes += stat.size;
@@ -2195,7 +2412,8 @@ const scanStreamerDirsFromRoots = async (roots: string[]) => {
 
 const listLocalUploadStreamers = async (): Promise<LocalUploadStreamerOption[]> => {
   const map = new Map<string, LocalUploadStreamerOption>();
-  for (const streamer of streamerService.list()) {
+  const knownStreamers = streamerService.list();
+  for (const streamer of knownStreamers) {
     addLocalUploadStreamerOption(map, {
       roomId: streamer.room_id,
       platform: streamer.platform,
@@ -2204,11 +2422,11 @@ const listLocalUploadStreamers = async (): Promise<LocalUploadStreamerOption[]> 
   }
 
   const rootResult = await resolveScanRoots();
-  const directoryStreamers = await scanStreamerDirsFromRoots(rootResult.roots);
+  const directoryStreamers = await scanStreamerDirsFromRoots(rootResult.roots, knownStreamers);
   for (const streamer of directoryStreamers) {
     addLocalUploadStreamerOption(map, {
       roomId: streamer.roomId,
-      platform: "bilibili",
+      platform: streamer.platform,
       name: streamer.username,
       localSizeBytes: streamer.localSizeBytes,
       localFolderCount: streamer.localFolderCount,
@@ -2228,9 +2446,14 @@ const remotePartMatchesLocalGroup = (context: LocalFileContext, remotePart: Remo
   const localIdentity = parseRecorderIdentity(context.localFile.fileName);
   const localRoomId = localIdentity?.roomId || context.roomId;
   const localDateKey = localIdentity?.date || formatDateKey(context.startTime);
+  const liveDateKeys = buildLiveDateKeyCandidates(
+    localDateKey,
+    localIdentity?.startTime ?? context.startTime,
+    localIdentity?.time,
+  );
   const normalizedUsername = normalizeMatchText(context.username);
   const remoteArchiveTitle = normalizeMatchText(remotePart.archiveTitle);
-  if (!localDateKey) return false;
+  if (liveDateKeys.size === 0) return false;
 
   const { streamerSearchMatched } = getSearchSignals(
     remotePart.searchKeywords,
@@ -2238,15 +2461,21 @@ const remotePartMatchesLocalGroup = (context: LocalFileContext, remotePart: Remo
     normalizedUsername,
   );
   const archiveHasUser = !!normalizedUsername && remoteArchiveTitle.includes(normalizedUsername);
-  const archiveHasDate = !!localDateKey && remoteArchiveTitle.includes(localDateKey);
+  const archiveHasDate = Array.from(liveDateKeys).some((dateKey) =>
+    remoteArchiveTitle.includes(dateKey),
+  );
   let hasSameStreamer = streamerSearchMatched || archiveHasUser;
   let hasSameDate = archiveHasDate;
 
   for (const value of remotePart.values) {
+    if (Array.from(liveDateKeys).some((dateKey) => value.normalized.includes(dateKey))) {
+      hasSameDate = true;
+    }
+
     const remoteIdentity = parseRecorderIdentity(value.raw);
     if (!remoteIdentity) continue;
 
-    if (remoteIdentity.date === localDateKey) hasSameDate = true;
+    if (liveDateKeys.has(remoteIdentity.date)) hasSameDate = true;
     if (localRoomId && remoteIdentity.roomId === localRoomId) hasSameStreamer = true;
   }
 
@@ -2261,6 +2490,17 @@ const buildUnuploadedGroups = async (
   progress?: LocalDetectProgressReporter,
 ): Promise<{ groups: LocalUnuploadedGroup[]; skippedSmallGroupCount: number }> => {
   const contexts = await buildLocalFileContexts(localFiles, matches, progress);
+  const uploadStore = await readLocalDetectHistoryStore();
+  cleanupLocalUploadQueueStore(uploadStore);
+  const localUploadStatusByKey = new Map<string, LocalUploadQueueItem>();
+  for (const item of uploadStore.localUploads) {
+    localUploadStatusByKey.set(item.key, item);
+  }
+  for (const [key, item] of localUploadQueueItems) {
+    if (Date.now() - item.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS) {
+      localUploadStatusByKey.set(key, item);
+    }
+  }
   const grouped = new Map<string, LocalFileContext[]>();
   for (const context of contexts) {
     const list = grouped.get(context.groupKey) ?? [];
@@ -2321,9 +2561,29 @@ const buildUnuploadedGroups = async (
       warnings.push("该房间未配置 webhook 上传账号或上传预设");
     }
 
+    const files = unuploaded.map((item) => ({
+      path: item.localFile.localPath,
+      fileName: item.localFile.fileName,
+      size: item.localFile.size,
+      mtimeMs: item.localFile.mtimeMs,
+      title: item.title,
+      startTime: item.startTime,
+      endTime: item.endTime,
+      danmuPath: item.danmuPath,
+      xmlDanmuPath: item.xmlDanmuPath,
+      recordId: item.record?.id,
+    }));
+    const { key: uploadKey } = buildLocalUploadKey(files);
+    const uploadStatus = localUploadStatusByKey.get(uploadKey);
+
     groups.push({
       id: uuid(),
       groupKey,
+      uploadKey,
+      uploadStatus: uploadStatus?.status,
+      uploadQueuedAt: uploadStatus?.createdAt,
+      uploadUpdatedAt: uploadStatus?.updatedAt,
+      uploadError: uploadStatus?.error,
       roomId: first.roomId,
       platform: first.platform,
       username: first.username,
@@ -2333,18 +2593,7 @@ const buildUnuploadedGroups = async (
       fileCount: unuploaded.length,
       totalSize,
       danmuCount,
-      files: unuploaded.map((item) => ({
-        path: item.localFile.localPath,
-        fileName: item.localFile.fileName,
-        size: item.localFile.size,
-        mtimeMs: item.localFile.mtimeMs,
-        title: item.title,
-        startTime: item.startTime,
-        endTime: item.endTime,
-        danmuPath: item.danmuPath,
-        xmlDanmuPath: item.xmlDanmuPath,
-        recordId: item.record?.id,
-      })),
+      files,
       suggestedAction,
       suggestedAid,
       archiveTitle: matchedArchive?.archiveTitle || titleMatchedArchiveTitle,
@@ -2897,6 +3146,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
         | "uploadRawWhenNoDanmu"
         | "mergeSegments"
       > & {
+        uploadKey?: string;
         uploadMode?: "auto" | "new" | "append";
       }
     >;
@@ -2914,6 +3164,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
   }
 
   const items: Array<{
+    uploadKey?: string;
     roomId: string;
     title?: string;
     status: "queued" | "skipped";
@@ -2940,6 +3191,35 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
       continue;
     }
 
+    const { key: uploadKey, filePaths } = buildLocalUploadKey(group.files);
+    const existingUpload = await getLocalUploadQueueItem(uploadKey);
+    const activeUpload = [existingUpload, localUploadQueueItems.get(uploadKey)].find((item) =>
+      isActiveLocalUploadStatus(item?.status),
+    );
+    if (activeUpload) {
+      items.push({
+        uploadKey,
+        roomId: group.roomId,
+        title: group.title,
+        status: "skipped",
+        reason: `duplicate:${activeUpload.status}`,
+      });
+      continue;
+    }
+
+    const now = Date.now();
+    await saveLocalUploadQueueItem({
+      key: uploadKey,
+      roomId: group.roomId,
+      platform: group.platform,
+      title: group.title,
+      filePaths,
+      status: "queued",
+      createdAt: now,
+      updatedAt: now,
+      error: undefined,
+    });
+
     const uploadOptions: LocalUploadOptions = {
       roomId: group.roomId,
       platform: group.platform,
@@ -2955,10 +3235,21 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
       files: group.files,
     };
 
-    handler.uploadLocalFiles(uploadOptions).catch((error) => {
-      console.error("uploadLocalUnuploaded failed", error);
-    });
+    void (async () => {
+      try {
+        await updateLocalUploadQueueStatus(uploadKey, "running");
+        await handler.uploadLocalFiles(uploadOptions);
+        await updateLocalUploadQueueStatus(uploadKey, "completed");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("uploadLocalUnuploaded failed", error);
+        await updateLocalUploadQueueStatus(uploadKey, "error", message).catch((updateError) => {
+          console.error("updateLocalUploadQueueStatus failed", updateError);
+        });
+      }
+    })();
     items.push({
+      uploadKey,
       roomId: group.roomId,
       title: group.title,
       status: "queued",
