@@ -695,6 +695,14 @@ type QueuedLocalUploadRecord = {
   key: string;
   queuedAt: number;
 };
+type LocalUploadStatusItem = {
+  key: string;
+  status: "missing" | "queued" | "running" | "completed" | "error";
+  createdAt?: number;
+  updatedAt?: number;
+  completedAt?: number;
+  error?: string;
+};
 const LOCAL_UPLOAD_QUEUE_TTL_MS = 1000 * 60 * 60 * 24 * 3;
 const queuedLocalUploadRecords = useLocalStorage<QueuedLocalUploadRecord[]>(
   "file-upload-local-queued-upload-records",
@@ -736,6 +744,13 @@ const pruneQueuedLocalUploadRecords = () => {
     queuedLocalUploadRecords.value = activeRecords;
   }
   return activeRecords;
+};
+const removeQueuedLocalUploadRecords = (keys: string[]) => {
+  if (keys.length === 0) return;
+  const keySet = new Set(keys);
+  queuedLocalUploadRecords.value = pruneQueuedLocalUploadRecords().filter(
+    (item) => !keySet.has(item.key),
+  );
 };
 const isLocalUnuploadedGroupQueued = (row: LocalUnuploadedGroup) =>
   activeLocalUploadStatuses.has(row.uploadStatus || "") ||
@@ -779,6 +794,71 @@ const syncLocalDetectProgress = (progress: LocalUploadedFilesDetectionProgress) 
   for (const item of logs.slice(localDetectLogCursor)) pushLocalDetectLog(item);
   localDetectLogCursor = logs.length;
 };
+const applyLocalUploadStatuses = (items: LocalUploadStatusItem[]) => {
+  const failedItems = items.filter((item) => item.status === "error" || item.status === "missing");
+  removeQueuedLocalUploadRecords(failedItems.map((item) => item.key));
+
+  if (!localUploadedFilesResult.value || items.length === 0) return failedItems;
+
+  const itemByKey = new Map(items.map((item) => [item.key, item]));
+  localUploadedFilesResult.value.unuploadedGroups =
+    localUploadedFilesResult.value.unuploadedGroups.map((row) => {
+      const item = itemByKey.get(row.uploadKey);
+      if (!item) return row;
+      if (item.status === "missing") {
+        const { uploadStatus, uploadQueuedAt, uploadUpdatedAt, uploadError, ...rest } = row;
+        return rest;
+      }
+      return {
+        ...row,
+        uploadStatus: item.status,
+        uploadQueuedAt: item.createdAt ?? row.uploadQueuedAt,
+        uploadUpdatedAt: item.updatedAt ?? row.uploadUpdatedAt,
+        uploadError: item.error,
+      };
+    });
+
+  return failedItems;
+};
+const refreshLocalUploadStatuses = async (keys: string[]) => {
+  const uniqueKeys = Array.from(new Set(keys.filter(Boolean)));
+  if (uniqueKeys.length === 0) return [];
+  const result = await biliApi.getLocalUnuploadedUploadStatuses(uniqueKeys);
+  return applyLocalUploadStatuses(result.items);
+};
+const monitorLocalUploadStatuses = async (keys: string[]) => {
+  const uniqueKeys = Array.from(new Set(keys.filter(Boolean)));
+  if (uniqueKeys.length === 0) return;
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    await waitLocalDetectPoll(attempt === 0 ? 1200 : 1500);
+    try {
+      const result = await biliApi.getLocalUnuploadedUploadStatuses(uniqueKeys);
+      const failedItems = applyLocalUploadStatuses(result.items);
+      if (failedItems.length > 0) {
+        const first = failedItems[0];
+        notice.error({
+          title: "本地补传未进入上传队列",
+          content:
+            first.status === "missing"
+              ? "未查询到这次补传记录，请重新扫描后再试"
+              : first.error || "后端创建上传任务失败",
+          duration: 6000,
+        });
+        return;
+      }
+      const pending = result.items.some(
+        (item) => item.status === "queued" || item.status === "running",
+      );
+      if (!pending) return;
+    } catch (error) {
+      pushLocalDetectLog(
+        `刷新本地补传状态失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+      return;
+    }
+  }
+};
 const resetLocalDetectView = () => {
   localDetectProgress.value = null;
   localUnuploadedSearchKeyword.value = "";
@@ -798,6 +878,20 @@ const applyLocalUploadedFilesResult = (result: LocalUploadedFilesResult) => {
   localUploadedFilesResult.value = result;
   selectedLocalDetectHistoryId.value = result.historyId ?? selectedLocalDetectHistoryId.value;
   resetLocalUnuploadedSelection();
+  const queuedKeySet = getQueuedLocalUploadKeySet();
+  const statusKeys = result.unuploadedGroups
+    .filter(
+      (row) =>
+        activeLocalUploadStatuses.has(row.uploadStatus || "") || queuedKeySet.has(row.uploadKey),
+    )
+    .map((row) => row.uploadKey);
+  if (statusKeys.length > 0) {
+    void refreshLocalUploadStatuses(statusKeys).catch((error) => {
+      pushLocalDetectLog(
+        `刷新本地补传状态失败：${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  }
 };
 const loadLocalDetectHistoryList = async () => {
   if (!userInfo.value.uid) return null;
@@ -857,11 +951,30 @@ const loadLocalDetectHistoryById = async (id: string) => {
 const refreshLocalDetectHistory = async () => {
   loadingLocalDetectHistory.value = true;
   try {
-    await Promise.all([
+    const [latest] = await Promise.all([
       loadLocalDetectHistoryList(),
       loadLocalDeletionHistory(),
       loadLocalUploadStreamers(),
     ]);
+    const currentId = selectedLocalDetectHistoryId.value;
+    const currentExists =
+      !!currentId && localDetectHistoryItems.value.some((item) => item.id === currentId);
+    const targetId = currentExists ? currentId : latest?.id;
+    if (targetId) {
+      await loadLocalDetectHistoryById(targetId);
+    } else {
+      localUploadedFilesResult.value = null;
+      selectedLocalDetectHistoryId.value = null;
+      pushLocalDetectLog("没有历史检测结果，请点击“重新扫描”生成一次检测结果");
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    pushLocalDetectLog(`刷新历史失败：${message}`);
+    notice.error({
+      title: "刷新历史失败",
+      content: message,
+      duration: 4000,
+    });
   } finally {
     loadingLocalDetectHistory.value = false;
   }
@@ -1414,9 +1527,9 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
     width: 110,
     render: (row) => {
       if (getQueuedLocalUploadKeySet().has(row.uploadKey) && !row.uploadStatus) {
-        return "已入队";
+        return "提交中";
       }
-      if (row.uploadStatus === "queued") return "已入队";
+      if (row.uploadStatus === "queued") return "提交中";
       if (row.uploadStatus === "running") return "处理中";
       if (row.uploadStatus === "completed") return "已提交";
       if (row.uploadStatus === "error") {
@@ -1655,6 +1768,7 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
             : row,
         );
     }
+    void monitorLocalUploadStatuses(queuedKeys);
     notice.success({
       title: "已加入上传流程",
       content: `已加入 ${queuedCount} 个分组${

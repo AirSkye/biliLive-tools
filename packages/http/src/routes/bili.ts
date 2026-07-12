@@ -503,6 +503,41 @@ const createEmptyLocalDetectHistoryStore = (): LocalDetectHistoryStore => ({
   localUploads: [],
 });
 
+const normalizeLocalDetectHistoryResult = (
+  result: Partial<LocalUploadedFilesResult> | undefined,
+): LocalUploadedFilesResult => ({
+  historyId: result?.historyId,
+  detectedAt: result?.detectedAt,
+  roots: Array.isArray(result?.roots) ? result.roots : [],
+  scannedFileCount: Number(result?.scannedFileCount ?? 0),
+  skippedSmallUnuploadedGroupCount: Number(result?.skippedSmallUnuploadedGroupCount ?? 0),
+  archiveCount: Number(result?.archiveCount ?? 0),
+  remotePartCount: Number(result?.remotePartCount ?? 0),
+  truncated: !!result?.truncated,
+  matches: Array.isArray(result?.matches) ? result.matches : [],
+  invalidMp4Files: Array.isArray(result?.invalidMp4Files) ? result.invalidMp4Files : [],
+  duplicateFiles: Array.isArray(result?.duplicateFiles) ? result.duplicateFiles : [],
+  unuploadedGroups: Array.isArray(result?.unuploadedGroups) ? result.unuploadedGroups : [],
+  errors: Array.isArray(result?.errors) ? result.errors : [],
+  warnings: Array.isArray(result?.warnings) ? result.warnings : [],
+  logs: Array.isArray(result?.logs) ? result.logs : [],
+});
+
+const normalizeLocalDetectHistoryItem = (
+  item: Partial<LocalDetectHistoryItem>,
+): LocalDetectHistoryItem => {
+  const result = normalizeLocalDetectHistoryResult(item.result);
+  return {
+    id: item.id || uuid(),
+    uid: Number(item.uid ?? 0),
+    createdAt: Number(item.createdAt ?? result.detectedAt ?? Date.now()),
+    options: (item.options ?? {}) as LocalDetectOptions,
+    result,
+    initialMatchCount: Number(item.initialMatchCount ?? result.matches.length),
+    deletedCount: Number(item.deletedCount ?? 0),
+  };
+};
+
 const readLocalDetectHistoryStore = async (): Promise<LocalDetectHistoryStore> => {
   const filePath = getLocalDetectHistoryFile();
   if (!(await fs.pathExists(filePath))) {
@@ -512,12 +547,15 @@ const readLocalDetectHistoryStore = async (): Promise<LocalDetectHistoryStore> =
     const data = (await fs.readJson(filePath)) as Partial<LocalDetectHistoryStore>;
     return {
       version: 1,
-      histories: Array.isArray(data.histories) ? data.histories : [],
+      histories: Array.isArray(data.histories)
+        ? data.histories.map((item) => normalizeLocalDetectHistoryItem(item))
+        : [],
       deletions: Array.isArray(data.deletions) ? data.deletions : [],
       localUploads: Array.isArray(data.localUploads) ? data.localUploads : [],
     };
   } catch (error) {
-    return createEmptyLocalDetectHistoryStore();
+    console.error(`read local detect history failed: ${filePath}`, error);
+    throw new Error(`读取本地检测历史失败：${filePath}`);
   }
 };
 
@@ -1331,9 +1369,32 @@ const getRecordingDedupKey = (localFile: LocalVideoFile) => {
   return buildRecorderIdentityKeys(localFile.fileName, localFile.stem)[0];
 };
 
-const getLocalFilePriority = (localFile: LocalVideoFile) => {
+const SUSPICIOUS_PROCESSED_MP4_MAX_BYTES = 128 * 1024 * 1024;
+const SUSPICIOUS_PROCESSED_MP4_SOURCE_BYTES = 1024 * 1024 * 1024;
+const SUSPICIOUS_PROCESSED_MP4_MAX_RATIO = 0.1;
+const processedMp4Pattern =
+  /(?:\u5f39\u5e55\u7248|danmu|subtitle|\u540e\u5904\u7406|\u5408\u5e76|handled|merged)/i;
+
+const isProcessedMp4Candidate = (localFile: LocalVideoFile) => {
+  return (
+    path.extname(localFile.fileName).toLowerCase() === ".mp4" &&
+    processedMp4Pattern.test(localFile.stem)
+  );
+};
+
+const isSuspiciousProcessedMp4 = (localFile: LocalVideoFile, groupMaxSize: number) => {
+  return (
+    isProcessedMp4Candidate(localFile) &&
+    groupMaxSize >= SUSPICIOUS_PROCESSED_MP4_SOURCE_BYTES &&
+    localFile.size < SUSPICIOUS_PROCESSED_MP4_MAX_BYTES &&
+    localFile.size < groupMaxSize * SUSPICIOUS_PROCESSED_MP4_MAX_RATIO
+  );
+};
+
+const getLocalFilePriority = (localFile: LocalVideoFile, groupMaxSize = localFile.size) => {
   const ext = path.extname(localFile.fileName).toLowerCase();
   const stem = localFile.stem.toLowerCase();
+  if (isSuspiciousProcessedMp4(localFile, groupMaxSize)) return 150;
   if (ext === ".mp4" && /弹幕版|danmu|subtitle/.test(stem)) return 500;
   if (ext === ".mp4" && /后处理|合并|handled|merged/.test(stem)) return 450;
   if (ext === ".mp4") return 400;
@@ -1343,8 +1404,10 @@ const getLocalFilePriority = (localFile: LocalVideoFile) => {
 };
 
 const choosePrimaryLocalRecordingFile = (files: LocalVideoFile[]) => {
+  const groupMaxSize = Math.max(...files.map((file) => file.size));
   return [...files].sort((left, right) => {
-    const priorityDiff = getLocalFilePriority(right) - getLocalFilePriority(left);
+    const priorityDiff =
+      getLocalFilePriority(right, groupMaxSize) - getLocalFilePriority(left, groupMaxSize);
     if (priorityDiff !== 0) return priorityDiff;
     const mtimeDiff = right.mtimeMs - left.mtimeMs;
     if (mtimeDiff !== 0) return mtimeDiff;
@@ -3128,6 +3191,47 @@ router.get("/localUploadedFiles/detect/:id", async (ctx) => {
     return;
   }
   ctx.body = job;
+});
+
+router.get("/uploadLocalUnuploaded/status", async (ctx) => {
+  const rawKeys = Array.isArray(ctx.request.query.keys)
+    ? ctx.request.query.keys.join(",")
+    : String(ctx.request.query.keys ?? "");
+  const keys = Array.from(
+    new Set(
+      rawKeys
+        .split(",")
+        .map((key) => key.trim())
+        .filter(Boolean),
+    ),
+  ).slice(0, 200);
+
+  const items: Array<
+    Omit<Partial<LocalUploadQueueItem>, "status"> & {
+      key: string;
+      status: LocalUploadQueueStatus | "missing";
+    }
+  > = [];
+  for (const key of keys) {
+    const item = await getLocalUploadQueueItem(key);
+    if (!item) {
+      items.push({ key, status: "missing" });
+      continue;
+    }
+    items.push({
+      key,
+      roomId: item.roomId,
+      platform: item.platform,
+      title: item.title,
+      status: item.status,
+      createdAt: item.createdAt,
+      updatedAt: item.updatedAt,
+      completedAt: item.completedAt,
+      error: item.error,
+    });
+  }
+
+  ctx.body = { items };
 });
 
 router.post("/uploadLocalUnuploaded", async (ctx) => {

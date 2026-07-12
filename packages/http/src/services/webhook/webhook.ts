@@ -743,7 +743,7 @@ export class WebhookHandler {
 
       this.liveManager.addLive(live);
       this.releaseLocalUploadReservations(reservedPaths);
-      await this.uploadVideoByType(live, "handled");
+      await this.uploadVideoByType(live, "handled", { throwOnFailure: true });
 
       return {
         eventId: live.eventId,
@@ -2416,7 +2416,11 @@ export class WebhookHandler {
    * 上传单个类型的视频（弹幕版或原始版）
    * @private
    */
-  private async uploadVideoByType(live: Live, type: "raw" | "handled") {
+  private async uploadVideoByType(
+    live: Live,
+    type: "raw" | "handled",
+    options: { throwOnFailure?: boolean } = {},
+  ) {
     const aidField = type === "handled" ? "aid" : "rawAid";
 
     // 1. 检查是否有正在上传的分段
@@ -2424,7 +2428,12 @@ export class WebhookHandler {
 
     // 2. 获取可上传的分段列表
     const uploadableParts = live.getUploadableParts(type);
-    if (uploadableParts.length === 0) return;
+    if (uploadableParts.length === 0) {
+      if (options.throwOnFailure) {
+        throw new Error("没有可上传的本地文件分P");
+      }
+      return;
+    }
 
     // 3. 获取配置
     const config = this.configManager.getConfig(live.roomId);
@@ -2434,6 +2443,9 @@ export class WebhookHandler {
 
     // 5. 验证上传配置
     if (!this.validateUploadConfig(live, filePaths, type, config)) {
+      if (options.throwOnFailure) {
+        throw new Error("上传配置校验失败，请检查 webhook 上传账号、预设和无弹幕上传设置");
+      }
       return;
     }
 
@@ -2468,6 +2480,9 @@ export class WebhookHandler {
         "error",
         type,
       );
+      if (options.throwOnFailure) {
+        throw error;
+      }
     }
   }
 

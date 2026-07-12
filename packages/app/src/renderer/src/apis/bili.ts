@@ -425,6 +425,27 @@ const uploadLocalUnuploaded = async (data: {
   return res.data;
 };
 
+const getLocalUnuploadedUploadStatuses = async (
+  keys: string[],
+): Promise<{
+  items: Array<{
+    key: string;
+    roomId?: string;
+    platform?: string;
+    title?: string;
+    status: "missing" | "queued" | "running" | "completed" | "error";
+    createdAt?: number;
+    updatedAt?: number;
+    completedAt?: number;
+    error?: string;
+  }>;
+}> => {
+  const res = await request.get("/bili/uploadLocalUnuploaded/status", {
+    params: { keys: keys.join(",") },
+  });
+  return res.data;
+};
+
 export const formatWebhookTitle = async (
   template: string,
   options?: {
@@ -504,6 +525,7 @@ const bili = {
   loginPoll,
   upload,
   uploadLocalUnuploaded,
+  getLocalUnuploadedUploadStatuses,
   formatWebhookTitle,
   formatWebhookPartTitle,
   formatWebhookDesc,
