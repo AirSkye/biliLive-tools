@@ -602,9 +602,6 @@ const buildLocalUploadKey = (
   return { key, filePaths };
 };
 
-const isActiveLocalUploadStatus = (status?: LocalUploadQueueItem["status"]) =>
-  status === "queued" || status === "running" || status === "completed";
-
 const isRunningLocalUploadStatus = (status?: LocalUploadQueueItem["status"]) =>
   status === "queued" || status === "running";
 
