@@ -125,6 +125,7 @@ export type LocalUploadStreamerOption = {
   platform: string;
   name: string;
   hasWebhookUploadConfig: boolean;
+  hasWebhookSyncConfig: boolean;
   localSizeBytes: number;
   localFolderCount: number;
 };
@@ -242,10 +243,15 @@ export type LocalUnuploadedGroup = {
   id: string;
   groupKey: string;
   uploadKey: string;
+  syncKey?: string;
   uploadStatus?: "queued" | "running" | "completed" | "error";
   uploadQueuedAt?: number;
   uploadUpdatedAt?: number;
   uploadError?: string;
+  syncStatus?: "queued" | "running" | "completed" | "error";
+  syncQueuedAt?: number;
+  syncUpdatedAt?: number;
+  syncError?: string;
   roomId?: string;
   platform?: string;
   username?: string;
@@ -261,6 +267,7 @@ export type LocalUnuploadedGroup = {
   archiveTitle?: string;
   mergeCandidate: boolean;
   hasWebhookUploadConfig: boolean;
+  hasWebhookSyncConfig: boolean;
   warnings: string[];
 };
 
@@ -425,11 +432,36 @@ const uploadLocalUnuploaded = async (data: {
   return res.data;
 };
 
+const syncLocalUnuploaded = async (data: {
+  groups: Array<{
+    syncKey?: string;
+    roomId?: string;
+    platform?: string;
+    username?: string;
+    title?: string;
+    startTime?: number;
+    files: LocalUploadCandidateFile[];
+  }>;
+}): Promise<{
+  status: string;
+  items: Array<{
+    syncKey?: string;
+    roomId: string;
+    title?: string;
+    status: "queued" | "skipped";
+    reason?: string;
+  }>;
+}> => {
+  const res = await request.post("/bili/syncLocalUnuploaded", data);
+  return res.data;
+};
+
 const getLocalUnuploadedUploadStatuses = async (
   keys: string[],
 ): Promise<{
   items: Array<{
     key: string;
+    operation?: "upload" | "sync";
     roomId?: string;
     platform?: string;
     title?: string;
@@ -525,6 +557,7 @@ const bili = {
   loginPoll,
   upload,
   uploadLocalUnuploaded,
+  syncLocalUnuploaded,
   getLocalUnuploadedUploadStatuses,
   formatWebhookTitle,
   formatWebhookPartTitle,

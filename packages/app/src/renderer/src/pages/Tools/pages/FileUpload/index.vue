@@ -310,7 +310,11 @@
             <n-button
               size="small"
               :loading="uploadingLocalUnuploaded"
-              :disabled="uploadingLocalUnuploaded || selectedLocalUploadGroupIds.length === 0"
+              :disabled="
+                uploadingLocalUnuploaded ||
+                syncingLocalUnuploaded ||
+                selectedLocalUploadGroupIds.length === 0
+              "
               @click="uploadSelectedLocalGroups('direct')"
             >
               直接上传选中
@@ -319,10 +323,26 @@
               type="primary"
               size="small"
               :loading="uploadingLocalUnuploaded"
-              :disabled="uploadingLocalUnuploaded || selectedLocalUploadGroupIds.length === 0"
+              :disabled="
+                uploadingLocalUnuploaded ||
+                syncingLocalUnuploaded ||
+                selectedLocalUploadGroupIds.length === 0
+              "
               @click="uploadSelectedLocalGroups('burn')"
             >
               压制上传选中
+            </n-button>
+            <n-button
+              size="small"
+              :loading="syncingLocalUnuploaded"
+              :disabled="
+                uploadingLocalUnuploaded ||
+                syncingLocalUnuploaded ||
+                selectedLocalUploadGroupIds.length === 0
+              "
+              @click="syncSelectedLocalGroups"
+            >
+              同步网盘选中
             </n-button>
           </div>
           <n-empty v-if="localUnuploadedRows.length === 0" description="没有检测到本地未上传文件" />
@@ -691,12 +711,14 @@ const localUnuploadedRows = computed(() => {
 });
 const selectedLocalUploadGroupIds = ref<DataTableRowKey[]>([]);
 const uploadingLocalUnuploaded = ref(false);
+const syncingLocalUnuploaded = ref(false);
 type QueuedLocalUploadRecord = {
   key: string;
   queuedAt: number;
 };
 type LocalUploadStatusItem = {
   key: string;
+  operation?: "upload" | "sync";
   status: "missing" | "queued" | "running" | "completed" | "error";
   createdAt?: number;
   updatedAt?: number;
@@ -727,6 +749,11 @@ const getLocalDuplicateRowKey = (row: LocalDuplicateVideoFile) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
 const getLocalDeletionRowKey = (row: LocalUploadedFileDeletionRecord) => row.id;
 const activeLocalUploadStatuses = new Set(["queued", "running", "completed"]);
+type LocalUnuploadedOperation = "upload" | "sync";
+const getLocalUnuploadedOperationKey = (
+  row: LocalUnuploadedGroup,
+  operation: LocalUnuploadedOperation,
+) => (operation === "upload" ? row.uploadKey : row.syncKey || row.uploadKey);
 const getQueuedLocalUploadKeySet = () => {
   const now = Date.now();
   return new Set(
@@ -752,12 +779,40 @@ const removeQueuedLocalUploadRecords = (keys: string[]) => {
     (item) => !keySet.has(item.key),
   );
 };
-const isLocalUnuploadedGroupQueued = (row: LocalUnuploadedGroup) =>
-  activeLocalUploadStatuses.has(row.uploadStatus || "") ||
-  getQueuedLocalUploadKeySet().has(row.uploadKey);
+const isLocalUnuploadedOperationQueued = (
+  row: LocalUnuploadedGroup,
+  operation: LocalUnuploadedOperation,
+) => {
+  const status = operation === "upload" ? row.uploadStatus : row.syncStatus;
+  return (
+    activeLocalUploadStatuses.has(status || "") ||
+    getQueuedLocalUploadKeySet().has(getLocalUnuploadedOperationKey(row, operation))
+  );
+};
+const canUploadLocalUnuploadedGroup = (row: LocalUnuploadedGroup) =>
+  !!row.roomId && row.hasWebhookUploadConfig && !isLocalUnuploadedOperationQueued(row, "upload");
+const canSyncLocalUnuploadedGroup = (row: LocalUnuploadedGroup) =>
+  !!row.roomId && row.hasWebhookSyncConfig && !isLocalUnuploadedOperationQueued(row, "sync");
+const renderLocalOperationStatus = (
+  row: LocalUnuploadedGroup,
+  operation: LocalUnuploadedOperation,
+) => {
+  const label = operation === "upload" ? "上传" : "同步";
+  const status = operation === "upload" ? row.uploadStatus : row.syncStatus;
+  const error = operation === "upload" ? row.uploadError : row.syncError;
+  const key = getLocalUnuploadedOperationKey(row, operation);
+  if (getQueuedLocalUploadKeySet().has(key) && !status) return `${label}: 提交中`;
+  if (status === "queued") return `${label}: 提交中`;
+  if (status === "running") return `${label}: 处理中`;
+  if (status === "completed") return `${label}: 完成`;
+  if (status === "error") {
+    return h("span", { title: error || "上次任务失败" }, `${label}: 失败可重试`);
+  }
+  return "";
+};
 const getEligibleLocalUnuploadedRows = () =>
   localUnuploadedRows.value.filter(
-    (row) => row.roomId && row.hasWebhookUploadConfig && !isLocalUnuploadedGroupQueued(row),
+    (row) => canUploadLocalUnuploadedGroup(row) || canSyncLocalUnuploadedGroup(row),
   );
 const selectAllLocalUnuploadedGroups = () => {
   selectedLocalUploadGroupIds.value = getEligibleLocalUnuploadedRows().map((row) => row.id);
@@ -803,19 +858,38 @@ const applyLocalUploadStatuses = (items: LocalUploadStatusItem[]) => {
   const itemByKey = new Map(items.map((item) => [item.key, item]));
   localUploadedFilesResult.value.unuploadedGroups =
     localUploadedFilesResult.value.unuploadedGroups.map((row) => {
-      const item = itemByKey.get(row.uploadKey);
-      if (!item) return row;
-      if (item.status === "missing") {
-        const { uploadStatus, uploadQueuedAt, uploadUpdatedAt, uploadError, ...rest } = row;
-        return rest;
+      const uploadItem = itemByKey.get(row.uploadKey);
+      const syncItem = itemByKey.get(getLocalUnuploadedOperationKey(row, "sync"));
+      let next = { ...row };
+      if (uploadItem) {
+        if (uploadItem.status === "missing") {
+          const { uploadStatus, uploadQueuedAt, uploadUpdatedAt, uploadError, ...rest } = next;
+          next = rest;
+        } else {
+          next = {
+            ...next,
+            uploadStatus: uploadItem.status,
+            uploadQueuedAt: uploadItem.createdAt ?? next.uploadQueuedAt,
+            uploadUpdatedAt: uploadItem.updatedAt ?? next.uploadUpdatedAt,
+            uploadError: uploadItem.error,
+          };
+        }
       }
-      return {
-        ...row,
-        uploadStatus: item.status,
-        uploadQueuedAt: item.createdAt ?? row.uploadQueuedAt,
-        uploadUpdatedAt: item.updatedAt ?? row.uploadUpdatedAt,
-        uploadError: item.error,
-      };
+      if (syncItem) {
+        if (syncItem.status === "missing") {
+          const { syncStatus, syncQueuedAt, syncUpdatedAt, syncError, ...rest } = next;
+          next = rest;
+        } else {
+          next = {
+            ...next,
+            syncStatus: syncItem.status,
+            syncQueuedAt: syncItem.createdAt ?? next.syncQueuedAt,
+            syncUpdatedAt: syncItem.updatedAt ?? next.syncUpdatedAt,
+            syncError: syncItem.error,
+          };
+        }
+      }
+      return next;
     });
 
   return failedItems;
@@ -838,11 +912,11 @@ const monitorLocalUploadStatuses = async (keys: string[]) => {
       if (failedItems.length > 0) {
         const first = failedItems[0];
         notice.error({
-          title: "本地补传未进入上传队列",
+          title: "本地处理未进入队列",
           content:
             first.status === "missing"
-              ? "未查询到这次补传记录，请重新扫描后再试"
-              : first.error || "后端创建上传任务失败",
+              ? "未查询到这次处理记录，请重新扫描后再试"
+              : first.error || "后端创建任务失败",
           duration: 6000,
         });
         return;
@@ -853,7 +927,7 @@ const monitorLocalUploadStatuses = async (keys: string[]) => {
       if (!pending) return;
     } catch (error) {
       pushLocalDetectLog(
-        `刷新本地补传状态失败：${error instanceof Error ? error.message : String(error)}`,
+        `刷新本地处理状态失败：${error instanceof Error ? error.message : String(error)}`,
       );
       return;
     }
@@ -879,16 +953,21 @@ const applyLocalUploadedFilesResult = (result: LocalUploadedFilesResult) => {
   selectedLocalDetectHistoryId.value = result.historyId ?? selectedLocalDetectHistoryId.value;
   resetLocalUnuploadedSelection();
   const queuedKeySet = getQueuedLocalUploadKeySet();
-  const statusKeys = result.unuploadedGroups
-    .filter(
-      (row) =>
-        activeLocalUploadStatuses.has(row.uploadStatus || "") || queuedKeySet.has(row.uploadKey),
-    )
-    .map((row) => row.uploadKey);
+  const statusKeys = result.unuploadedGroups.flatMap((row) => {
+    const keys: string[] = [];
+    if (activeLocalUploadStatuses.has(row.uploadStatus || "") || queuedKeySet.has(row.uploadKey)) {
+      keys.push(row.uploadKey);
+    }
+    const syncKey = getLocalUnuploadedOperationKey(row, "sync");
+    if (activeLocalUploadStatuses.has(row.syncStatus || "") || queuedKeySet.has(syncKey)) {
+      keys.push(syncKey);
+    }
+    return keys;
+  });
   if (statusKeys.length > 0) {
     void refreshLocalUploadStatuses(statusKeys).catch((error) => {
       pushLocalDetectLog(
-        `刷新本地补传状态失败：${error instanceof Error ? error.message : String(error)}`,
+        `刷新本地处理状态失败：${error instanceof Error ? error.message : String(error)}`,
       );
     });
   }
@@ -1472,8 +1551,7 @@ const localDuplicateColumns: DataTableColumns<LocalDuplicateVideoFile> = [
 const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   {
     type: "selection",
-    disabled: (row) =>
-      !row.roomId || !row.hasWebhookUploadConfig || isLocalUnuploadedGroupQueued(row),
+    disabled: (row) => !canUploadLocalUnuploadedGroup(row) && !canSyncLocalUnuploadedGroup(row),
   },
   {
     title: "主播/房间",
@@ -1524,18 +1602,18 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   {
     title: "状态",
     key: "uploadStatus",
-    width: 110,
+    width: 140,
     render: (row) => {
-      if (getQueuedLocalUploadKeySet().has(row.uploadKey) && !row.uploadStatus) {
-        return "提交中";
-      }
-      if (row.uploadStatus === "queued") return "提交中";
-      if (row.uploadStatus === "running") return "处理中";
-      if (row.uploadStatus === "completed") return "已提交";
-      if (row.uploadStatus === "error") {
-        return h("span", { title: row.uploadError || "上次入队失败" }, "失败可重试");
-      }
-      return "-";
+      const items = [
+        renderLocalOperationStatus(row, "upload"),
+        renderLocalOperationStatus(row, "sync"),
+      ].filter(Boolean);
+      if (items.length === 0) return "-";
+      return h(
+        "div",
+        { class: "local-status-list" },
+        items.map((item) => h("div", {}, [item])),
+      );
     },
   },
   {
@@ -1670,11 +1748,7 @@ const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = 
 const uploadSelectedLocalGroups = async (mode: LocalUploadRunMode) => {
   const selectedIds = new Set(selectedLocalUploadGroupIds.value.map((item) => String(item)));
   const groups = localUnuploadedRows.value.filter(
-    (row) =>
-      selectedIds.has(row.id) &&
-      row.roomId &&
-      row.hasWebhookUploadConfig &&
-      !isLocalUnuploadedGroupQueued(row),
+    (row) => selectedIds.has(row.id) && canUploadLocalUnuploadedGroup(row),
   );
 
   if (groups.length === 0) {
@@ -1790,6 +1864,83 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     });
   } finally {
     uploadingLocalUnuploaded.value = false;
+  }
+};
+
+const syncSelectedLocalGroups = async () => {
+  const selectedIds = new Set(selectedLocalUploadGroupIds.value.map((item) => String(item)));
+  const groups = localUnuploadedRows.value.filter(
+    (row) => selectedIds.has(row.id) && canSyncLocalUnuploadedGroup(row),
+  );
+
+  if (groups.length === 0) {
+    notice.warning({
+      title: "没有可同步的分组",
+      content: "请先选择已识别房间且已配置 webhook 同步器的分组",
+      duration: 3000,
+    });
+    return;
+  }
+
+  syncingLocalUnuploaded.value = true;
+  try {
+    const result = await biliApi.syncLocalUnuploaded({
+      groups: groups.map((row) => ({
+        syncKey: row.syncKey,
+        roomId: row.roomId,
+        platform: row.platform,
+        username: row.username,
+        title: row.title,
+        startTime: row.startTime,
+        files: row.files,
+      })),
+    });
+    const queuedCount = result.items.filter((item) => item.status === "queued").length;
+    const skippedDuplicateCount = result.items.filter(
+      (item) => item.status === "skipped" && item.reason?.startsWith("duplicate:"),
+    ).length;
+    const queuedKeys = result.items
+      .filter((item) => item.status === "queued" && item.syncKey)
+      .map((item) => item.syncKey!);
+    const now = Date.now();
+    const queuedRecordByKey = new Map(
+      pruneQueuedLocalUploadRecords().map((item) => [item.key, item]),
+    );
+    for (const key of queuedKeys) {
+      queuedRecordByKey.set(key, { key, queuedAt: now });
+    }
+    queuedLocalUploadRecords.value = Array.from(queuedRecordByKey.values()).slice(-1000);
+    if (localUploadedFilesResult.value && queuedKeys.length > 0) {
+      const queuedKeySet = new Set(queuedKeys);
+      localUploadedFilesResult.value.unuploadedGroups =
+        localUploadedFilesResult.value.unuploadedGroups.map((row) =>
+          queuedKeySet.has(getLocalUnuploadedOperationKey(row, "sync"))
+            ? {
+                ...row,
+                syncStatus: "queued",
+                syncQueuedAt: now,
+                syncUpdatedAt: now,
+              }
+            : row,
+        );
+    }
+    void monitorLocalUploadStatuses(queuedKeys);
+    notice.success({
+      title: "已加入同步流程",
+      content: `已加入 ${queuedCount} 个分组${
+        skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
+      }，会按 webhook 同步器配置同步到网盘`,
+      duration: 3000,
+    });
+    selectedLocalUploadGroupIds.value = [];
+  } catch (error) {
+    notice.error({
+      title: "加入同步流程失败",
+      content: error instanceof Error ? error.message : String(error),
+      duration: 3000,
+    });
+  } finally {
+    syncingLocalUnuploaded.value = false;
   }
 };
 

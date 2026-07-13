@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -153,6 +154,20 @@ class ReleaseBuild:
                 return value
         return ""
 
+    @staticmethod
+    def _is_retryable_http_error(error: urllib.error.HTTPError, raw: str) -> bool:
+        if error.code in {429, 500, 502, 503, 504}:
+            return True
+        return error.code == 403 and "rate limit" in raw.lower()
+
+    def _github_retry_delay(self, attempt: int, error: urllib.error.HTTPError | None = None) -> float:
+        if error is not None:
+            retry_after = error.headers.get("Retry-After")
+            if retry_after and retry_after.isdigit():
+                return min(float(retry_after), 60.0)
+        base = max(float(self.args.api_retry_base_seconds), 0.1)
+        return min(base * (2 ** max(attempt - 1, 0)), 30.0)
+
     def github_api(self, path: str, *, method: str = "GET", body: dict[str, Any] | None = None) -> Any:
         url = f"https://api.github.com/repos/{self.repo_slug}/{path}"
         headers = {
@@ -169,16 +184,40 @@ class ReleaseBuild:
             headers["Content-Type"] = "application/json"
 
         self.log(f"GitHub API {method} {path}", "API")
-        request = urllib.request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.args.api_timeout_seconds) as response:
-                raw = response.read()
-                if not raw:
-                    return None
-                return json.loads(raw.decode("utf-8"))
-        except urllib.error.HTTPError as error:
-            raw = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"GitHub API 失败：{method} {path} -> HTTP {error.code}: {raw}") from error
+        attempts = max(int(self.args.api_retries), 0) + 1
+        for attempt in range(1, attempts + 1):
+            request = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=self.args.api_timeout_seconds) as response:
+                    raw = response.read()
+                    if not raw:
+                        return None
+                    return json.loads(raw.decode("utf-8"))
+            except urllib.error.HTTPError as error:
+                raw = error.read().decode("utf-8", errors="replace")
+                if attempt < attempts and self._is_retryable_http_error(error, raw):
+                    delay = self._github_retry_delay(attempt, error)
+                    self.log(
+                        f"GitHub API 暂时失败，{delay:.1f}s 后重试 "
+                        f"({attempt}/{attempts - 1})：HTTP {error.code}",
+                        "WARN",
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"GitHub API 失败：{method} {path} -> HTTP {error.code}: {raw}") from error
+            except (urllib.error.URLError, TimeoutError, ssl.SSLError, ConnectionResetError, OSError) as error:
+                if attempt < attempts:
+                    delay = self._github_retry_delay(attempt)
+                    self.log(
+                        f"GitHub API 网络异常，{delay:.1f}s 后重试 "
+                        f"({attempt}/{attempts - 1})：{type(error).__name__}: {error}",
+                        "WARN",
+                    )
+                    time.sleep(delay)
+                    continue
+                raise RuntimeError(f"GitHub API 网络失败：{method} {path} -> {error}") from error
+
+        raise RuntimeError(f"GitHub API 网络失败：{method} {path}")
 
     def resolve_repo_slug(self) -> str:
         if self.args.repo:
@@ -607,6 +646,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout-minutes", type=int, default=90, help="Action run timeout.")
     parser.add_argument("--release-timeout-minutes", type=int, default=20, help="Release asset timeout.")
     parser.add_argument("--api-timeout-seconds", type=int, default=60, help="Single GitHub API HTTP timeout.")
+    parser.add_argument("--api-retries", type=int, default=5, help="Retries for transient GitHub API errors.")
+    parser.add_argument(
+        "--api-retry-base-seconds",
+        type=float,
+        default=3.0,
+        help="Base backoff seconds for transient GitHub API retries.",
+    )
     parser.add_argument(
         "--windows-asset-regex",
         default=r"win-x64\.(exe|zip)$",

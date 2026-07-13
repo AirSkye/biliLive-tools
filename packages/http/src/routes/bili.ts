@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import path from "node:path";
 
 import { biliApi, validateBiliupConfig } from "@biliLive-tools/shared/task/bili.js";
+import { addSyncTask } from "@biliLive-tools/shared/task/sync.js";
 import { parseMeta, readVideoMeta } from "@biliLive-tools/shared/task/video.js";
 import { recordHistoryService, streamerService } from "@biliLive-tools/shared/db/index.js";
 import { TvQrcodeLogin } from "@renmu/bili-api";
@@ -17,6 +18,7 @@ import {
 } from "@biliLive-tools/shared/utils/index.js";
 import type { BiliupConfig, PartTitleFormatOptions } from "@biliLive-tools/types";
 import { appConfig, config as globalConfig, handler } from "../index.js";
+import { PathResolver } from "../services/webhook/PathResolver.js";
 import type { LocalUploadOptions } from "../services/webhook/webhook.js";
 import type { LiveHistory } from "@biliLive-tools/shared/db/model/recordHistory.js";
 import type { Streamer } from "@biliLive-tools/shared/db/model/streamer.js";
@@ -111,10 +113,15 @@ type LocalUnuploadedGroup = {
   id: string;
   groupKey: string;
   uploadKey: string;
+  syncKey: string;
   uploadStatus?: LocalUploadQueueStatus;
   uploadQueuedAt?: number;
   uploadUpdatedAt?: number;
   uploadError?: string;
+  syncStatus?: LocalUploadQueueStatus;
+  syncQueuedAt?: number;
+  syncUpdatedAt?: number;
+  syncError?: string;
   roomId?: string;
   platform?: string;
   username?: string;
@@ -130,6 +137,7 @@ type LocalUnuploadedGroup = {
   archiveTitle?: string;
   mergeCandidate: boolean;
   hasWebhookUploadConfig: boolean;
+  hasWebhookSyncConfig: boolean;
   warnings: string[];
 };
 
@@ -139,6 +147,7 @@ type LocalUploadStreamerOption = {
   platform: string;
   name: string;
   hasWebhookUploadConfig: boolean;
+  hasWebhookSyncConfig: boolean;
   localSizeBytes: number;
   localFolderCount: number;
 };
@@ -326,6 +335,7 @@ type LocalUploadedFileDeletionRecord = LocalDetectedDeletionItem & {
 };
 
 type LocalUploadQueueStatus = "queued" | "running" | "completed" | "error";
+type LocalUploadQueueOperation = "upload" | "sync";
 
 type LocalDetectHistoryStore = {
   version: 1;
@@ -336,6 +346,7 @@ type LocalDetectHistoryStore = {
 
 type LocalUploadQueueItem = {
   key: string;
+  operation?: LocalUploadQueueOperation;
   roomId?: string;
   platform?: string;
   title?: string;
@@ -578,11 +589,16 @@ const writeLocalDetectHistoryStore = async (store: LocalDetectHistoryStore) => {
 
 const normalizeLocalUploadFilePath = (filePath: string) => normalizeLocalPath(filePath);
 
-const buildLocalUploadKey = (files: Array<{ path: string }>) => {
+const buildLocalUploadKey = (
+  files: Array<{ path: string }>,
+  operation: LocalUploadQueueOperation = "upload",
+) => {
   const filePaths = Array.from(
     new Set(files.map((file) => normalizeLocalUploadFilePath(file.path)).filter(Boolean)),
   ).sort();
-  const key = crypto.createHash("sha1").update(filePaths.join("\n")).digest("hex");
+  const keyContent =
+    operation === "upload" ? filePaths.join("\n") : `${operation}\n${filePaths.join("\n")}`;
+  const key = crypto.createHash("sha1").update(keyContent).digest("hex");
   return { key, filePaths };
 };
 
@@ -2233,6 +2249,14 @@ const hasWebhookUploadConfig = (roomId?: string) => {
   }
 };
 
+const hasWebhookSyncConfig = (roomId?: string) => {
+  try {
+    return !!handler.configManager.getSyncConfig(roomId || DEFAULT_WEBHOOK_ROOM_ID);
+  } catch {
+    return false;
+  }
+};
+
 const normalizeStreamerPlatform = (platform?: string | null) =>
   String(platform || "bilibili").toLowerCase();
 
@@ -2278,6 +2302,7 @@ const addLocalUploadStreamerOption = (
       existing.name = name;
     }
     existing.hasWebhookUploadConfig ||= hasWebhookUploadConfig(roomId);
+    existing.hasWebhookSyncConfig ||= hasWebhookSyncConfig(roomId);
     existing.localSizeBytes += localSizeBytes;
     existing.localFolderCount += localFolderCount;
     return;
@@ -2288,6 +2313,7 @@ const addLocalUploadStreamerOption = (
     platform: normalizeStreamerPlatform(item.platform),
     name,
     hasWebhookUploadConfig: hasWebhookUploadConfig(roomId),
+    hasWebhookSyncConfig: hasWebhookSyncConfig(roomId),
     localSizeBytes,
     localFolderCount,
   });
@@ -2615,13 +2641,18 @@ const buildUnuploadedGroups = async (
       unuploaded.length > 1 &&
       unuploaded.every((item) => path.extname(item.localFile.fileName).toLowerCase() === ".flv");
     const groupHasWebhookConfig = hasWebhookUploadConfig(first.roomId);
+    const groupHasWebhookSyncConfig = hasWebhookSyncConfig(first.roomId);
     const warnings: string[] = [];
     if (!first.roomId) warnings.push("未从录制历史识别到房间号，无法复用 webhook 房间配置");
     if (suggestedAction === "ambiguous") {
       warnings.push("同组文件匹配到多个远端稿件，默认不会自动续传");
     }
-    if (!groupHasWebhookConfig) {
-      warnings.push("该房间未配置 webhook 上传账号或上传预设");
+    if (!groupHasWebhookConfig && !groupHasWebhookSyncConfig) {
+      warnings.push("该房间未配置 webhook 上传账号、上传预设或同步器");
+    } else if (!groupHasWebhookConfig) {
+      warnings.push("该房间未配置 webhook 上传账号或上传预设，仅可同步网盘");
+    } else if (!groupHasWebhookSyncConfig) {
+      warnings.push("该房间未配置 webhook 同步器，仅可B站上传");
     }
 
     const files = unuploaded.map((item) => ({
@@ -2636,17 +2667,24 @@ const buildUnuploadedGroups = async (
       xmlDanmuPath: item.xmlDanmuPath,
       recordId: item.record?.id,
     }));
-    const { key: uploadKey } = buildLocalUploadKey(files);
+    const { key: uploadKey } = buildLocalUploadKey(files, "upload");
+    const { key: syncKey } = buildLocalUploadKey(files, "sync");
     const uploadStatus = localUploadStatusByKey.get(uploadKey);
+    const syncStatus = localUploadStatusByKey.get(syncKey);
 
     groups.push({
       id: uuid(),
       groupKey,
       uploadKey,
+      syncKey,
       uploadStatus: uploadStatus?.status,
       uploadQueuedAt: uploadStatus?.createdAt,
       uploadUpdatedAt: uploadStatus?.updatedAt,
       uploadError: uploadStatus?.error,
+      syncStatus: syncStatus?.status,
+      syncQueuedAt: syncStatus?.createdAt,
+      syncUpdatedAt: syncStatus?.updatedAt,
+      syncError: syncStatus?.error,
       roomId: first.roomId,
       platform: first.platform,
       username: first.username,
@@ -2662,6 +2700,7 @@ const buildUnuploadedGroups = async (
       archiveTitle: matchedArchive?.archiveTitle || titleMatchedArchiveTitle,
       mergeCandidate,
       hasWebhookUploadConfig: groupHasWebhookConfig,
+      hasWebhookSyncConfig: groupHasWebhookSyncConfig,
       warnings,
     });
   }
@@ -3220,6 +3259,7 @@ router.get("/uploadLocalUnuploaded/status", async (ctx) => {
     }
     items.push({
       key,
+      operation: item.operation,
       roomId: item.roomId,
       platform: item.platform,
       title: item.title,
@@ -3232,6 +3272,227 @@ router.get("/uploadLocalUnuploaded/status", async (ctx) => {
   }
 
   ctx.body = { items };
+});
+
+const resolveLocalSyncXmlPath = async (file: LocalUploadCandidateFile) => {
+  const candidates = [
+    file.xmlDanmuPath,
+    file.danmuPath && path.extname(file.danmuPath).toLowerCase() === ".xml"
+      ? file.danmuPath
+      : undefined,
+    replaceExtName(file.path, ".xml"),
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (await fs.pathExists(candidate)) return candidate;
+  }
+  return undefined;
+};
+
+const waitForLocalSyncTask = (task: any, filePath: string) =>
+  new Promise<void>((resolve, reject) => {
+    task.on("task-end", () => resolve());
+    task.on("task-error", ({ error }: { error?: unknown } = {}) => {
+      reject(new Error(`${path.basename(filePath)} 同步失败：${String(error || "unknown error")}`));
+    });
+    task.on("task-cancel", () => {
+      reject(new Error(`${path.basename(filePath)} 同步已取消`));
+    });
+  });
+
+const syncLocalUnuploadedFiles = async (group: {
+  roomId: string;
+  platform?: string;
+  username?: string;
+  title?: string;
+  startTime?: number;
+  files: LocalUploadCandidateFile[];
+}) => {
+  const syncConfig = handler.configManager.getSyncConfig(group.roomId);
+  if (!syncConfig) {
+    throw new Error("房间未配置 webhook 同步器");
+  }
+
+  const targetFiles = new Set(syncConfig.targetFiles ?? []);
+  const liveStartTime = new Date(group.startTime ?? group.files[0]?.startTime ?? Date.now());
+  const remotePath = PathResolver.formatFolderStructure(syncConfig.folderStructure, {
+    platform: group.platform || "custom",
+    user: group.username || group.roomId || "unknown",
+    software: "local-sync",
+    liveStartTime,
+  });
+
+  const candidates: Array<{
+    path: string;
+    type: "source" | "danmaku" | "xml" | "cover";
+  }> = [];
+  const seen = new Set<string>();
+  const addCandidate = (
+    filePath: string | undefined,
+    type: "source" | "danmaku" | "xml" | "cover",
+  ) => {
+    if (!filePath) return;
+    const key = `${type}:${normalizeLocalPath(filePath)}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ path: filePath, type });
+  };
+
+  const sortedFiles = [...group.files].sort(
+    (left, right) => (left.startTime ?? left.mtimeMs) - (right.startTime ?? right.mtimeMs),
+  );
+  for (const file of sortedFiles) {
+    if (!(await fs.pathExists(file.path))) {
+      throw new Error(`本地文件不存在：${file.path}`);
+    }
+
+    const videoType = PathResolver.getFileType(file.path);
+    if (targetFiles.has(videoType)) {
+      addCandidate(file.path, videoType);
+    }
+    if (targetFiles.has("xml")) {
+      addCandidate(await resolveLocalSyncXmlPath(file), "xml");
+    }
+    if (targetFiles.has("cover")) {
+      addCandidate(PathResolver.getCoverPath(file.path), "cover");
+    }
+  }
+
+  if (candidates.length === 0) {
+    throw new Error(
+      `同步器目标文件类型未命中：${Array.from(targetFiles).join(", ") || "未配置目标类型"}`,
+    );
+  }
+
+  await Promise.all(
+    candidates.map(async (candidate) => {
+      const task = await addSyncTask({
+        input: candidate.path,
+        remotePath,
+        policy: "skip",
+        type: syncConfig.syncSource,
+        aliyunpanDriveType: syncConfig.aliyunpanDriveType,
+        stringFilters: syncConfig.stringFilters,
+      });
+      return waitForLocalSyncTask(task, candidate.path);
+    }),
+  );
+
+  return {
+    fileCount: candidates.length,
+  };
+};
+
+router.post("/syncLocalUnuploaded", async (ctx) => {
+  const data = ctx.request.body as {
+    groups?: Array<{
+      syncKey?: string;
+      roomId?: string;
+      platform?: string;
+      username?: string;
+      title?: string;
+      startTime?: number;
+      files?: LocalUploadCandidateFile[];
+    }>;
+  };
+
+  if (!data.groups?.length) {
+    ctx.body = "groups required";
+    ctx.status = 400;
+    return;
+  }
+
+  const items: Array<{
+    syncKey?: string;
+    roomId: string;
+    title?: string;
+    status: "queued" | "skipped";
+    reason?: string;
+  }> = [];
+
+  for (const group of data.groups) {
+    if (!group.roomId) {
+      items.push({
+        roomId: "",
+        title: group.title,
+        status: "skipped",
+        reason: "missing roomId",
+      });
+      continue;
+    }
+    if (!group.files?.length) {
+      items.push({
+        roomId: group.roomId,
+        title: group.title,
+        status: "skipped",
+        reason: "missing files",
+      });
+      continue;
+    }
+
+    const { key: syncKey, filePaths } = buildLocalUploadKey(group.files, "sync");
+    const existingUpload = await getLocalUploadQueueItem(syncKey);
+    const activeUpload = [existingUpload, localUploadQueueItems.get(syncKey)].find((item) =>
+      isActiveLocalUploadStatus(item?.status),
+    );
+    if (activeUpload) {
+      items.push({
+        syncKey,
+        roomId: group.roomId,
+        title: group.title,
+        status: "skipped",
+        reason: `duplicate:${activeUpload.status}`,
+      });
+      continue;
+    }
+
+    const now = Date.now();
+    await saveLocalUploadQueueItem({
+      key: syncKey,
+      operation: "sync",
+      roomId: group.roomId,
+      platform: group.platform,
+      title: group.title,
+      filePaths,
+      status: "queued",
+      createdAt: now,
+      updatedAt: now,
+      error: undefined,
+    });
+
+    void (async () => {
+      try {
+        await updateLocalUploadQueueStatus(syncKey, "running");
+        await syncLocalUnuploadedFiles({
+          roomId: group.roomId!,
+          platform: group.platform,
+          username: group.username,
+          title: group.title,
+          startTime: group.startTime,
+          files: group.files!,
+        });
+        await updateLocalUploadQueueStatus(syncKey, "completed");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        console.error("syncLocalUnuploaded failed", error);
+        await updateLocalUploadQueueStatus(syncKey, "error", message).catch((updateError) => {
+          console.error("updateLocalUploadQueueStatus failed", updateError);
+        });
+      }
+    })();
+
+    items.push({
+      syncKey,
+      roomId: group.roomId,
+      title: group.title,
+      status: "queued",
+    });
+  }
+
+  ctx.body = {
+    status: "success",
+    items,
+  };
 });
 
 router.post("/uploadLocalUnuploaded", async (ctx) => {
@@ -3314,6 +3575,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
     const now = Date.now();
     await saveLocalUploadQueueItem({
       key: uploadKey,
+      operation: "upload",
       roomId: group.roomId,
       platform: group.platform,
       title: group.title,
