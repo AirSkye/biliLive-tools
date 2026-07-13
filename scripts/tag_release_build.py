@@ -131,6 +131,62 @@ class ReleaseBuild:
 
         return CommandResult(stdout=stdout, stderr=stderr, returncode=process.returncode)
 
+    @staticmethod
+    def _is_retryable_git_push_failure(result: CommandResult) -> bool:
+        text = f"{result.stdout}\n{result.stderr}".lower()
+        hard_failures = [
+            "permission denied (publickey)",
+            "repository not found",
+            "could not resolve hostname",
+            "authentication failed",
+        ]
+        if any(item in text for item in hard_failures):
+            return False
+
+        retryable = [
+            "connection closed",
+            "connection reset",
+            "connection timed out",
+            "operation timed out",
+            "kex_exchange_identification",
+            "banner exchange",
+            "remote host closed",
+            "early eof",
+            "failed to connect",
+            "connection refused",
+            "broken pipe",
+        ]
+        return any(item in text for item in retryable)
+
+    def _git_push_retry_delay(self, attempt: int) -> float:
+        base = max(float(self.args.git_push_retry_base_seconds), 0.1)
+        return min(base * (2 ** max(attempt - 1, 0)), 45.0)
+
+    def run_git_push(self, command: list[str]) -> CommandResult:
+        attempts = max(int(self.args.git_push_retries), 0) + 1
+        env = self.ssh_git_env()
+        last_result: CommandResult | None = None
+        for attempt in range(1, attempts + 1):
+            result = self.run_cmd(command, allow_failure=True, env=env)
+            last_result = result
+            if result.returncode == 0:
+                return result
+            if attempt < attempts and self._is_retryable_git_push_failure(result):
+                delay = self._git_push_retry_delay(attempt)
+                self.log(
+                    f"git push SSH 连接异常，{delay:.1f}s 后重试 "
+                    f"({attempt}/{attempts - 1})",
+                    "WARN",
+                )
+                time.sleep(delay)
+                continue
+            break
+
+        returncode = last_result.returncode if last_result else -1
+        raise RuntimeError(
+            f"命令失败，退出码 {returncode}：{self._format_command(command)}"
+        )
+
     def git_text(self, *arguments: str, allow_failure: bool = False) -> str:
         result = self.run_cmd(["git", *arguments], allow_failure=allow_failure)
         return result.stdout.strip()
@@ -359,7 +415,7 @@ class ReleaseBuild:
             return
 
         refspec = f"HEAD:{self.branch}"
-        self.run_cmd(["git", "push", self.push_url(), refspec], env=self.ssh_git_env())
+        self.run_git_push(["git", "push", self.push_url(), refspec])
         self.log(f"分支已推送：{refspec}", "OK")
 
     def create_tag_name(self) -> str:
@@ -387,7 +443,7 @@ class ReleaseBuild:
         command = ["git", "push", self.push_url(), ref]
         if self.args.force_tag:
             command = ["git", "push", "--force", self.push_url(), ref]
-        self.run_cmd(command, env=self.ssh_git_env())
+        self.run_git_push(command)
         self.log(f"tag 已推送：{self.tag_name}", "OK")
 
     def resolve_latest_tag_name(self) -> str:
@@ -652,6 +708,13 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         help="Base backoff seconds for transient GitHub API retries.",
+    )
+    parser.add_argument("--git-push-retries", type=int, default=4, help="Retries for transient git push SSH errors.")
+    parser.add_argument(
+        "--git-push-retry-base-seconds",
+        type=float,
+        default=5.0,
+        help="Base backoff seconds for transient git push retries.",
     )
     parser.add_argument(
         "--windows-asset-regex",

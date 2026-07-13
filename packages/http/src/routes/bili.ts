@@ -605,6 +605,31 @@ const buildLocalUploadKey = (
 const isActiveLocalUploadStatus = (status?: LocalUploadQueueItem["status"]) =>
   status === "queued" || status === "running" || status === "completed";
 
+const isRunningLocalUploadStatus = (status?: LocalUploadQueueItem["status"]) =>
+  status === "queued" || status === "running";
+
+const isBlockingLocalUploadQueueItem = (
+  item: LocalUploadQueueItem | undefined,
+  options: { inMemory: boolean },
+) => {
+  if (!item) return false;
+  if (item.status === "completed") return true;
+  if (isRunningLocalUploadStatus(item.status)) return options.inMemory;
+  return false;
+};
+
+const getBlockingLocalUploadQueueItem = async (key: string) => {
+  const memoryItem = localUploadQueueItems.get(key);
+  if (isBlockingLocalUploadQueueItem(memoryItem, { inMemory: true })) {
+    return memoryItem;
+  }
+  const storedItem = await getLocalUploadQueueItem(key);
+  if (isBlockingLocalUploadQueueItem(storedItem, { inMemory: false })) {
+    return storedItem;
+  }
+  return undefined;
+};
+
 const cleanupLocalUploadQueueStore = (store: LocalDetectHistoryStore) => {
   const now = Date.now();
   store.localUploads = (store.localUploads ?? []).filter(
@@ -625,7 +650,6 @@ const getLocalUploadQueueItem = async (key: string) => {
   const store = await readLocalDetectHistoryStore();
   cleanupLocalUploadQueueStore(store);
   const stored = store.localUploads.find((item) => item.key === key);
-  if (stored) localUploadQueueItems.set(key, stored);
   return stored;
 };
 
@@ -3252,22 +3276,24 @@ router.get("/uploadLocalUnuploaded/status", async (ctx) => {
     }
   > = [];
   for (const key of keys) {
-    const item = await getLocalUploadQueueItem(key);
+    const memoryItem = localUploadQueueItems.get(key);
+    const item = memoryItem ?? (await getLocalUploadQueueItem(key));
     if (!item) {
       items.push({ key, status: "missing" });
       continue;
     }
+    const isStaleRunningRecord = !memoryItem && isRunningLocalUploadStatus(item.status);
     items.push({
       key,
       operation: item.operation,
       roomId: item.roomId,
       platform: item.platform,
       title: item.title,
-      status: item.status,
+      status: isStaleRunningRecord ? "error" : item.status,
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
-      completedAt: item.completedAt,
-      error: item.error,
+      completedAt: isStaleRunningRecord ? Date.now() : item.completedAt,
+      error: isStaleRunningRecord ? "任务不在当前运行队列中，请重新提交" : item.error,
     });
   }
 
@@ -3431,10 +3457,7 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
     }
 
     const { key: syncKey, filePaths } = buildLocalUploadKey(group.files, "sync");
-    const existingUpload = await getLocalUploadQueueItem(syncKey);
-    const activeUpload = [existingUpload, localUploadQueueItems.get(syncKey)].find((item) =>
-      isActiveLocalUploadStatus(item?.status),
-    );
+    const activeUpload = await getBlockingLocalUploadQueueItem(syncKey);
     if (activeUpload) {
       items.push({
         syncKey,
@@ -3557,10 +3580,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
     }
 
     const { key: uploadKey, filePaths } = buildLocalUploadKey(group.files);
-    const existingUpload = await getLocalUploadQueueItem(uploadKey);
-    const activeUpload = [existingUpload, localUploadQueueItems.get(uploadKey)].find((item) =>
-      isActiveLocalUploadStatus(item?.status),
-    );
+    const activeUpload = await getBlockingLocalUploadQueueItem(uploadKey);
     if (activeUpload) {
       items.push({
         uploadKey,

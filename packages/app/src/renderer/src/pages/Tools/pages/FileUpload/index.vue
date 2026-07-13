@@ -1820,6 +1820,13 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     const queuedKeys = result.items
       .filter((item) => item.status === "queued" && item.uploadKey)
       .map((item) => item.uploadKey!);
+    const duplicateKeys = result.items
+      .filter(
+        (item) =>
+          item.status === "skipped" && item.reason?.startsWith("duplicate:") && item.uploadKey,
+      )
+      .map((item) => item.uploadKey!);
+    const statusKeys = [...queuedKeys, ...duplicateKeys];
     const now = Date.now();
     const queuedRecordByKey = new Map(
       pruneQueuedLocalUploadRecords().map((item) => [item.key, item]),
@@ -1842,14 +1849,21 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
             : row,
         );
     }
-    void monitorLocalUploadStatuses(queuedKeys);
+    void monitorLocalUploadStatuses(statusKeys);
+    const noticeTitle = queuedCount > 0 ? "已加入上传流程" : "没有新增上传任务";
+    const noticeContent =
+      queuedCount > 0
+        ? `已加入 ${queuedCount} 个分组${
+            skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
+          }，${
+            pendingLocalUploadGroups.value.some((item) => item.burnDanmu)
+              ? "压制后上传"
+              : "直接上传"
+          }任务会在队列中执行`
+        : `选中分组已有 ${skippedDuplicateCount} 个上传记录，已刷新状态`;
     notice.success({
-      title: "已加入上传流程",
-      content: `已加入 ${queuedCount} 个分组${
-        skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
-      }，${
-        pendingLocalUploadGroups.value.some((item) => item.burnDanmu) ? "压制后上传" : "直接上传"
-      }任务会在队列中执行`,
+      title: noticeTitle,
+      content: noticeContent,
       duration: 3000,
     });
     selectedLocalUploadGroupIds.value = [];
@@ -1902,6 +1916,13 @@ const syncSelectedLocalGroups = async () => {
     const queuedKeys = result.items
       .filter((item) => item.status === "queued" && item.syncKey)
       .map((item) => item.syncKey!);
+    const duplicateKeys = result.items
+      .filter(
+        (item) =>
+          item.status === "skipped" && item.reason?.startsWith("duplicate:") && item.syncKey,
+      )
+      .map((item) => item.syncKey!);
+    const statusKeys = [...queuedKeys, ...duplicateKeys];
     const now = Date.now();
     const queuedRecordByKey = new Map(
       pruneQueuedLocalUploadRecords().map((item) => [item.key, item]),
@@ -1924,12 +1945,17 @@ const syncSelectedLocalGroups = async () => {
             : row,
         );
     }
-    void monitorLocalUploadStatuses(queuedKeys);
+    void monitorLocalUploadStatuses(statusKeys);
+    const noticeTitle = queuedCount > 0 ? "已加入同步流程" : "没有新增同步任务";
+    const noticeContent =
+      queuedCount > 0
+        ? `已加入 ${queuedCount} 个分组${
+            skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
+          }，会按 webhook 同步器配置同步到网盘`
+        : `选中分组已有 ${skippedDuplicateCount} 个同步记录，已刷新状态`;
     notice.success({
-      title: "已加入同步流程",
-      content: `已加入 ${queuedCount} 个分组${
-        skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
-      }，会按 webhook 同步器配置同步到网盘`,
+      title: noticeTitle,
+      content: noticeContent,
       duration: 3000,
     });
     selectedLocalUploadGroupIds.value = [];
