@@ -440,8 +440,18 @@ const syncLocalUnuploaded = async (data: {
     username?: string;
     title?: string;
     startTime?: number;
+    burnDanmu?: boolean;
+    uploadRawWhenNoDanmu?: boolean;
+    mergeSegments?: boolean;
+    deleteSourceAfterSync?: boolean;
     files: LocalUploadCandidateFile[];
   }>;
+  options?: {
+    burnDanmu?: boolean;
+    uploadRawWhenNoDanmu?: boolean;
+    mergeSegments?: boolean;
+    deleteSourceAfterSync?: boolean;
+  };
 }): Promise<{
   status: string;
   items: Array<{

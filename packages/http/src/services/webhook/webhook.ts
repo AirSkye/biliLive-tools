@@ -101,6 +101,20 @@ type PreparedLocalUploadPart = {
   danmuPath?: string;
   xmlDanmuPath?: string;
   cleanupPaths: string[];
+  temporaryPaths: string[];
+  warnings: string[];
+};
+
+export type PreparedLocalSyncFile = {
+  path: string;
+  type: "source" | "danmaku";
+  title: string;
+  startTime?: number;
+  endTime?: number;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
+  coverPath?: string;
+  cleanupPaths: string[];
   warnings: string[];
 };
 
@@ -589,6 +603,7 @@ export class WebhookHandler {
       danmuPath: mergedDanmu,
       xmlDanmuPath: mergedDanmu,
       cleanupPaths: inputFiles,
+      temporaryPaths: [mergedVideo, ...(mergedDanmu ? [mergedDanmu] : [])],
       warnings,
     };
   }
@@ -615,6 +630,7 @@ export class WebhookHandler {
         danmuPath: file.danmuPath || (await this.resolveLocalDanmuPath(file)),
         xmlDanmuPath: file.xmlDanmuPath || (await this.resolveLocalDanmuPath(file, true)),
         cleanupPaths: [],
+        temporaryPaths: [],
         warnings: [],
       });
     }
@@ -664,6 +680,72 @@ export class WebhookHandler {
       },
     );
   }
+
+  prepareLocalSyncFiles = async (options: LocalUploadOptions): Promise<PreparedLocalSyncFile[]> => {
+    if (!options.files.length) {
+      throw new Error("files is required");
+    }
+
+    const reservedPaths = this.reserveLocalUploadPaths(options.files);
+
+    try {
+      const config = this.configManager.getConfig(options.roomId);
+      for (const file of options.files) {
+        if (!(await fs.pathExists(file.path))) {
+          throw new Error(`本地文件不存在：${file.path}`);
+        }
+      }
+
+      const preparedParts = await this.buildLocalUploadParts(options);
+      const uploadRawWhenNoDanmu = options.uploadRawWhenNoDanmu ?? true;
+      const fallbackCoverPath = PathResolver.getCoverPath(this.sortLocalUploadFiles(options.files)[0]?.path || "");
+      const files: PreparedLocalSyncFile[] = [];
+
+      for (const preparedPart of preparedParts) {
+        const cleanupPaths = new Set(preparedPart.temporaryPaths);
+        let syncPath = preparedPart.path;
+        const warnings = [...preparedPart.warnings];
+
+        if (options.burnDanmu) {
+          try {
+            syncPath = await this.burnLocalUploadPart(preparedPart, config);
+            cleanupPaths.add(syncPath);
+          } catch (error) {
+            if (!uploadRawWhenNoDanmu) {
+              warnings.push(`${path.basename(preparedPart.path)} 跳过：${String(error)}`);
+              continue;
+            }
+            warnings.push(
+              `${path.basename(preparedPart.path)} 未压制弹幕，改为同步原视频：${String(error)}`,
+            );
+          }
+        }
+
+        files.push({
+          path: syncPath,
+          type: options.burnDanmu && syncPath !== preparedPart.path ? "danmaku" : PathResolver.getFileType(syncPath),
+          title: preparedPart.title,
+          startTime: preparedPart.startTime,
+          endTime: preparedPart.endTime,
+          danmuPath: preparedPart.danmuPath,
+          xmlDanmuPath: preparedPart.xmlDanmuPath,
+          coverPath: PathResolver.getCoverPath(preparedPart.path) || fallbackCoverPath,
+          cleanupPaths: Array.from(cleanupPaths),
+          warnings,
+        });
+      }
+
+      if (files.length === 0) {
+        throw new Error("没有可同步的本地文件");
+      }
+
+      this.releaseLocalUploadReservations(reservedPaths);
+      return files;
+    } catch (error) {
+      this.releaseLocalUploadReservations(reservedPaths);
+      throw error;
+    }
+  };
 
   uploadLocalFiles = async (options: LocalUploadOptions) => {
     if (!options.files.length) {

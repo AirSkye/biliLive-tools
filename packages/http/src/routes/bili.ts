@@ -15,11 +15,12 @@ import {
   formatDesc,
   uuid,
   replaceExtName,
+  trashItem,
 } from "@biliLive-tools/shared/utils/index.js";
 import type { BiliupConfig, PartTitleFormatOptions } from "@biliLive-tools/types";
 import { appConfig, config as globalConfig, handler } from "../index.js";
 import { PathResolver } from "../services/webhook/PathResolver.js";
-import type { LocalUploadOptions } from "../services/webhook/webhook.js";
+import type { LocalUploadOptions, PreparedLocalSyncFile } from "../services/webhook/webhook.js";
 import type { LiveHistory } from "@biliLive-tools/shared/db/model/recordHistory.js";
 import type { Streamer } from "@biliLive-tools/shared/db/model/streamer.js";
 
@@ -3297,7 +3298,11 @@ router.get("/uploadLocalUnuploaded/status", async (ctx) => {
   ctx.body = { items };
 });
 
-const resolveLocalSyncXmlPath = async (file: LocalUploadCandidateFile) => {
+const resolveLocalSyncXmlPath = async (file: {
+  path: string;
+  danmuPath?: string;
+  xmlDanmuPath?: string;
+}) => {
   const candidates = [
     file.xmlDanmuPath,
     file.danmuPath && path.extname(file.danmuPath).toLowerCase() === ".xml"
@@ -3323,12 +3328,31 @@ const waitForLocalSyncTask = (task: any, filePath: string) =>
     });
   });
 
+const cleanupLocalSyncSourceFiles = async (files: Array<{ path: string }>) => {
+  const sourcePaths = Array.from(
+    new Set(files.map((file) => file.path).filter(Boolean).map((filePath) => path.resolve(filePath))),
+  );
+  for (const filePath of sourcePaths) {
+    try {
+      if (await fs.pathExists(filePath)) {
+        await trashItem(filePath);
+      }
+    } catch (error) {
+      console.error("cleanupLocalSyncSourceFile failed", filePath, error);
+    }
+  }
+};
+
 const syncLocalUnuploadedFiles = async (group: {
   roomId: string;
   platform?: string;
   username?: string;
   title?: string;
   startTime?: number;
+  burnDanmu?: boolean;
+  uploadRawWhenNoDanmu?: boolean;
+  mergeSegments?: boolean;
+  deleteSourceAfterSync?: boolean;
   files: LocalUploadCandidateFile[];
 }) => {
   const syncConfig = handler.configManager.getSyncConfig(group.roomId);
@@ -3349,7 +3373,9 @@ const syncLocalUnuploadedFiles = async (group: {
     path: string;
     type: "source" | "danmaku" | "xml" | "cover";
   }> = [];
+  let hasVideoCandidate = false;
   const seen = new Set<string>();
+  const cleanupPaths = new Set<string>();
   const addCandidate = (
     filePath: string | undefined,
     type: "source" | "danmaku" | "xml" | "cover",
@@ -3358,26 +3384,67 @@ const syncLocalUnuploadedFiles = async (group: {
     const key = `${type}:${normalizeLocalPath(filePath)}`;
     if (seen.has(key)) return;
     seen.add(key);
+    if (type === "source" || type === "danmaku") {
+      hasVideoCandidate = true;
+    }
     candidates.push({ path: filePath, type });
   };
+  const addCleanupPaths = (paths: string[] | undefined) => {
+    for (const filePath of paths ?? []) {
+      if (filePath) cleanupPaths.add(filePath);
+    }
+  };
+  const shouldSyncPreparedVideo = (file: PreparedLocalSyncFile) =>
+    targetFiles.has(file.type) ||
+    (group.burnDanmu && (targetFiles.has("source") || targetFiles.has("danmaku")));
 
-  const sortedFiles = [...group.files].sort(
-    (left, right) => (left.startTime ?? left.mtimeMs) - (right.startTime ?? right.mtimeMs),
-  );
-  for (const file of sortedFiles) {
-    if (!(await fs.pathExists(file.path))) {
-      throw new Error(`本地文件不存在：${file.path}`);
-    }
+  if (group.burnDanmu || group.mergeSegments) {
+    const preparedFiles = await handler.prepareLocalSyncFiles({
+      roomId: group.roomId,
+      platform: group.platform as LocalUploadOptions["platform"],
+      username: group.username,
+      title: group.title,
+      startTime: group.startTime,
+      burnDanmu: group.burnDanmu ?? false,
+      uploadRawWhenNoDanmu: group.uploadRawWhenNoDanmu ?? true,
+      mergeSegments: group.mergeSegments ?? false,
+      files: group.files,
+    });
 
-    const videoType = PathResolver.getFileType(file.path);
-    if (targetFiles.has(videoType)) {
-      addCandidate(file.path, videoType);
+    for (const file of preparedFiles) {
+      const candidateCountBefore = candidates.length;
+      if (shouldSyncPreparedVideo(file)) {
+        addCandidate(file.path, file.type);
+      }
+      if (targetFiles.has("xml")) {
+        addCandidate(file.xmlDanmuPath || (await resolveLocalSyncXmlPath(file)), "xml");
+      }
+      if (targetFiles.has("cover")) {
+        addCandidate(file.coverPath || PathResolver.getCoverPath(file.path), "cover");
+      }
+      if (candidates.length > candidateCountBefore) {
+        addCleanupPaths(file.cleanupPaths);
+      }
     }
-    if (targetFiles.has("xml")) {
-      addCandidate(await resolveLocalSyncXmlPath(file), "xml");
-    }
-    if (targetFiles.has("cover")) {
-      addCandidate(PathResolver.getCoverPath(file.path), "cover");
+  } else {
+    const sortedFiles = [...group.files].sort(
+      (left, right) => (left.startTime ?? left.mtimeMs) - (right.startTime ?? right.mtimeMs),
+    );
+    for (const file of sortedFiles) {
+      if (!(await fs.pathExists(file.path))) {
+        throw new Error(`本地文件不存在：${file.path}`);
+      }
+
+      const videoType = PathResolver.getFileType(file.path);
+      if (targetFiles.has(videoType)) {
+        addCandidate(file.path, videoType);
+      }
+      if (targetFiles.has("xml")) {
+        addCandidate(await resolveLocalSyncXmlPath(file), "xml");
+      }
+      if (targetFiles.has("cover")) {
+        addCandidate(PathResolver.getCoverPath(file.path), "cover");
+      }
     }
   }
 
@@ -3401,6 +3468,20 @@ const syncLocalUnuploadedFiles = async (group: {
     }),
   );
 
+  for (const filePath of cleanupPaths) {
+    try {
+      if (await fs.pathExists(filePath)) {
+        await trashItem(filePath);
+      }
+    } catch (error) {
+      console.error("cleanupLocalSyncFile failed", filePath, error);
+    }
+  }
+
+  if (group.deleteSourceAfterSync && hasVideoCandidate) {
+    await cleanupLocalSyncSourceFiles(group.files);
+  }
+
   return {
     fileCount: candidates.length,
   };
@@ -3415,8 +3496,18 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
       username?: string;
       title?: string;
       startTime?: number;
+      burnDanmu?: boolean;
+      uploadRawWhenNoDanmu?: boolean;
+      mergeSegments?: boolean;
+      deleteSourceAfterSync?: boolean;
       files?: LocalUploadCandidateFile[];
     }>;
+    options?: {
+      burnDanmu?: boolean;
+      uploadRawWhenNoDanmu?: boolean;
+      mergeSegments?: boolean;
+      deleteSourceAfterSync?: boolean;
+    };
   };
 
   if (!data.groups?.length) {
@@ -3456,6 +3547,18 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
     const { key: syncKey, filePaths } = buildLocalUploadKey(group.files, "sync");
     const activeUpload = await getBlockingLocalUploadQueueItem(syncKey);
     if (activeUpload) {
+      const deleteSourceAfterSync =
+        group.deleteSourceAfterSync ?? data.options?.deleteSourceAfterSync ?? false;
+      const burnDanmu = group.burnDanmu ?? data.options?.burnDanmu ?? false;
+      const syncTargetFiles = new Set(
+        handler.configManager.getSyncConfig(group.roomId)?.targetFiles ?? [],
+      );
+      const hasCurrentVideoTarget = burnDanmu
+        ? syncTargetFiles.has("source") || syncTargetFiles.has("danmaku")
+        : group.files.some((file) => syncTargetFiles.has(PathResolver.getFileType(file.path)));
+      if (deleteSourceAfterSync && activeUpload.status === "completed" && hasCurrentVideoTarget) {
+        await cleanupLocalSyncSourceFiles(group.files);
+      }
       items.push({
         syncKey,
         roomId: group.roomId,
@@ -3489,6 +3592,12 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
           username: group.username,
           title: group.title,
           startTime: group.startTime,
+          burnDanmu: group.burnDanmu ?? data.options?.burnDanmu ?? false,
+          uploadRawWhenNoDanmu:
+            group.uploadRawWhenNoDanmu ?? data.options?.uploadRawWhenNoDanmu ?? true,
+          mergeSegments: group.mergeSegments ?? data.options?.mergeSegments ?? false,
+          deleteSourceAfterSync:
+            group.deleteSourceAfterSync ?? data.options?.deleteSourceAfterSync ?? false,
           files: group.files!,
         });
         await updateLocalUploadQueueStatus(syncKey, "completed");
