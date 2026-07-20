@@ -303,7 +303,7 @@
               压制时弹幕不存在则上传原视频
             </n-checkbox>
             <n-checkbox v-model:checked="localUploadOptions.mergeSegments">
-              上传前选择合并分段
+              压制时选择合并分段
             </n-checkbox>
             <n-checkbox v-model:checked="localUploadOptions.deleteSourceAfterSync">
               同步成功后删除原始视频
@@ -396,6 +396,37 @@
       </n-tabs>
     </component>
     <n-modal
+      v-model:show="localBurnDialogVisible"
+      preset="card"
+      title="选择压制弹幕的视频"
+      style="width: min(980px, 92vw)"
+      :bordered="false"
+      :trap-focus="false"
+      :auto-focus="false"
+    >
+      <div class="local-upload-toolbar">
+        <span>视频：{{ localBurnFileRows.length }}</span>
+        <n-button size="small" @click="selectAllBurnFiles"> 全选全部 </n-button>
+        <n-button size="small" @click="clearBurnFiles"> 清空选择 </n-button>
+      </div>
+      <n-empty v-if="localBurnFileRows.length === 0" description="没有可压制的视频" />
+      <n-data-table
+        v-else
+        v-model:checked-row-keys="selectedBurnFileKeys"
+        :row-key="getLocalBurnFileRowKey"
+        :columns="localBurnFileColumns"
+        :data="localBurnFileRows"
+        :pagination="{ pageSize: 8 }"
+        size="small"
+      />
+      <template #footer>
+        <div class="local-dialog-footer">
+          <n-button @click="cancelLocalBurnSelection">返回</n-button>
+          <n-button type="primary" @click="confirmLocalBurnSelection">确认压制选择</n-button>
+        </div>
+      </template>
+    </n-modal>
+    <n-modal
       v-model:show="localMergeDialogVisible"
       preset="card"
       title="选择待合并分段"
@@ -405,18 +436,18 @@
       :auto-focus="false"
     >
       <div class="local-upload-toolbar">
-        <span>可合并分组：{{ localMergeRows.length }}</span>
-        <n-button size="small" @click="selectAllMergeGroups"> 全选全部 </n-button>
-        <n-button size="small" @click="clearMergeGroups"> 清空选择 </n-button>
+        <span>可合并视频：{{ localMergeFileRows.length }}</span>
+        <n-button size="small" @click="selectAllMergeFiles"> 全选全部 </n-button>
+        <n-button size="small" @click="clearMergeFiles"> 清空选择 </n-button>
       </div>
-      <n-empty v-if="localMergeRows.length === 0" description="没有待合并分段" />
+      <n-empty v-if="localMergeFileRows.length === 0" description="没有待合并分段" />
       <n-data-table
         v-else
-        v-model:checked-row-keys="selectedMergeGroupIds"
-        :row-key="getLocalUnuploadedRowKey"
-        :columns="localMergeColumns"
-        :data="localMergeRows"
-        :pagination="{ pageSize: 6 }"
+        v-model:checked-row-keys="selectedMergeFileKeys"
+        :row-key="getLocalBurnFileRowKey"
+        :columns="localMergeFileColumns"
+        :data="localMergeFileRows"
+        :pagination="{ pageSize: 8 }"
         size="small"
       />
       <template #footer>
@@ -459,6 +490,7 @@ import type {
   LocalUploadedFilesHistorySummary,
   LocalUploadedFileMatch,
   LocalUploadedFilesResult,
+  LocalUploadCandidateFile,
   LocalUploadStreamerOption,
   LocalUnuploadedGroup,
 } from "@renderer/apis/bili";
@@ -754,20 +786,31 @@ const localUploadOptions = reactive({
 type PendingLocalUploadGroup = {
   row: LocalUnuploadedGroup;
   burnDanmu: boolean;
+  burnFilePaths: string[];
   uploadRawWhenNoDanmu: boolean;
+};
+type LocalBurnFileRow = LocalUploadCandidateFile & {
+  groupId: string;
+  username?: string;
+  roomId?: string;
+  groupTitle: string;
 };
 type LocalUploadRunMode = "direct" | "burn";
 type PendingLocalPreparedOperation = "upload" | "sync";
+const localBurnDialogVisible = ref(false);
 const localMergeDialogVisible = ref(false);
 const pendingLocalUploadGroups = ref<PendingLocalUploadGroup[]>([]);
 const pendingLocalPreparedOperation = ref<PendingLocalPreparedOperation>("upload");
-const selectedMergeGroupIds = ref<DataTableRowKey[]>([]);
+const selectedBurnFileKeys = ref<DataTableRowKey[]>([]);
+const selectedMergeFileKeys = ref<DataTableRowKey[]>([]);
 const getLocalUploadedRowKey = (row: LocalUploadedFileMatch) => row.localPath;
 const getLocalInvalidMp4RowKey = (row: LocalInvalidMp4File) => row.localPath;
 const getLocalDuplicateRowKey = (row: LocalDuplicateVideoFile) => row.localPath;
 const getLocalUnuploadedRowKey = (row: LocalUnuploadedGroup) => row.id;
+const getLocalBurnFileRowKey = (row: LocalBurnFileRow) => row.path;
 const getLocalDeletionRowKey = (row: LocalUploadedFileDeletionRecord) => row.id;
 const activeLocalUploadStatuses = new Set(["queued", "running", "completed"]);
+const pendingLocalUploadStatuses = new Set(["queued", "running"]);
 type LocalUnuploadedOperation = "upload" | "sync";
 const getLocalUnuploadedOperationKey = (
   row: LocalUnuploadedGroup,
@@ -839,20 +882,44 @@ const selectAllLocalUnuploadedGroups = () => {
 const clearSelectedLocalUploadGroups = () => {
   selectedLocalUploadGroupIds.value = [];
 };
-const localMergeRows = computed(() =>
-  pendingLocalUploadGroups.value
-    .map((item) => item.row)
-    .filter((row) => row.mergeCandidate)
-    .sort((left, right) => right.totalSize - left.totalSize),
+const localBurnFileRows = computed<LocalBurnFileRow[]>(() =>
+  pendingLocalUploadGroups.value.flatMap((item) =>
+    item.row.files.map((file) => ({
+      ...file,
+      groupId: item.row.id,
+      username: item.row.username,
+      roomId: item.row.roomId,
+      groupTitle: item.row.title,
+    })),
+  ),
+);
+const selectAllBurnFiles = () => {
+  selectedBurnFileKeys.value = localBurnFileRows.value.map((row) => row.path);
+};
+const clearBurnFiles = () => {
+  selectedBurnFileKeys.value = [];
+};
+const localMergeFileRows = computed<LocalBurnFileRow[]>(() =>
+  pendingLocalUploadGroups.value.flatMap((item) =>
+    item.row.mergeCandidate
+      ? item.row.files.map((file) => ({
+          ...file,
+          groupId: item.row.id,
+          username: item.row.username,
+          roomId: item.row.roomId,
+          groupTitle: item.row.title,
+        }))
+      : [],
+  ),
 );
 const localMergeConfirmText = computed(() =>
   pendingLocalPreparedOperation.value === "sync" ? "加入同步流程" : "加入上传流程",
 );
-const selectAllMergeGroups = () => {
-  selectedMergeGroupIds.value = localMergeRows.value.map((row) => row.id);
+const selectAllMergeFiles = () => {
+  selectedMergeFileKeys.value = localMergeFileRows.value.map((row) => row.path);
 };
-const clearMergeGroups = () => {
-  selectedMergeGroupIds.value = [];
+const clearMergeFiles = () => {
+  selectedMergeFileKeys.value = [];
 };
 
 let localDetectPollingRunId = 0;
@@ -873,13 +940,20 @@ const syncLocalDetectProgress = (progress: LocalUploadedFilesDetectionProgress) 
 };
 const applyLocalUploadStatuses = (items: LocalUploadStatusItem[]) => {
   const failedItems = items.filter((item) => item.status === "error" || item.status === "missing");
-  removeQueuedLocalUploadRecords(failedItems.map((item) => item.key));
+  const completedUploadKeys = new Set(
+    items.filter((item) => item.status === "completed").map((item) => item.key),
+  );
+  const finishedItems = items.filter(
+    (item) => item.status === "error" || item.status === "missing" || item.status === "completed",
+  );
+  removeQueuedLocalUploadRecords(finishedItems.map((item) => item.key));
 
   if (!localUploadedFilesResult.value || items.length === 0) return failedItems;
 
   const itemByKey = new Map(items.map((item) => [item.key, item]));
-  localUploadedFilesResult.value.unuploadedGroups =
-    localUploadedFilesResult.value.unuploadedGroups.map((row) => {
+  localUploadedFilesResult.value.unuploadedGroups = localUploadedFilesResult.value.unuploadedGroups
+    .filter((row) => !completedUploadKeys.has(row.uploadKey))
+    .map((row) => {
       const uploadItem = itemByKey.get(row.uploadKey);
       const syncItem = itemByKey.get(getLocalUnuploadedOperationKey(row, "sync"));
       let next = { ...row };
@@ -913,47 +987,90 @@ const applyLocalUploadStatuses = (items: LocalUploadStatusItem[]) => {
       }
       return next;
     });
+  const remainingGroupIds = new Set(
+    localUploadedFilesResult.value.unuploadedGroups.map((row) => row.id),
+  );
+  selectedLocalUploadGroupIds.value = selectedLocalUploadGroupIds.value.filter((id) =>
+    remainingGroupIds.has(String(id)),
+  );
 
   return failedItems;
 };
 const refreshLocalUploadStatuses = async (keys: string[]) => {
   const uniqueKeys = Array.from(new Set(keys.filter(Boolean)));
   if (uniqueKeys.length === 0) return [];
-  const result = await biliApi.getLocalUnuploadedUploadStatuses(uniqueKeys);
-  return applyLocalUploadStatuses(result.items);
+  const items: LocalUploadStatusItem[] = [];
+  for (let index = 0; index < uniqueKeys.length; index += 200) {
+    const result = await biliApi.getLocalUnuploadedUploadStatuses(
+      uniqueKeys.slice(index, index + 200),
+    );
+    items.push(...result.items);
+  }
+  return applyLocalUploadStatuses(items);
 };
-const monitorLocalUploadStatuses = async (keys: string[]) => {
-  const uniqueKeys = Array.from(new Set(keys.filter(Boolean)));
-  if (uniqueKeys.length === 0) return;
+const getPendingLocalUploadStatusKeys = () => {
+  const result = localUploadedFilesResult.value;
+  if (!result) return [];
 
-  for (let attempt = 0; attempt < 8; attempt++) {
-    await waitLocalDetectPoll(attempt === 0 ? 1200 : 1500);
-    try {
-      const result = await biliApi.getLocalUnuploadedUploadStatuses(uniqueKeys);
-      const failedItems = applyLocalUploadStatuses(result.items);
-      if (failedItems.length > 0) {
-        const first = failedItems[0];
-        notice.error({
-          title: "本地处理未进入队列",
-          content:
-            first.status === "missing"
-              ? "未查询到这次处理记录，请重新扫描后再试"
-              : first.error || "后端创建任务失败",
-          duration: 6000,
-        });
+  const queuedKeySet = getQueuedLocalUploadKeySet();
+  return Array.from(
+    new Set(
+      result.unuploadedGroups.flatMap((row) => {
+        const keys: string[] = [];
+        if (
+          pendingLocalUploadStatuses.has(row.uploadStatus || "") ||
+          queuedKeySet.has(row.uploadKey)
+        ) {
+          keys.push(row.uploadKey);
+        }
+        const syncKey = getLocalUnuploadedOperationKey(row, "sync");
+        if (pendingLocalUploadStatuses.has(row.syncStatus || "") || queuedKeySet.has(syncKey)) {
+          keys.push(syncKey);
+        }
+        return keys;
+      }),
+    ),
+  );
+};
+let localUploadStatusPollingRunId = 0;
+const startLocalUploadStatusPolling = () => {
+  const runId = ++localUploadStatusPollingRunId;
+  void (async () => {
+    while (runId === localUploadStatusPollingRunId) {
+      const keys = getPendingLocalUploadStatusKeys();
+      if (keys.length === 0) return;
+
+      try {
+        const failedItems = await refreshLocalUploadStatuses(keys);
+        if (failedItems.length > 0) {
+          const first = failedItems[0];
+          notice.error({
+            title: "本地处理任务失败",
+            content:
+              first.status === "missing"
+                ? "未查询到这次处理记录，请重新扫描后再试"
+                : first.error || "后端处理任务失败",
+            duration: 6000,
+          });
+        }
+      } catch (error) {
+        pushLocalDetectLog(
+          `刷新本地处理状态失败：${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+
+      if (
+        runId !== localUploadStatusPollingRunId ||
+        getPendingLocalUploadStatusKeys().length === 0
+      ) {
         return;
       }
-      const pending = result.items.some(
-        (item) => item.status === "queued" || item.status === "running",
-      );
-      if (!pending) return;
-    } catch (error) {
-      pushLocalDetectLog(
-        `刷新本地处理状态失败：${error instanceof Error ? error.message : String(error)}`,
-      );
-      return;
+      await waitLocalDetectPoll(2000);
     }
-  }
+  })();
+};
+const monitorLocalUploadStatuses = (keys: string[]) => {
+  if (keys.some(Boolean)) startLocalUploadStatusPolling();
 };
 const resetLocalDetectView = () => {
   localDetectProgress.value = null;
@@ -963,7 +1080,10 @@ const resetLocalDetectView = () => {
   selectedLocalDuplicateFileKeys.value = [];
   selectedLocalUploadGroupIds.value = [];
   pendingLocalUploadGroups.value = [];
-  selectedMergeGroupIds.value = [];
+  selectedBurnFileKeys.value = [];
+  selectedMergeFileKeys.value = [];
+  localBurnDialogVisible.value = false;
+  localMergeDialogVisible.value = false;
   localDetectLogs.value = [];
   localDetectLogCursor = 0;
 };
@@ -971,27 +1091,26 @@ const resetLocalUnuploadedSelection = () => {
   selectedLocalUploadGroupIds.value = [];
 };
 const applyLocalUploadedFilesResult = (result: LocalUploadedFilesResult) => {
+  result.unuploadedGroups = result.unuploadedGroups.filter(
+    (row) => row.uploadStatus !== "completed",
+  );
   localUploadedFilesResult.value = result;
   selectedLocalDetectHistoryId.value = result.historyId ?? selectedLocalDetectHistoryId.value;
   resetLocalUnuploadedSelection();
   const queuedKeySet = getQueuedLocalUploadKeySet();
   const statusKeys = result.unuploadedGroups.flatMap((row) => {
     const keys: string[] = [];
-    if (activeLocalUploadStatuses.has(row.uploadStatus || "") || queuedKeySet.has(row.uploadKey)) {
+    if (pendingLocalUploadStatuses.has(row.uploadStatus || "") || queuedKeySet.has(row.uploadKey)) {
       keys.push(row.uploadKey);
     }
     const syncKey = getLocalUnuploadedOperationKey(row, "sync");
-    if (activeLocalUploadStatuses.has(row.syncStatus || "") || queuedKeySet.has(syncKey)) {
+    if (pendingLocalUploadStatuses.has(row.syncStatus || "") || queuedKeySet.has(syncKey)) {
       keys.push(syncKey);
     }
     return keys;
   });
   if (statusKeys.length > 0) {
-    void refreshLocalUploadStatuses(statusKeys).catch((error) => {
-      pushLocalDetectLog(
-        `刷新本地处理状态失败：${error instanceof Error ? error.message : String(error)}`,
-      );
-    });
+    monitorLocalUploadStatuses(statusKeys);
   }
 };
 const loadLocalDetectHistoryList = async () => {
@@ -1144,6 +1263,7 @@ watch(
 );
 onBeforeUnmount(() => {
   localDetectPollingRunId += 1;
+  localUploadStatusPollingRunId += 1;
 });
 
 function formatFileSize(size: number) {
@@ -1666,7 +1786,7 @@ const localUnuploadedColumns: DataTableColumns<LocalUnuploadedGroup> = [
   },
 ];
 
-const localMergeColumns: DataTableColumns<LocalUnuploadedGroup> = [
+const localBurnFileColumns: DataTableColumns<LocalBurnFileRow> = [
   {
     type: "selection",
   },
@@ -1677,31 +1797,27 @@ const localMergeColumns: DataTableColumns<LocalUnuploadedGroup> = [
     render: (row) => `${row.username || "未知"}${row.roomId ? ` (${row.roomId})` : ""}`,
   },
   {
-    title: "标题",
-    key: "title",
-    minWidth: 180,
-    render: (row) => h("span", { title: row.title }, row.title),
-  },
-  {
     title: "文件",
-    key: "files",
+    key: "fileName",
     minWidth: 320,
-    render: (row) =>
-      h(
-        "div",
-        { class: "merge-file-list" },
-        row.files.map((file) =>
-          h("div", { title: file.path, class: "merge-file-list__item" }, file.fileName),
-        ),
-      ),
+    render: (row) => h("span", { title: row.path }, row.fileName),
   },
   {
     title: "大小",
-    key: "totalSize",
+    key: "size",
     width: 120,
-    render: (row) => formatFileSize(row.totalSize),
+    sorter: (left, right) => left.size - right.size,
+    render: (row) => formatFileSize(row.size),
+  },
+  {
+    title: "时间",
+    key: "startTime",
+    width: 170,
+    render: (row) => new Date(row.startTime ?? row.mtimeMs).toLocaleString(),
   },
 ];
+
+const localMergeFileColumns = localBurnFileColumns;
 
 const localDeletionColumns: DataTableColumns<LocalUploadedFileDeletionRecord> = [
   {
@@ -1787,15 +1903,43 @@ const uploadSelectedLocalGroups = async (mode: LocalUploadRunMode) => {
   pendingLocalUploadGroups.value = groups.map((row) => ({
     row,
     burnDanmu,
+    burnFilePaths: [],
     uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
   }));
-  if (localUploadOptions.mergeSegments && localMergeRows.value.length > 0) {
-    selectedMergeGroupIds.value = [];
-    localMergeDialogVisible.value = true;
+  if (burnDanmu && localBurnFileRows.value.length > 0) {
+    selectedBurnFileKeys.value = [];
+    localBurnDialogVisible.value = true;
     return;
   }
 
   await submitPreparedLocalUploadGroups(new Set());
+};
+
+const cancelLocalBurnSelection = () => {
+  localBurnDialogVisible.value = false;
+};
+
+const confirmLocalBurnSelection = async () => {
+  const selectedPaths = new Set(selectedBurnFileKeys.value.map((item) => String(item)));
+  pendingLocalUploadGroups.value = pendingLocalUploadGroups.value.map((item) => ({
+    ...item,
+    burnFilePaths: item.row.files
+      .filter((file) => selectedPaths.has(file.path))
+      .map((file) => file.path),
+  }));
+  localBurnDialogVisible.value = false;
+
+  if (localUploadOptions.mergeSegments && localMergeFileRows.value.length > 0) {
+    selectedMergeFileKeys.value = [];
+    localMergeDialogVisible.value = true;
+    return;
+  }
+
+  if (pendingLocalPreparedOperation.value === "sync") {
+    await submitPreparedLocalSyncGroups(new Set());
+  } else {
+    await submitPreparedLocalUploadGroups(new Set());
+  }
 };
 
 const cancelLocalMergeSelection = () => {
@@ -1803,17 +1947,49 @@ const cancelLocalMergeSelection = () => {
 };
 
 const confirmLocalMergeSelection = async () => {
-  const mergeIds = new Set(selectedMergeGroupIds.value.map((item) => String(item)));
+  const mergePaths = new Set(selectedMergeFileKeys.value.map((item) => String(item)));
+  const singleMergeGroup = pendingLocalUploadGroups.value.find(
+    (item) => item.row.files.filter((file) => mergePaths.has(file.path)).length === 1,
+  );
+  if (singleMergeGroup) {
+    notice.warning({
+      title: "每组至少选择两个视频",
+      content: singleMergeGroup.row.title,
+      duration: 3000,
+    });
+    return;
+  }
+  const partialBurnGroup = pendingLocalUploadGroups.value.find((item) => {
+    const selectedMergePaths = item.row.files
+      .filter((file) => mergePaths.has(file.path))
+      .map((file) => file.path);
+    if (selectedMergePaths.length < 2) return false;
+    const selectedBurnCount = selectedMergePaths.filter((filePath) =>
+      item.burnFilePaths.includes(filePath),
+    ).length;
+    return selectedBurnCount > 0 && selectedBurnCount < selectedMergePaths.length;
+  });
+  if (partialBurnGroup) {
+    notice.warning({
+      title: "合并组压制选择不完整",
+      content: `${partialBurnGroup.row.title}：合并分组内的视频需要全部压制或全部不压制`,
+      duration: 4000,
+    });
+    return;
+  }
   if (pendingLocalPreparedOperation.value === "sync") {
-    await submitPreparedLocalSyncGroups(mergeIds);
+    await submitPreparedLocalSyncGroups(mergePaths);
   } else {
-    await submitPreparedLocalUploadGroups(mergeIds);
+    await submitPreparedLocalUploadGroups(mergePaths);
   }
 };
 
-const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
+const submitPreparedLocalUploadGroups = async (mergePaths: Set<string>) => {
   const groups = pendingLocalUploadGroups.value.map((item) => {
     const row = item.row;
+    const mergeFilePaths = row.files
+      .filter((file) => mergePaths.has(file.path))
+      .map((file) => file.path);
     return {
       uploadKey: row.uploadKey,
       roomId: row.roomId,
@@ -1823,9 +1999,11 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
       startTime: row.startTime,
       aid: row.suggestedAction === "append" ? row.suggestedAid : undefined,
       uploadMode: row.suggestedAction === "append" ? ("append" as const) : ("new" as const),
-      burnDanmu: item.burnDanmu,
+      burnDanmu: item.burnDanmu && item.burnFilePaths.length > 0,
+      burnFilePaths: item.burnFilePaths,
       uploadRawWhenNoDanmu: item.uploadRawWhenNoDanmu,
-      mergeSegments: row.mergeCandidate && mergeIds.has(row.id),
+      mergeSegments: mergeFilePaths.length > 1,
+      mergeFilePaths,
       files: row.files,
     };
   });
@@ -1835,7 +2013,7 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     const result = await biliApi.uploadLocalUnuploaded({
       groups,
       options: {
-        burnDanmu: pendingLocalUploadGroups.value.some((item) => item.burnDanmu),
+        burnDanmu: pendingLocalUploadGroups.value.some((item) => item.burnFilePaths.length > 0),
         uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
         mergeSegments: false,
       },
@@ -1883,7 +2061,7 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
         ? `已加入 ${queuedCount} 个分组${
             skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
           }，${
-            pendingLocalUploadGroups.value.some((item) => item.burnDanmu)
+            pendingLocalUploadGroups.value.some((item) => item.burnFilePaths.length > 0)
               ? "压制后上传"
               : "直接上传"
           }任务会在队列中执行`
@@ -1895,7 +2073,9 @@ const submitPreparedLocalUploadGroups = async (mergeIds: Set<string>) => {
     });
     selectedLocalUploadGroupIds.value = [];
     pendingLocalUploadGroups.value = [];
-    selectedMergeGroupIds.value = [];
+    selectedBurnFileKeys.value = [];
+    selectedMergeFileKeys.value = [];
+    localBurnDialogVisible.value = false;
     localMergeDialogVisible.value = false;
   } catch (error) {
     notice.error({
@@ -1928,20 +2108,24 @@ const syncSelectedLocalGroups = async (mode: LocalUploadRunMode) => {
   pendingLocalUploadGroups.value = groups.map((row) => ({
     row,
     burnDanmu,
+    burnFilePaths: [],
     uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
   }));
-  if (burnDanmu && localUploadOptions.mergeSegments && localMergeRows.value.length > 0) {
-    selectedMergeGroupIds.value = [];
-    localMergeDialogVisible.value = true;
+  if (burnDanmu && localBurnFileRows.value.length > 0) {
+    selectedBurnFileKeys.value = [];
+    localBurnDialogVisible.value = true;
     return;
   }
 
   await submitPreparedLocalSyncGroups(new Set());
 };
 
-const submitPreparedLocalSyncGroups = async (mergeIds: Set<string>) => {
+const submitPreparedLocalSyncGroups = async (mergePaths: Set<string>) => {
   const groups = pendingLocalUploadGroups.value.map((item) => {
     const row = item.row;
+    const mergeFilePaths = row.files
+      .filter((file) => mergePaths.has(file.path))
+      .map((file) => file.path);
     return {
       syncKey: row.syncKey,
       roomId: row.roomId,
@@ -1949,9 +2133,11 @@ const submitPreparedLocalSyncGroups = async (mergeIds: Set<string>) => {
       username: row.username,
       title: row.title,
       startTime: row.startTime,
-      burnDanmu: item.burnDanmu,
+      burnDanmu: item.burnDanmu && item.burnFilePaths.length > 0,
+      burnFilePaths: item.burnFilePaths,
       uploadRawWhenNoDanmu: item.uploadRawWhenNoDanmu,
-      mergeSegments: item.burnDanmu && row.mergeCandidate && mergeIds.has(row.id),
+      mergeSegments: mergeFilePaths.length > 1,
+      mergeFilePaths,
       deleteSourceAfterSync: localUploadOptions.deleteSourceAfterSync,
       files: row.files,
     };
@@ -1962,7 +2148,7 @@ const submitPreparedLocalSyncGroups = async (mergeIds: Set<string>) => {
     const result = await biliApi.syncLocalUnuploaded({
       groups,
       options: {
-        burnDanmu: pendingLocalUploadGroups.value.some((item) => item.burnDanmu),
+        burnDanmu: pendingLocalUploadGroups.value.some((item) => item.burnFilePaths.length > 0),
         uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
         mergeSegments: false,
         deleteSourceAfterSync: localUploadOptions.deleteSourceAfterSync,
@@ -2011,7 +2197,9 @@ const submitPreparedLocalSyncGroups = async (mergeIds: Set<string>) => {
         ? `已加入 ${queuedCount} 个分组${
             skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
           }，会按 webhook 同步器配置${
-            pendingLocalUploadGroups.value.some((item) => item.burnDanmu) ? "压制后同步到网盘" : "同步到网盘"
+            pendingLocalUploadGroups.value.some((item) => item.burnFilePaths.length > 0)
+              ? "压制后同步到网盘"
+              : "同步到网盘"
           }${localUploadOptions.deleteSourceAfterSync ? "，同步成功后删除原始视频" : ""}`
         : `选中分组已有 ${skippedDuplicateCount} 个同步记录，已刷新状态${
             localUploadOptions.deleteSourceAfterSync ? "，已按完成记录尝试删除原始视频" : ""
@@ -2023,7 +2211,9 @@ const submitPreparedLocalSyncGroups = async (mergeIds: Set<string>) => {
     });
     selectedLocalUploadGroupIds.value = [];
     pendingLocalUploadGroups.value = [];
-    selectedMergeGroupIds.value = [];
+    selectedBurnFileKeys.value = [];
+    selectedMergeFileKeys.value = [];
+    localBurnDialogVisible.value = false;
     localMergeDialogVisible.value = false;
   } catch (error) {
     notice.error({

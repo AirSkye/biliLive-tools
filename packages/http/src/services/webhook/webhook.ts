@@ -88,13 +88,16 @@ export type LocalUploadOptions = {
   aid?: number;
   uploadMode?: "auto" | "new" | "append";
   burnDanmu?: boolean;
+  burnFilePaths?: string[];
   uploadRawWhenNoDanmu?: boolean;
   mergeSegments?: boolean;
+  mergeFilePaths?: string[];
   files: LocalUploadFileInput[];
 };
 
 type PreparedLocalUploadPart = {
   path: string;
+  sourcePaths: string[];
   title: string;
   startTime?: number;
   endTime?: number;
@@ -111,9 +114,6 @@ export type PreparedLocalSyncFile = {
   title: string;
   startTime?: number;
   endTime?: number;
-  danmuPath?: string;
-  xmlDanmuPath?: string;
-  coverPath?: string;
   cleanupPaths: string[];
   warnings: string[];
 };
@@ -597,6 +597,7 @@ export class WebhookHandler {
 
     return {
       path: mergedVideo,
+      sourcePaths: inputFiles,
       title: sortedFiles[0].title || path.parse(sortedFiles[0].path).name,
       startTime: sortedFiles[0].startTime,
       endTime: sortedFiles[sortedFiles.length - 1].endTime,
@@ -612,18 +613,34 @@ export class WebhookHandler {
     options: LocalUploadOptions,
   ): Promise<PreparedLocalUploadPart[]> {
     const sortedFiles = this.sortLocalUploadFiles(options.files);
+    const selectedMergePaths =
+      options.mergeFilePaths === undefined
+        ? undefined
+        : new Set(options.mergeFilePaths.map((filePath) => this.normalizeManagedPath(filePath)));
+    const mergeFiles = selectedMergePaths
+      ? sortedFiles.filter((file) => selectedMergePaths.has(this.normalizeManagedPath(file.path)))
+      : sortedFiles;
     const shouldMerge =
       options.mergeSegments &&
-      sortedFiles.length > 1 &&
-      sortedFiles.every((file) => path.extname(file.path).toLowerCase() === ".flv");
-    if (shouldMerge) {
-      return [await this.buildMergedLocalUploadPart(sortedFiles)];
-    }
+      mergeFiles.length > 1 &&
+      mergeFiles.every((file) => path.extname(file.path).toLowerCase() === ".flv");
 
     const parts: PreparedLocalUploadPart[] = [];
-    for (const file of sortedFiles) {
+    if (shouldMerge) {
+      parts.push(await this.buildMergedLocalUploadPart(mergeFiles));
+    }
+
+    const remainingFiles = shouldMerge
+      ? selectedMergePaths
+        ? sortedFiles.filter(
+            (file) => !selectedMergePaths.has(this.normalizeManagedPath(file.path)),
+          )
+        : []
+      : sortedFiles;
+    for (const file of remainingFiles) {
       parts.push({
         path: file.path,
+        sourcePaths: [file.path],
         title: file.title || path.parse(file.path).name,
         startTime: file.startTime,
         endTime: file.endTime,
@@ -634,7 +651,17 @@ export class WebhookHandler {
         warnings: [],
       });
     }
-    return parts;
+    return parts.sort((left, right) => (left.startTime ?? 0) - (right.startTime ?? 0));
+  }
+
+  private shouldBurnLocalUploadPart(part: PreparedLocalUploadPart, options: LocalUploadOptions) {
+    if (!options.burnDanmu) return false;
+    if (options.burnFilePaths === undefined) return true;
+
+    const selectedPaths = new Set(
+      options.burnFilePaths.map((filePath) => this.normalizeManagedPath(filePath)),
+    );
+    return part.sourcePaths.some((filePath) => selectedPaths.has(this.normalizeManagedPath(filePath)));
   }
 
   private async burnLocalUploadPart(
@@ -698,7 +725,6 @@ export class WebhookHandler {
 
       const preparedParts = await this.buildLocalUploadParts(options);
       const uploadRawWhenNoDanmu = options.uploadRawWhenNoDanmu ?? true;
-      const fallbackCoverPath = PathResolver.getCoverPath(this.sortLocalUploadFiles(options.files)[0]?.path || "");
       const files: PreparedLocalSyncFile[] = [];
 
       for (const preparedPart of preparedParts) {
@@ -706,7 +732,7 @@ export class WebhookHandler {
         let syncPath = preparedPart.path;
         const warnings = [...preparedPart.warnings];
 
-        if (options.burnDanmu) {
+        if (this.shouldBurnLocalUploadPart(preparedPart, options)) {
           try {
             syncPath = await this.burnLocalUploadPart(preparedPart, config);
             cleanupPaths.add(syncPath);
@@ -727,9 +753,6 @@ export class WebhookHandler {
           title: preparedPart.title,
           startTime: preparedPart.startTime,
           endTime: preparedPart.endTime,
-          danmuPath: preparedPart.danmuPath,
-          xmlDanmuPath: preparedPart.xmlDanmuPath,
-          coverPath: PathResolver.getCoverPath(preparedPart.path) || fallbackCoverPath,
           cleanupPaths: Array.from(cleanupPaths),
           warnings,
         });
@@ -787,7 +810,7 @@ export class WebhookHandler {
       for (const preparedPart of preparedParts) {
         warnings.push(...preparedPart.warnings);
         let uploadPath = preparedPart.path;
-        if (options.burnDanmu) {
+        if (this.shouldBurnLocalUploadPart(preparedPart, options)) {
           try {
             uploadPath = await this.burnLocalUploadPart(preparedPart, config);
           } catch (error) {
