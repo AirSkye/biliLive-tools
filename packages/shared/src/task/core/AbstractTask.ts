@@ -21,12 +21,14 @@ export abstract class AbstractTask {
   startTime: number = 0;
   endTime?: number;
   error?: string;
-  pauseStartTime: number | null = 0;
+  pauseStartTime: number | null = null;
   totalPausedDuration: number = 0;
   emitter = new TypedEmitter<TaskEvents>();
   limitTime?: [] | [string, string];
   extra?: Record<string, any>;
   manualStart: boolean;
+  autoStartWhenReady: boolean;
+  starting: boolean;
   on: TypedEmitter<TaskEvents>["on"];
   emit: TypedEmitter<TaskEvents>["emit"];
 
@@ -44,6 +46,8 @@ export abstract class AbstractTask {
     this.action = ["pause", "kill"];
     this.custsomProgressMsg = "";
     this.manualStart = false;
+    this.autoStartWhenReady = false;
+    this.starting = false;
     this.on = this.emitter.on.bind(this.emitter);
     this.emit = this.emitter.emit.bind(this.emitter);
   }
@@ -56,6 +60,11 @@ export abstract class AbstractTask {
     if (this.status === "pending") return 0;
     const now = Date.now();
     const currentTime = this.endTime || now;
-    return Math.max(currentTime - this.startTime, 0);
+    const currentPauseDuration =
+      this.status === "paused" && this.pauseStartTime ? now - this.pauseStartTime : 0;
+    return Math.max(
+      currentTime - this.startTime - this.totalPausedDuration - currentPauseDuration,
+      0,
+    );
   }
 }

@@ -60,6 +60,76 @@ describe("WebhookHandler", () => {
     webhookHandler = new WebhookHandler(appConfig);
   });
 
+  describe("local upload file planning", () => {
+    const localFile = (filePath: string, index: number) => ({
+      path: filePath,
+      title: `part-${index}`,
+      startTime: index * 1000,
+      endTime: index * 1000 + 500,
+    });
+
+    it("keeps a single selected merge file as a normal upload part", async () => {
+      (webhookHandler as any).resolveLocalDanmuPath = vi.fn().mockResolvedValue(undefined);
+      const mergeSpy = vi
+        .spyOn(webhookHandler as any, "buildMergedLocalUploadPart")
+        .mockResolvedValue(undefined);
+
+      const parts = await (webhookHandler as any).buildLocalUploadParts({
+        roomId: "100",
+        mergeSegments: false,
+        mergeFilePaths: ["C:\\recordings\\a.flv"],
+        files: [localFile("C:\\recordings\\a.flv", 1)],
+      });
+
+      expect(mergeSpy).not.toHaveBeenCalled();
+      expect(parts).toHaveLength(1);
+      expect(parts[0].sourcePaths).toEqual(["C:\\recordings\\a.flv"]);
+    });
+
+    it("merges selected FLV files and keeps MP4 as a separate part", async () => {
+      (webhookHandler as any).resolveLocalDanmuPath = vi.fn().mockResolvedValue(undefined);
+      vi.spyOn(webhookHandler as any, "buildMergedLocalUploadPart").mockResolvedValue({
+        path: "C:\\recordings\\merged.mp4",
+        sourcePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
+        title: "merged",
+        startTime: 1000,
+        endTime: 2500,
+        cleanupPaths: [],
+        temporaryPaths: [],
+        warnings: [],
+      });
+
+      const parts = await (webhookHandler as any).buildLocalUploadParts({
+        roomId: "100",
+        mergeSegments: true,
+        mergeFilePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
+        files: [
+          localFile("C:\\recordings\\a.flv", 1),
+          localFile("C:\\recordings\\b.flv", 2),
+          localFile("C:\\recordings\\ready.mp4", 3),
+        ],
+      });
+
+      expect(parts).toHaveLength(2);
+      expect(parts[0].sourcePaths).toEqual(["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"]);
+      expect(parts[1].sourcePaths).toEqual(["C:\\recordings\\ready.mp4"]);
+    });
+
+    it("burns only parts whose source files are selected", () => {
+      const options = {
+        roomId: "100",
+        burnDanmu: true,
+        burnFilePaths: ["C:\\recordings\\a.flv"],
+        files: [],
+      };
+      const selectedPart = { sourcePaths: ["C:\\recordings\\a.flv"] };
+      const otherPart = { sourcePaths: ["C:\\recordings\\b.flv"] };
+
+      expect((webhookHandler as any).shouldBurnLocalUploadPart(selectedPart, options)).toBe(true);
+      expect((webhookHandler as any).shouldBurnLocalUploadPart(otherPart, options)).toBe(false);
+    });
+  });
+
   describe("handleLiveData", () => {
     const appConfig = {
       getAll: vi.fn().mockReturnValue({
@@ -428,6 +498,11 @@ describe("WebhookHandler", () => {
         metaSpy.mockRestore();
         await fs.remove(tempDir);
       }
+    });
+
+    it("空间提示应使用正确的二进制单位", () => {
+      expect((webhookHandler as any).formatBytes(8 * 1024 * 1024 * 1024)).toBe("8.00 GB");
+      expect((webhookHandler as any).formatBytes(3 * 1024 * 1024 * 1024)).toBe("3.00 GB");
     });
 
     it("ffprobe返回异常超长时长时应回退到源文件大小估算", async () => {

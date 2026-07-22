@@ -47,7 +47,11 @@ type FFmpegTaskCallback = {
   onProgress?: (progress: Progress) => any;
 };
 
-type FFmpegCommandFactory = () => ffmpeg.FfmpegCommand | Promise<ffmpeg.FfmpegCommand>;
+type FFmpegCommandFactory = (
+  output?: string,
+) => ffmpeg.FfmpegCommand | Promise<ffmpeg.FfmpegCommand>;
+
+export type FFmpegTaskStartPreparation = (task: FFmpegTask) => boolean | Promise<boolean>;
 
 type BiliPartVideoTaskCallback = {
   onStart?: () => void;
@@ -146,6 +150,8 @@ export class FFmpegTask extends AbstractTask {
   isInterrupted: boolean = false;
   private callback: FFmpegTaskCallback;
   private commandFactory?: FFmpegCommandFactory;
+  private startPreparation?: FFmpegTaskStartPreparation;
+  private preparingStart = false;
 
   constructor(
     command: ffmpeg.FfmpegCommand,
@@ -242,11 +248,47 @@ export class FFmpegTask extends AbstractTask {
       this.emitter.emit("task-progress", { taskId: this.taskId });
     });
   }
-  exec() {
-    if (this.status !== "pending") console.warn("ffmpeg task is not pending when exec");
+  setStartPreparation(preparation: FFmpegTaskStartPreparation) {
+    this.startPreparation = preparation;
+  }
+  async replaceOutput(output: string) {
+    if (!this.commandFactory) {
+      throw new Error("该压制任务缺少命令工厂，无法切换输出目录");
+    }
+    this.output = output;
+    this.command = await this.commandFactory(output);
+    this.bindCommandEvents(this.command);
+  }
+  async exec() {
+    if (this.status !== "pending") {
+      console.warn("ffmpeg task is not pending when exec");
+      return;
+    }
+    if (this.preparingStart) return;
 
-    this.status = "running";
-    this.command.run();
+    this.preparingStart = true;
+    this.starting = true;
+    try {
+      if (this.startPreparation && !(await this.startPreparation(this))) {
+        this.emitter.emit("task-progress", { taskId: this.taskId });
+        return;
+      }
+
+      if (this.status !== "pending") return;
+      this.manualStart = false;
+      this.starting = false;
+      this.status = "running";
+      this.command.run();
+    } catch (error) {
+      this.status = "pending";
+      this.manualStart = true;
+      this.custsomProgressMsg = `启动前检查失败：${String(error)}`;
+      this.emitter.emit("task-progress", { taskId: this.taskId });
+      throw error;
+    } finally {
+      this.starting = false;
+      this.preparingStart = false;
+    }
   }
   pause() {
     if (this.status !== "running") return;
@@ -321,7 +363,7 @@ export class FFmpegTask extends AbstractTask {
     this.startTime = 0;
     this.endTime = undefined;
     this.status = "pending";
-    this.command = await this.commandFactory();
+    this.command = await this.commandFactory(this.output);
     log.info(
       `ffmpeg task ${this.taskId} restart, command: ${this.command._getArguments().join(" ")}`,
     );

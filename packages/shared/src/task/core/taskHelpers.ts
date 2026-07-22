@@ -143,8 +143,8 @@ export const handleQueryTask = (taskId: string) => {
 /**
  * 启动任务
  */
-export const handleStartTask = (taskId: string): void => {
-  taskQueue.start(taskId);
+export const handleStartTask = async (taskId: string): Promise<void> => {
+  await taskQueue.start(taskId);
 };
 
 /**

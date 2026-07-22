@@ -25,7 +25,7 @@ import {
   RGB2BGR,
 } from "../utils/index.js";
 import log from "../utils/log.js";
-import { taskQueue, FFmpegTask, AbstractTask } from "./task.js";
+import { taskQueue, FFmpegTask, AbstractTask, type FFmpegTaskStartPreparation } from "./task.js";
 import { isEmptyDanmu, convertXml2Ass, genHotProgress } from "./danmu.js";
 import { recordHistoryService } from "../db/index.js";
 
@@ -1013,6 +1013,8 @@ export const mergeAssMp4 = async (
     limitTime?: [] | [string, string];
     autoRun?: boolean;
     manualStart?: boolean;
+    autoStartWhenReady?: boolean;
+    startPreparation?: FFmpegTaskStartPreparation;
     removeSubtitle?: boolean;
     onEnd?: (output: string) => void | Promise<void>;
   } = {
@@ -1034,7 +1036,7 @@ export const mergeAssMp4 = async (
   };
   options = { ...defaultOptions, ...options };
   const videoInput = files.videoFilePath;
-  const output = files.outputPath;
+  let output = files.outputPath;
 
   if (!(await pathExists(videoInput))) {
     log.error("mergrAssMp4, file not exist", videoInput);
@@ -1047,9 +1049,10 @@ export const mergeAssMp4 = async (
 
   const assFile = files.assFilePath;
   const startTimestamp = options.startTimestamp || 0;
-  const createCommand = async () => {
+  const createCommand = async (nextOutput = output) => {
+    output = nextOutput;
     log.debug("genMergeAssMp4Command start", startTimestamp);
-    const command = await genMergeAssMp4Command(files, ffmpegOptions, {
+    const command = await genMergeAssMp4Command({ ...files, outputPath: output }, ffmpegOptions, {
       startTimestamp: startTimestamp,
       timestampFont: options.timestampFont,
     });
@@ -1106,6 +1109,10 @@ export const mergeAssMp4 = async (
     },
   );
   task.manualStart = options.manualStart ?? false;
+  task.autoStartWhenReady = options.autoStartWhenReady ?? false;
+  if (options.startPreparation) {
+    task.setStartPreparation(options.startPreparation);
+  }
   log.debug("mergeAssMp4 start task", task.taskId);
   taskQueue.addTask(task, options.autoRun ?? false);
 
@@ -1185,6 +1192,8 @@ export const transcode = async (
     /** 自动运行 */
     autoRun?: boolean;
     manualStart?: boolean;
+    autoStartWhenReady?: boolean;
+    startPreparation?: FFmpegTaskStartPreparation;
   },
 ) => {
   const options = Object.assign(
@@ -1211,6 +1220,8 @@ export const transcode = async (
       limitTime: options.limitTime,
       autoRun: options.autoRun ?? false,
       manualStart: options.manualStart ?? false,
+      autoStartWhenReady: options.autoStartWhenReady ?? false,
+      startPreparation: options.startPreparation,
     },
     ffmpegOptions,
   );
@@ -1514,6 +1525,8 @@ export const burn = async (
     limitTime?: [string, string];
     autoRun?: boolean;
     manualStart?: boolean;
+    autoStartWhenReady?: boolean;
+    startPreparation?: FFmpegTaskStartPreparation;
   },
   hooks: FFmpegTaskHooks = {},
 ) => {
@@ -1609,6 +1622,8 @@ export const burn = async (
       limitTime: options.limitTime,
       autoRun: options.autoRun ?? false,
       manualStart: options.manualStart ?? false,
+      autoStartWhenReady: options.autoStartWhenReady ?? false,
+      startPreparation: options.startPreparation,
       onEnd: hooks.onEnd,
     },
     options.ffmpegOptions,

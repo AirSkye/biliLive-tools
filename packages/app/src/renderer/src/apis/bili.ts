@@ -426,6 +426,7 @@ const uploadLocalUnuploaded = async (data: {
     uploadKey?: string;
     roomId: string;
     title?: string;
+    filePaths?: string[];
     status: "queued" | "skipped";
     reason?: string;
   }>;
@@ -462,6 +463,7 @@ const syncLocalUnuploaded = async (data: {
     syncKey?: string;
     roomId: string;
     title?: string;
+    filePaths?: string[];
     status: "queued" | "skipped";
     reason?: string;
   }>;
@@ -479,6 +481,7 @@ const getLocalUnuploadedUploadStatuses = async (
     roomId?: string;
     platform?: string;
     title?: string;
+    filePaths?: string[];
     status: "missing" | "queued" | "running" | "completed" | "error";
     createdAt?: number;
     updatedAt?: number;

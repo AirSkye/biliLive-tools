@@ -41,6 +41,7 @@ import type {
   DanmuConfig,
   HotProgressOptions,
 } from "@biliLive-tools/types";
+import type { FFmpegTask } from "@biliLive-tools/shared/task/task.js";
 import type { AppConfig } from "@biliLive-tools/shared/config.js";
 import type { Options, Platform, UploadStatus } from "../../types/webhook.js";
 import type { RoomConfig } from "./ConfigManager.js";
@@ -281,7 +282,7 @@ export class WebhookHandler {
 
   private formatBytes(bytes: number) {
     if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
-    const units = ["B", "MB", "GB", "TB"];
+    const units = ["B", "KB", "MB", "GB", "TB", "PB"];
     let value = bytes;
     let unitIndex = 0;
     while (value >= 1024 && unitIndex < units.length - 1) {
@@ -533,6 +534,28 @@ export class WebhookHandler {
     };
   }
 
+  private createFfmpegStartPreparation(
+    input: string,
+    output: string,
+    preset: FfmpegOptions,
+    context?: { roomId?: string; username?: string },
+  ) {
+    return async (task: FFmpegTask) => {
+      const plan = await this.planFfmpegOutput(input, output, preset, context);
+      task.custsomProgressMsg = plan.message;
+      if (!plan.autoRun) {
+        task.manualStart = true;
+        return false;
+      }
+
+      if (plan.output !== task.output) {
+        await task.replaceOutput(plan.output);
+      }
+      task.manualStart = false;
+      return true;
+    };
+  }
+
   private async resolveLocalDanmuPath(file: LocalUploadFileInput, xmlOnly = false) {
     const candidates = xmlOnly
       ? [file.xmlDanmuPath, replaceExtName(file.path, ".xml")]
@@ -661,7 +684,9 @@ export class WebhookHandler {
     const selectedPaths = new Set(
       options.burnFilePaths.map((filePath) => this.normalizeManagedPath(filePath)),
     );
-    return part.sourcePaths.some((filePath) => selectedPaths.has(this.normalizeManagedPath(filePath)));
+    return part.sourcePaths.some((filePath) =>
+      selectedPaths.has(this.normalizeManagedPath(filePath)),
+    );
   }
 
   private async burnLocalUploadPart(
@@ -749,7 +774,10 @@ export class WebhookHandler {
 
         files.push({
           path: syncPath,
-          type: options.burnDanmu && syncPath !== preparedPart.path ? "danmaku" : PathResolver.getFileType(syncPath),
+          type:
+            options.burnDanmu && syncPath !== preparedPart.path
+              ? "danmaku"
+              : PathResolver.getFileType(syncPath),
           title: preparedPart.title,
           startTime: preparedPart.startTime,
           endTime: preparedPart.endTime,
@@ -1611,6 +1639,11 @@ export class WebhookHandler {
       removeOrigin: options.removeVideo,
       autoRun: false,
       manualStart: !plan.autoRun,
+      autoStartWhenReady: true,
+      startPreparation: this.createFfmpegStartPreparation(videoFile, output, preset, {
+        roomId: options.roomId,
+        username: options.username,
+      }),
     });
     task.custsomProgressMsg = plan.message;
 
@@ -1683,6 +1716,16 @@ export class WebhookHandler {
       override: false,
       autoRun: false,
       manualStart: !plan.autoRun,
+      autoStartWhenReady: true,
+      startPreparation: this.createFfmpegStartPreparation(
+        videoInput,
+        output,
+        options.ffmpegOptions,
+        {
+          roomId: options.roomId,
+          username: options.username,
+        },
+      ),
     });
     task.custsomProgressMsg = plan.message;
 

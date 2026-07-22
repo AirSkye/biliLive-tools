@@ -651,11 +651,50 @@ const getLocalUploadQueueItem = async (key: string) => {
   return stored;
 };
 
+const removeCompletedUploadFilesFromHistories = (
+  store: LocalDetectHistoryStore,
+  filePaths: string[],
+) => {
+  const completedPaths = new Set(filePaths.map(normalizeLocalUploadFilePath));
+  if (completedPaths.size === 0) return;
+
+  for (const history of store.histories) {
+    history.result.unuploadedGroups = history.result.unuploadedGroups.flatMap((group) => {
+      const files = group.files.filter(
+        (file) => !completedPaths.has(normalizeLocalUploadFilePath(file.path)),
+      );
+      if (files.length === 0) return [];
+      if (files.length === group.files.length) return [group];
+      return [
+        {
+          ...group,
+          files,
+          fileCount: files.length,
+          totalSize: files.reduce((sum, file) => sum + file.size, 0),
+          danmuCount: files.filter((file) => file.danmuPath || file.xmlDanmuPath).length,
+          mergeCandidate:
+            files.length > 1 &&
+            files.every((file) => path.extname(file.path).toLowerCase() === ".flv"),
+          startTime: files[0].startTime ?? files[0].mtimeMs,
+          endTime: files[files.length - 1].endTime,
+          uploadStatus: undefined,
+          uploadQueuedAt: undefined,
+          uploadUpdatedAt: undefined,
+          uploadError: undefined,
+        },
+      ];
+    });
+  }
+};
+
 const saveLocalUploadQueueItem = async (item: LocalUploadQueueItem) => {
   localUploadQueueItems.set(item.key, item);
   const store = await readLocalDetectHistoryStore();
   cleanupLocalUploadQueueStore(store);
   store.localUploads = [item, ...store.localUploads.filter((record) => record.key !== item.key)];
+  if (item.operation === "upload" && item.status === "completed") {
+    removeCompletedUploadFilesFromHistories(store, item.filePaths);
+  }
   await writeLocalDetectHistoryStore(store);
 };
 
@@ -3287,6 +3326,7 @@ router.get("/uploadLocalUnuploaded/status", async (ctx) => {
       roomId: item.roomId,
       platform: item.platform,
       title: item.title,
+      filePaths: item.filePaths,
       status: isStaleRunningRecord ? "error" : item.status,
       createdAt: item.createdAt,
       updatedAt: item.updatedAt,
@@ -3311,7 +3351,12 @@ const waitForLocalSyncTask = (task: any, filePath: string) =>
 
 const cleanupLocalSyncSourceFiles = async (files: Array<{ path: string }>) => {
   const sourcePaths = Array.from(
-    new Set(files.map((file) => file.path).filter(Boolean).map((filePath) => path.resolve(filePath))),
+    new Set(
+      files
+        .map((file) => file.path)
+        .filter(Boolean)
+        .map((filePath) => path.resolve(filePath)),
+    ),
   );
   for (const filePath of sourcePaths) {
     try {
@@ -3358,10 +3403,7 @@ const syncLocalUnuploadedFiles = async (group: {
   let hasVideoCandidate = false;
   const seen = new Set<string>();
   const cleanupPaths = new Set<string>();
-  const addCandidate = (
-    filePath: string | undefined,
-    type: "source" | "danmaku",
-  ) => {
+  const addCandidate = (filePath: string | undefined, type: "source" | "danmaku") => {
     if (!filePath) return;
     const key = `${type}:${normalizeLocalPath(filePath)}`;
     if (seen.has(key)) return;
@@ -3484,6 +3526,7 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
     syncKey?: string;
     roomId: string;
     title?: string;
+    filePaths?: string[];
     status: "queued" | "skipped";
     reason?: string;
   }> = [];
@@ -3520,6 +3563,7 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
         syncKey,
         roomId: group.roomId,
         title: group.title,
+        filePaths,
         status: "skipped",
         reason: `duplicate:${activeUpload.status}`,
       });
@@ -3573,6 +3617,7 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
       syncKey,
       roomId: group.roomId,
       title: group.title,
+      filePaths,
       status: "queued",
     });
   }
@@ -3622,6 +3667,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
     uploadKey?: string;
     roomId: string;
     title?: string;
+    filePaths?: string[];
     status: "queued" | "skipped";
     reason?: string;
   }> = [];
@@ -3653,6 +3699,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
         uploadKey,
         roomId: group.roomId,
         title: group.title,
+        filePaths,
         status: "skipped",
         reason: `duplicate:${activeUpload.status}`,
       });
@@ -3707,6 +3754,7 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
       uploadKey,
       roomId: group.roomId,
       title: group.title,
+      filePaths,
       status: "queued",
     });
   }

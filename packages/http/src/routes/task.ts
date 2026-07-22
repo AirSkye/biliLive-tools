@@ -150,7 +150,7 @@ router.post("/:id/removeFile", async (ctx) => {
 
 router.post("/:id/start", async (ctx) => {
   const { id } = ctx.params;
-  handleStartTask(id);
+  await handleStartTask(id);
   ctx.body = { code: 0 };
 });
 

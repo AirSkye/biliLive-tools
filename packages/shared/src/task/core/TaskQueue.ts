@@ -25,6 +25,7 @@ type PersistedTaskRecord = {
   error?: string;
   extra?: Record<string, any>;
   manualStart?: boolean;
+  autoStartWhenReady?: boolean;
 };
 
 class RestoredTask extends AbstractTask {
@@ -33,21 +34,28 @@ class RestoredTask extends AbstractTask {
   constructor(record: PersistedTaskRecord) {
     super();
     const interrupted = record.status === "running" || record.status === "paused";
+    const unrestorable = record.status === "pending";
+    const needsRecovery = interrupted || unrestorable;
     this.pid = record.pid;
     this.taskId = record.taskId;
-    this.status = interrupted ? "error" : record.status;
+    this.status = needsRecovery ? "error" : record.status;
     this.name = record.name;
     this.type = record.type;
     this.relTaskId = record.relTaskId;
     this.output = record.output;
-    this.progress = interrupted ? 0 : record.progress;
+    this.progress = needsRecovery ? 0 : record.progress;
     this.action = [];
     this.startTime = record.startTime;
-    this.endTime = record.endTime ?? (interrupted ? Date.now() : undefined);
+    this.endTime = record.endTime ?? (needsRecovery ? Date.now() : undefined);
     this.custsomProgressMsg = record.custsomProgressMsg ?? "";
-    this.error = interrupted ? "应用关闭时任务已中断，请重新创建任务或删除记录" : record.error;
+    this.error = interrupted
+      ? "应用关闭时任务已中断，请重新创建任务或删除记录"
+      : unrestorable
+        ? "应用重启后未恢复可执行上下文，请重新创建任务或删除记录"
+        : record.error;
     this.extra = record.extra;
     this.manualStart = record.manualStart ?? false;
+    this.autoStartWhenReady = record.autoStartWhenReady ?? false;
   }
 
   exec() {}
@@ -175,7 +183,9 @@ export class TaskQueue {
     const config = this.appConfig.getAll();
     const maxNum = config?.task?.[typeMap[task.type]] ?? 0;
     if (maxNum >= 0) {
-      this.filter({ type: task.type, status: "running" }).length < maxNum &&
+      this.queue.filter(
+        (item) => item.type === task.type && (item.status === "running" || item.starting),
+      ).length < maxNum &&
         isBetweenTimeRange(task.limitTime) &&
         task.exec();
     } else {
@@ -261,6 +271,7 @@ export class TaskQueue {
         duration: task.getDuration(),
         extra: task.extra,
         manualStart: task.manualStart,
+        autoStartWhenReady: task.autoStartWhenReady,
       };
     });
   }
@@ -286,11 +297,12 @@ export class TaskQueue {
   /**
    * 启动任务
    */
-  start(taskId: string): void {
+  async start(taskId: string): Promise<void> {
     const task = this.queryTask(taskId);
     if (!task) return;
     if (task.status !== "pending") return;
-    task.exec();
+    await task.exec();
+    this.schedulePersist();
   }
 
   /**
@@ -314,7 +326,9 @@ export class TaskQueue {
     const task = this.queryTask(taskId);
     if (!task) return;
     task.pause();
-    task.pauseStartTime = Date.now();
+    if (task.status === "paused") {
+      task.pauseStartTime = Date.now();
+    }
     this.schedulePersist();
   }
 
@@ -324,12 +338,13 @@ export class TaskQueue {
   resume(taskId: string): void {
     const task = this.queryTask(taskId);
     if (!task) return;
+    const pauseStartTime = task.pauseStartTime;
     task.resume();
+    if (task.status === "running" && pauseStartTime !== null) {
+      task.totalPausedDuration += Date.now() - pauseStartTime;
+      task.pauseStartTime = null;
+    }
     this.schedulePersist();
-    // if (task.pauseStartTime !== null) {
-    //   task.totalPausedDuration += Date.now() - task.pauseStartTime;
-    //   task.pauseStartTime = null;
-    // }
   }
 
   /**
@@ -375,14 +390,14 @@ export class TaskQueue {
    */
   private taskLimit(maxNum: number, type: string): void {
     const pendingFFmpegTask = this.filter({ type: type, status: "pending" }).filter((task) => {
-      if (task.manualStart) return false;
+      if (task.starting) return false;
+      if (task.manualStart && !task.autoStartWhenReady) return false;
       return isBetweenTimeRange(task.limitTime);
     });
     if (maxNum !== -1) {
-      const runningTaskCount = this.filter({
-        type: type,
-        status: "running",
-      }).length;
+      const runningTaskCount = this.queue.filter(
+        (task) => task.type === type && (task.status === "running" || task.starting),
+      ).length;
 
       if (runningTaskCount < maxNum) {
         pendingFFmpegTask.slice(0, maxNum - runningTaskCount).forEach((task) => {

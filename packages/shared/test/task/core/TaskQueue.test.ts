@@ -2,7 +2,12 @@ import os from "node:os";
 import path from "node:path";
 import EventEmitter from "node:events";
 import fs from "fs-extra";
-import { TaskQueue, AbstractTask, FFmpegTask } from "../../../src/task/task.js";
+import {
+  TaskQueue,
+  AbstractTask,
+  FFmpegTask,
+  FFmpegTask as ActualFFmpegTask,
+} from "../../../src/task/task.js";
 import { TaskType } from "../../../src/enum.js";
 import { sleep } from "../../../src/utils/index.js";
 import { expect, describe, it, beforeEach, vi } from "vitest";
@@ -118,6 +123,26 @@ describe("TaskQueue", () => {
       expect(restoredTask.name).toBe("running task");
       expect(restoredTask.status).toBe("error");
       expect(restoredTask.error).toContain("应用关闭时任务已中断");
+    } finally {
+      fs.removeSync(tempDir);
+    }
+  });
+
+  it("should mark pending restored tasks as unrecoverable", () => {
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-task-queue-pending-"));
+    try {
+      const task = new TestTask();
+      task.name = "pending task";
+      taskQueue.addTask(task, false);
+      taskQueue.initPersistence(tempDir);
+      taskQueue.flushPersistence();
+
+      const nextQueue = new TaskQueue(taskQueue.appConfig);
+      nextQueue.initPersistence(tempDir);
+      const restoredTask = nextQueue.list()[0];
+
+      expect(restoredTask.status).toBe("error");
+      expect(restoredTask.error).toContain("未恢复可执行上下文");
     } finally {
       fs.removeSync(tempDir);
     }
@@ -263,6 +288,85 @@ describe("TaskQueue", () => {
 
         taskQueue.start(task.taskId);
         expect(task.exec).toHaveBeenCalledTimes(1);
+      });
+      it("should periodically retry tasks waiting for space", () => {
+        const task = new FFmpegTask();
+        task.manualStart = true;
+        task.autoStartWhenReady = true;
+
+        taskQueue.addTask(task, false);
+
+        expect(task.exec).not.toHaveBeenCalled();
+        (taskQueue as any).addTaskForLimit();
+
+        expect(task.exec).toHaveBeenCalledTimes(1);
+      });
+      it("should keep a blocked ffmpeg task pending when start preparation fails", async () => {
+        const command = new EventEmitter() as any;
+        command.run = vi.fn();
+        command.kill = vi.fn();
+        command._getArguments = vi.fn(() => []);
+        const task = new (ActualFFmpegTask as any)(
+          command,
+          { output: "blocked.mp4", name: "blocked" },
+          {},
+        ) as FFmpegTask;
+        task.manualStart = true;
+        task.setStartPreparation(vi.fn().mockResolvedValue(false));
+
+        await task.exec();
+
+        expect(command.run).not.toHaveBeenCalled();
+        expect(task.status).toBe("pending");
+        expect(task.manualStart).toBe(true);
+      });
+      it("should replace the output command after start preparation succeeds", async () => {
+        const initialCommand = new EventEmitter() as any;
+        initialCommand.run = vi.fn();
+        initialCommand.kill = vi.fn();
+        initialCommand._getArguments = vi.fn(() => []);
+        const migratedCommand = new EventEmitter() as any;
+        migratedCommand.run = vi.fn();
+        migratedCommand.kill = vi.fn();
+        migratedCommand._getArguments = vi.fn(() => []);
+        const commandFactory = vi.fn().mockResolvedValue(migratedCommand);
+        const task = new ActualFFmpegTask(
+          initialCommand,
+          { output: "source.mp4", name: "source" },
+          {},
+          { commandFactory },
+        );
+        task.manualStart = true;
+        task.setStartPreparation(async (currentTask) => {
+          await currentTask.replaceOutput("alternate.mp4");
+          return true;
+        });
+
+        await task.exec();
+
+        expect(commandFactory).toHaveBeenCalledWith("alternate.mp4");
+        expect(migratedCommand.run).toHaveBeenCalledTimes(1);
+        expect(task.output).toBe("alternate.mp4");
+        expect(task.manualStart).toBe(false);
+      });
+      it("should exclude paused time from ffmpeg duration", () => {
+        const nowSpy = vi.spyOn(Date, "now").mockReturnValue(20_000);
+        const command = new EventEmitter() as any;
+        command._getArguments = vi.fn(() => []);
+        command.kill = vi.fn();
+        const task = new ActualFFmpegTask(
+          command,
+          { output: "duration.mp4", name: "duration" },
+          {},
+        );
+        task.status = "paused";
+        task.startTime = 0;
+        task.pauseStartTime = 10_000;
+        task.totalPausedDuration = 3_000;
+
+        expect(task.getDuration()).toBe(7_000);
+
+        nowSpy.mockRestore();
       });
       // it("should auto start after task-end event", async () => {
       //   const task1 = new FFmpegTask();
