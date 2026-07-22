@@ -20,6 +20,7 @@ import {
 import type { BiliupConfig, PartTitleFormatOptions } from "@biliLive-tools/types";
 import { appConfig, config as globalConfig, handler } from "../index.js";
 import { PathResolver } from "../services/webhook/PathResolver.js";
+import { RecoverableJsonStore } from "../utils/recoverableJsonStore.js";
 import type { LocalUploadOptions } from "../services/webhook/webhook.js";
 import type { LiveHistory } from "@biliLive-tools/shared/db/model/recordHistory.js";
 import type { Streamer } from "@biliLive-tools/shared/db/model/streamer.js";
@@ -550,42 +551,33 @@ const normalizeLocalDetectHistoryItem = (
   };
 };
 
-const readLocalDetectHistoryStore = async (): Promise<LocalDetectHistoryStore> => {
-  const filePath = getLocalDetectHistoryFile();
-  if (!(await fs.pathExists(filePath))) {
-    return createEmptyLocalDetectHistoryStore();
-  }
-  try {
-    const data = (await fs.readJson(filePath)) as Partial<LocalDetectHistoryStore>;
-    return {
-      version: 1,
-      histories: Array.isArray(data.histories)
-        ? data.histories.map((item) => normalizeLocalDetectHistoryItem(item))
-        : [],
-      deletions: Array.isArray(data.deletions) ? data.deletions : [],
-      localUploads: Array.isArray(data.localUploads) ? data.localUploads : [],
-    };
-  } catch (error) {
-    console.error(`read local detect history failed: ${filePath}`, error);
-    throw new Error(`读取本地检测历史失败：${filePath}`);
-  }
+const normalizeLocalDetectHistoryStore = (data: unknown): LocalDetectHistoryStore => {
+  const store = (data ?? {}) as Partial<LocalDetectHistoryStore>;
+  return {
+    version: 1,
+    histories: Array.isArray(store.histories)
+      ? store.histories.map((item) => normalizeLocalDetectHistoryItem(item))
+      : [],
+    deletions: Array.isArray(store.deletions) ? store.deletions : [],
+    localUploads: Array.isArray(store.localUploads) ? store.localUploads : [],
+  };
 };
 
-const writeLocalDetectHistoryStore = async (store: LocalDetectHistoryStore) => {
-  const filePath = getLocalDetectHistoryFile();
-  await fs.ensureDir(path.dirname(filePath));
-  await fs.writeJson(
-    filePath,
-    {
-      version: 1,
-      histories: store.histories.slice(0, LOCAL_DETECT_HISTORY_LIMIT),
-      deletions: store.deletions.slice(0, LOCAL_DETECT_DELETION_LIMIT),
-      localUploads: store.localUploads
-        .filter((item) => Date.now() - item.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS)
-        .slice(0, 3000),
-    },
-    { spaces: 2 },
-  );
+const localDetectHistoryStore = new RecoverableJsonStore<LocalDetectHistoryStore>({
+  getFilePath: getLocalDetectHistoryFile,
+  createDefault: createEmptyLocalDetectHistoryStore,
+  normalize: normalizeLocalDetectHistoryStore,
+});
+
+const readLocalDetectHistoryStore = () => localDetectHistoryStore.read();
+
+const writeLocalDetectHistoryStore = (store: LocalDetectHistoryStore) => {
+  store.histories = store.histories.slice(0, LOCAL_DETECT_HISTORY_LIMIT);
+  store.deletions = store.deletions.slice(0, LOCAL_DETECT_DELETION_LIMIT);
+  store.localUploads = store.localUploads
+    .filter((item) => Date.now() - item.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS)
+    .slice(0, 3000);
+  return localDetectHistoryStore.write(store);
 };
 
 const normalizeLocalUploadFilePath = (filePath: string) => normalizeLocalPath(filePath);
@@ -689,13 +681,19 @@ const removeCompletedUploadFilesFromHistories = (
 
 const saveLocalUploadQueueItem = async (item: LocalUploadQueueItem) => {
   localUploadQueueItems.set(item.key, item);
-  const store = await readLocalDetectHistoryStore();
-  cleanupLocalUploadQueueStore(store);
-  store.localUploads = [item, ...store.localUploads.filter((record) => record.key !== item.key)];
-  if (item.operation === "upload" && item.status === "completed") {
-    removeCompletedUploadFilesFromHistories(store, item.filePaths);
+  try {
+    await localDetectHistoryStore.update((store) => {
+      cleanupLocalUploadQueueStore(store);
+      store.localUploads = [item, ...store.localUploads.filter((record) => record.key !== item.key)]
+        .filter((record) => Date.now() - record.updatedAt <= LOCAL_UPLOAD_QUEUE_TTL_MS)
+        .slice(0, 3000);
+      if (item.operation === "upload" && item.status === "completed") {
+        removeCompletedUploadFilesFromHistories(store, item.filePaths);
+      }
+    });
+  } catch (error) {
+    console.error("save local upload queue history failed, continue with memory state", error);
   }
-  await writeLocalDetectHistoryStore(store);
 };
 
 const updateLocalUploadQueueStatus = async (
