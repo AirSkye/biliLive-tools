@@ -73,6 +73,23 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
   private cmd: ChildProcess | null = null;
   private uploadCmd: ChildProcess | null = null;
 
+  private isRemotePathMissingError(error: unknown): boolean {
+    return /not found|not exist|no such file|不存在|未找到/i.test(String(error));
+  }
+
+  private async getExistingRemoteFileMeta(remoteFilePath: string) {
+    try {
+      const meta = await this.getFileMeta(remoteFilePath);
+      if (!meta.path && !meta.filename && !meta.fsId) {
+        throw new Error(`无法解析远端文件信息: ${remoteFilePath}`);
+      }
+      return meta;
+    } catch (error) {
+      if (this.isRemotePathMissingError(error)) return null;
+      throw new Error(`检查百度网盘远端文件失败: ${remoteFilePath}，${String(error)}`);
+    }
+  }
+
   constructor(options?: BaiduPCSOptions) {
     super();
     this.binary = options?.binary || "BaiduPCS-Go";
@@ -146,9 +163,10 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
           this.cmd = null;
           resolve(stdout);
         } else {
+          const commandOutput = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
           const errorMsg = uploadFailed
             ? `上传失败: 检测到"文件上传失败"信息 ${stdout}`
-            : `命令执行失败: ${stderr}`;
+            : `命令执行失败: ${commandOutput}`;
           this.logger.error(`命令执行失败: ${args.join(" ")}`);
           this.cmd = null;
           reject(new Error(`Command failed with code ${code}: ${errorMsg}`));
@@ -301,14 +319,31 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
       throw error;
     }
 
+    const localFileMeta = await fs.stat(localFilePath);
+
     // 确保目标文件夹存在
     const targetDir = path.join(this.remotePath, remoteDir).replace(/\\/g, "/");
+    const remoteFilepath = path.posix.join(targetDir, path.parse(localFilePath).base);
 
     try {
+      if (options?.policy === "skip") {
+        const remoteFileMeta = await this.getExistingRemoteFileMeta(remoteFilepath);
+        if (remoteFileMeta) {
+          if (remoteFileMeta.size === localFileMeta.size) {
+            const skippedMessage = `远端已存在同名同大小文件，跳过同步: ${remoteFilepath}`;
+            this.logger.info(skippedMessage);
+            this.emit("success", skippedMessage);
+            return;
+          }
+          throw new Error(
+            `远端已存在同名文件但大小不同，已停止同步: ${remoteFilepath}（本地 ${localFileMeta.size} 字节，远端 ${remoteFileMeta.size ?? 0} 字节）`,
+          );
+        }
+      }
+
       // 执行上传
       this.logger.info(`开始上传: ${localFilePath} 到 ${targetDir}`);
       const args = ["upload", localFilePath, targetDir, "--norapid"];
-      console.log(options);
       // if (options?.retry !== undefined) {
       //   args.push("--retry", options.retry.toString());
       // }
@@ -317,10 +352,11 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
       // }
       await this.executeUploadCommand(args);
 
-      const remoteFilepath = path.posix.join(targetDir, path.parse(localFilePath).base);
       const data = await this.getFileMeta(remoteFilepath);
-      if (data.size === 0) {
-        const error = new Error("文件大小为0，上传失败");
+      if (data.size !== localFileMeta.size) {
+        const error = new Error(
+          `上传后文件大小校验失败: ${remoteFilepath}（本地 ${localFileMeta.size} 字节，远端 ${data.size ?? 0} 字节）`,
+        );
         throw error;
       }
 

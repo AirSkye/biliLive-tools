@@ -3862,6 +3862,78 @@ describe("Live", () => {
           pathExistsSpy.mockRestore();
         });
 
+        it("本地补偿上传应跳过已完成文件并继续上传其余文件", async () => {
+          const completedLive = new Live({
+            platform: "bilibili",
+            software: "local-upload",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Completed live",
+            username: "User",
+          });
+          completedLive.addPart({
+            filePath: "/path/to/completed.flv",
+            rawFilePath: "/path/to/completed.flv",
+            recordStatus: "handled",
+            uploadStatus: "uploaded",
+            rawUploadStatus: "uploaded",
+            title: "Completed part",
+          });
+          webhookHandler.liveData.push(completedLive);
+          vi.spyOn(fs, "pathExists").mockResolvedValue(true);
+          // @ts-ignore
+          webhookHandler.configManager.getConfig = vi.fn().mockReturnValue({
+            uid: 1,
+            roomId: "123",
+            afterUploadDeletAction: "none",
+          });
+          // @ts-ignore
+          webhookHandler.resolveLocalDanmuPath = vi.fn().mockResolvedValue(undefined);
+          const uploadSpy = vi
+            .spyOn(webhookHandler as any, "uploadVideoByType")
+            .mockResolvedValue(undefined);
+
+          const result = await webhookHandler.uploadLocalFiles({
+            roomId: "123",
+            files: [{ path: "/path/to/completed.flv" }, { path: "/path/to/pending.flv" }],
+          });
+
+          expect(uploadSpy).toHaveBeenCalledOnce();
+          expect(webhookHandler.liveData.at(-1)?.parts.map((part) => part.filePath)).toEqual([
+            "/path/to/pending.flv",
+          ]);
+          expect(result.warnings).toContain("completed.flv 已由本地上传流程上传完成，本次已跳过");
+        });
+
+        it("本地补偿上传全部文件均已完成时不应创建新任务", async () => {
+          const completedLive = new Live({
+            platform: "bilibili",
+            software: "local-upload",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Completed live",
+            username: "User",
+          });
+          completedLive.addPart({
+            filePath: "/path/to/completed.flv",
+            rawFilePath: "/path/to/completed.flv",
+            recordStatus: "handled",
+            uploadStatus: "uploaded",
+            rawUploadStatus: "uploaded",
+            title: "Completed part",
+          });
+          webhookHandler.liveData.push(completedLive);
+          const uploadSpy = vi.spyOn(webhookHandler as any, "uploadVideoByType");
+
+          const result = await webhookHandler.uploadLocalFiles({
+            roomId: "123",
+            files: [{ path: "/path/to/completed.flv" }],
+          });
+
+          expect(uploadSpy).not.toHaveBeenCalled();
+          expect(result.warnings).toHaveLength(1);
+        });
+
         it("应正确构建上传文件列表", () => {
           const live = new Live({
             eventId: "123",

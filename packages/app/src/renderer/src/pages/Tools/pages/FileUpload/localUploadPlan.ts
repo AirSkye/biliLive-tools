@@ -115,3 +115,36 @@ export const removeCompletedLocalUploadFiles = (
     ];
   });
 };
+
+export const removeLocalUnuploadedFiles = (
+  groups: LocalUnuploadedGroup[],
+  deletedFilePaths: string[],
+) => {
+  const deletedPaths = new Set(deletedFilePaths.map(normalizePath));
+  return groups.flatMap((row) => {
+    const files = row.files.filter((file) => !deletedPaths.has(normalizePath(file.path)));
+    if (files.length === 0) return [];
+    if (files.length === row.files.length) return [row];
+
+    return [
+      {
+        ...row,
+        files,
+        fileCount: files.length,
+        totalSize: files.reduce((sum, file) => sum + file.size, 0),
+        danmuCount: files.filter((file) => file.danmuPath || file.xmlDanmuPath).length,
+        mergeCandidate: files.length > 1 && files.every((file) => isFlv(file.path)),
+        startTime: files[0].startTime ?? files[0].mtimeMs,
+        endTime: files[files.length - 1].endTime,
+        uploadStatus: undefined,
+        uploadQueuedAt: undefined,
+        uploadUpdatedAt: undefined,
+        uploadError: undefined,
+        syncStatus: undefined,
+        syncQueuedAt: undefined,
+        syncUpdatedAt: undefined,
+        syncError: undefined,
+      },
+    ];
+  });
+};

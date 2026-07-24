@@ -1,7 +1,12 @@
-import { describe, it, expect, vi } from "vitest";
+import fs from "fs-extra";
+import { afterEach, describe, it, expect, vi } from "vitest";
 import { BaiduPCS } from "../../src/sync/baiduPCS";
 
 describe("BaiduPCS", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   describe("parseProgress", () => {
     it("应该正确解析带索引的进度信息", () => {
       const baiduPCS = new BaiduPCS();
@@ -59,6 +64,70 @@ describe("BaiduPCS", () => {
         elapsed: "10s",
         percentage: 50,
       });
+    });
+  });
+
+  describe("uploadFile remote deduplication", () => {
+    const localFilePath = "C:/recordings/test.flv";
+
+    const mockLocalFile = (size: number) => {
+      vi.spyOn(fs, "pathExists").mockResolvedValue(true);
+      vi.spyOn(fs, "stat").mockResolvedValue({ size } as Awaited<ReturnType<typeof fs.stat>>);
+    };
+
+    it("skips upload when the remote file has the same size", async () => {
+      mockLocalFile(1024);
+      const baiduPCS = new BaiduPCS({ remotePath: "/录播" });
+      vi.spyOn(baiduPCS, "emit").mockReturnValue(true);
+      vi.spyOn(baiduPCS, "getFileMeta").mockResolvedValue({
+        path: "/录播/主播/test.flv",
+        filename: "test.flv",
+        size: 1024,
+      });
+      const uploadSpy = vi.spyOn(baiduPCS as any, "executeUploadCommand");
+
+      await baiduPCS.uploadFile(localFilePath, "主播", { policy: "skip" });
+
+      expect(uploadSpy).not.toHaveBeenCalled();
+      expect(baiduPCS.emit).toHaveBeenCalledWith(
+        "success",
+        expect.stringContaining("远端已存在同名同大小文件"),
+      );
+    });
+
+    it("stops when the remote file has a different size", async () => {
+      mockLocalFile(1024);
+      const baiduPCS = new BaiduPCS({ remotePath: "/录播" });
+      vi.spyOn(baiduPCS, "emit").mockReturnValue(true);
+      vi.spyOn(baiduPCS, "getFileMeta").mockResolvedValue({
+        path: "/录播/主播/test.flv",
+        filename: "test.flv",
+        size: 512,
+      });
+      const uploadSpy = vi.spyOn(baiduPCS as any, "executeUploadCommand");
+
+      await expect(baiduPCS.uploadFile(localFilePath, "主播", { policy: "skip" })).rejects.toThrow(
+        "远端已存在同名文件但大小不同",
+      );
+      expect(uploadSpy).not.toHaveBeenCalled();
+    });
+
+    it("uploads when the remote file does not exist", async () => {
+      mockLocalFile(1024);
+      const baiduPCS = new BaiduPCS({ remotePath: "/录播" });
+      vi.spyOn(baiduPCS, "emit").mockReturnValue(true);
+      vi.spyOn(baiduPCS, "getFileMeta")
+        .mockRejectedValueOnce(new Error("文件不存在"))
+        .mockResolvedValueOnce({
+          path: "/录播/主播/test.flv",
+          filename: "test.flv",
+          size: 1024,
+        });
+      const uploadSpy = vi.spyOn(baiduPCS as any, "executeUploadCommand").mockResolvedValue("");
+
+      await baiduPCS.uploadFile(localFilePath, "主播", { policy: "skip" });
+
+      expect(uploadSpy).toHaveBeenCalledOnce();
     });
   });
 });

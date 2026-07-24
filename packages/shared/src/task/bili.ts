@@ -505,6 +505,11 @@ async function biliMediaAction(
  * @param filePath 视频文件路径数组
  * @returns 格式化后的配置
  */
+export function inferReprintSourceFromFilePath(filePath: string): string | undefined {
+  const filename = path.parse(filePath).name;
+  return filename.match(/^录制-(\d+)-\d{8}-\d{6}(?:-\d+)?(?:-|$)/)?.[1];
+}
+
 async function preFormatOptions(
   options: BiliupConfig,
   filePath:
@@ -523,7 +528,9 @@ async function preFormatOptions(
 
   // 判断是否需要解析元数据
   const needParseForTitle = options.title.includes("{{");
-  const needParseForSource = options.copyright === 2 && !options.source;
+  const needParseForSource =
+    Number(options.copyright) === 2 &&
+    (typeof options.source !== "string" || options.source.trim() === "");
   const needParseForPartTitle = options.partTitleTemplate && !!options.partTitleTemplate.trim();
   const needParseForDesc = options.desc && options.desc.includes("{{");
 
@@ -620,6 +627,18 @@ async function preFormatOptions(
     if (!resultOptions.source && parseResult?.roomId) {
       // 如果平台信息不可用，但有房间号，尝试使用房间号
       resultOptions.source = parseResult?.roomId;
+    }
+    if (!resultOptions.source?.trim()) {
+      const filenameSource = inferReprintSourceFromFilePath(firstFilePath);
+      if (filenameSource) {
+        resultOptions.source = filenameSource;
+        log.warn(`视频元数据中未识别到转载来源，已使用文件名中的房间号：${filenameSource}`);
+      }
+    }
+    if (!resultOptions.source?.trim()) {
+      throw new Error(
+        `投稿类型为转载，但未设置转载来源，且无法从视频元数据或文件名识别房间号：${path.basename(firstFilePath)}。请在上传预设中填写转载来源。`,
+      );
     }
   }
 

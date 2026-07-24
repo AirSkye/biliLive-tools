@@ -2,7 +2,7 @@ import path from "node:path";
 import os from "node:os";
 import fs from "fs-extra";
 import { expect, describe, it } from "vitest";
-import { parseDesc, formatOptions } from "../src/task/bili";
+import { parseDesc, formatOptions, inferReprintSourceFromFilePath } from "../src/task/bili";
 import { uuid } from "../src/utils/index";
 
 import type { BiliupConfig } from "@biliLive-tools/types";
@@ -299,5 +299,27 @@ describe("formatOptions", () => {
     const result = formatOptions(options);
 
     expect(result.tid).toEqual(21);
+  });
+});
+
+describe("inferReprintSourceFromFilePath", () => {
+  it("extracts the room id from a standard recording filename", () => {
+    expect(
+      inferReprintSourceFromFilePath(
+        "D:/recordings/录制-23202883-20260716-203031-723-白帽黑客挑战赛.flv",
+      ),
+    ).toBe("23202883");
+  });
+
+  it("supports recording filenames without a sequence number", () => {
+    expect(
+      inferReprintSourceFromFilePath(
+        "D:/recordings/录制-23202883-20260716-203031-白帽黑客挑战赛.mp4",
+      ),
+    ).toBe("23202883");
+  });
+
+  it("does not infer a source from unrelated filenames", () => {
+    expect(inferReprintSourceFromFilePath("D:/recordings/白帽黑客挑战赛.flv")).toBeUndefined();
   });
 });

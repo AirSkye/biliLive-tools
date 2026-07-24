@@ -207,15 +207,22 @@ export class WebhookHandler {
   }
 
   private isPathInActiveLive(filePath: string) {
+    return this.getManagedLivePathState(filePath) === "active";
+  }
+
+  private getManagedLivePathState(filePath: string): "active" | "uploaded" | undefined {
     const normalizedPath = this.normalizeManagedPath(filePath);
+    let uploaded = false;
     for (const live of this.liveData) {
       for (const part of live.parts) {
-        if (this.getPartAllManagedPaths(part).has(normalizedPath)) {
-          return true;
-        }
+        if (!this.getPartAllManagedPaths(part).has(normalizedPath)) continue;
+
+        if (live.software !== "local-upload") return "active";
+        if (part.uploadStatus === "pending" || part.uploadStatus === "uploading") return "active";
+        if (part.uploadStatus === "uploaded") uploaded = true;
       }
     }
-    return false;
+    return uploaded ? "uploaded" : undefined;
   }
 
   private reserveLocalUploadPaths(files: LocalUploadFileInput[]) {
@@ -803,7 +810,27 @@ export class WebhookHandler {
       throw new Error("files is required");
     }
 
-    const reservedPaths = this.reserveLocalUploadPaths(options.files);
+    const uploadedFiles = options.files.filter(
+      (file) => this.getManagedLivePathState(file.path) === "uploaded",
+    );
+    const uploadFiles = options.files.filter(
+      (file) => this.getManagedLivePathState(file.path) !== "uploaded",
+    );
+    const warnings = uploadedFiles.map(
+      (file) => `${path.basename(file.path)} 已由本地上传流程上传完成，本次已跳过`,
+    );
+    if (uploadedFiles.length > 0) {
+      log.warn(warnings.join("；"));
+    }
+    if (uploadFiles.length === 0) {
+      return {
+        eventId: undefined,
+        aid: undefined,
+        warnings,
+      };
+    }
+
+    const reservedPaths = this.reserveLocalUploadPaths(uploadFiles);
 
     try {
       const config = this.configManager.getConfig(options.roomId);
@@ -811,13 +838,13 @@ export class WebhookHandler {
         throw new Error("房间未配置 webhook 上传账号");
       }
 
-      for (const file of options.files) {
+      for (const file of uploadFiles) {
         if (!(await fs.pathExists(file.path))) {
           throw new Error(`本地文件不存在：${file.path}`);
         }
       }
 
-      const preparedParts = await this.buildLocalUploadParts(options);
+      const preparedParts = await this.buildLocalUploadParts({ ...options, files: uploadFiles });
       const appendAid =
         options.uploadMode === "append" || (options.uploadMode !== "new" && options.aid)
           ? options.aid
@@ -832,7 +859,6 @@ export class WebhookHandler {
         aid: appendAid,
       });
 
-      const warnings: string[] = [];
       const uploadRawWhenNoDanmu = options.uploadRawWhenNoDanmu ?? true;
 
       for (const preparedPart of preparedParts) {

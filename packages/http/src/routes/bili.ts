@@ -760,6 +760,45 @@ const saveLocalDetectHistory = async (
   return savedResult;
 };
 
+const removeDeletedLocalUnuploadedFiles = (
+  groups: LocalUnuploadedGroup[],
+  deletedPaths: Set<string>,
+) =>
+  groups.flatMap((group) => {
+    const files = group.files.filter(
+      (file) => !deletedPaths.has(normalizeLocalUploadFilePath(file.path)),
+    );
+    if (files.length === 0) return [];
+    if (files.length === group.files.length) return [group];
+
+    const { key: uploadKey } = buildLocalUploadKey(files, "upload");
+    const { key: syncKey } = buildLocalUploadKey(files, "sync");
+    return [
+      {
+        ...group,
+        uploadKey,
+        syncKey,
+        uploadStatus: undefined,
+        uploadQueuedAt: undefined,
+        uploadUpdatedAt: undefined,
+        uploadError: undefined,
+        syncStatus: undefined,
+        syncQueuedAt: undefined,
+        syncUpdatedAt: undefined,
+        syncError: undefined,
+        files,
+        fileCount: files.length,
+        totalSize: files.reduce((sum, file) => sum + file.size, 0),
+        danmuCount: files.filter((file) => file.danmuPath || file.xmlDanmuPath).length,
+        mergeCandidate:
+          files.length > 1 &&
+          files.every((file) => path.extname(file.path).toLowerCase() === ".flv"),
+        startTime: files[0].startTime ?? files[0].mtimeMs,
+        endTime: files[files.length - 1].endTime,
+      },
+    ];
+  });
+
 const recordLocalUploadedFileDeletions = async (data: {
   uid?: number;
   historyId?: string;
@@ -788,6 +827,10 @@ const recordLocalUploadedFileDeletions = async (data: {
       );
       history.result.duplicateFiles = (history.result.duplicateFiles ?? []).filter(
         (item) => !deletedPaths.has(normalizeLocalPath(item.localPath)),
+      );
+      history.result.unuploadedGroups = removeDeletedLocalUnuploadedFiles(
+        history.result.unuploadedGroups,
+        deletedPaths,
       );
       history.deletedCount = (history.deletedCount ?? 0) + records.length;
     }

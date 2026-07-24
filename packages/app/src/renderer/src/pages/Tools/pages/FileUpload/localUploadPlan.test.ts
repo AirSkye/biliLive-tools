@@ -4,6 +4,7 @@ import type { LocalUnuploadedGroup } from "@renderer/apis/bili";
 import {
   buildLocalActionGroups,
   removeCompletedLocalUploadFiles,
+  removeLocalUnuploadedFiles,
   type LocalProcessMode,
 } from "./localUploadPlan";
 
@@ -161,5 +162,20 @@ describe("local upload plan", () => {
       ],
     );
     expect(result).toEqual([source]);
+  });
+
+  it("removes selected unuploaded files and recalculates the remaining group", () => {
+    const source = group(["a.flv", "b.flv", "c.mp4"]);
+    const result = removeLocalUnuploadedFiles([source], ["A.FLV", "c.mp4"]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].files.map((item) => item.path)).toEqual(["b.flv"]);
+    expect(result[0].fileCount).toBe(1);
+    expect(result[0].totalSize).toBe(200);
+    expect(result[0].mergeCandidate).toBe(false);
+  });
+
+  it("removes an unuploaded group when all of its files are deleted", () => {
+    expect(removeLocalUnuploadedFiles([group(["a.flv"])], ["a.flv"])).toEqual([]);
   });
 });

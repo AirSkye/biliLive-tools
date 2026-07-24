@@ -331,6 +331,21 @@
             >
               处理并同步...
             </n-button>
+            <n-button
+              size="small"
+              type="error"
+              secondary
+              :loading="deletingLocalUnuploadedFiles"
+              :disabled="
+                uploadingLocalUnuploaded ||
+                syncingLocalUnuploaded ||
+                deletingLocalUnuploadedFiles ||
+                selectedLocalUploadGroupIds.length === 0
+              "
+              @click="openLocalFileActionDialog('delete')"
+            >
+              删除视频...
+            </n-button>
           </div>
           <n-empty v-if="localUnuploadedRows.length === 0" description="没有检测到本地未上传文件" />
           <n-data-table
@@ -379,7 +394,11 @@
         <span>已选：{{ selectedActionFileKeys.length }}/{{ localActionFileRows.length }}</span>
         <n-button size="small" @click="selectAllActionFiles"> 全选全部 </n-button>
         <n-button size="small" @click="clearActionFiles"> 清空选择 </n-button>
-        <n-radio-group v-model:value="pendingLocalProcessMode" size="small">
+        <n-radio-group
+          v-if="pendingLocalPreparedOperation !== 'delete'"
+          v-model:value="pendingLocalProcessMode"
+          size="small"
+        >
           <n-radio-button value="direct">直接</n-radio-button>
           <n-radio-button value="merge">合并</n-radio-button>
           <n-radio-button value="burn">压制</n-radio-button>
@@ -403,9 +422,13 @@
         <div class="local-dialog-footer">
           <n-button @click="cancelLocalActionDialog">取消</n-button>
           <n-button
-            type="primary"
-            :loading="uploadingLocalUnuploaded || syncingLocalUnuploaded"
-            :disabled="uploadingLocalUnuploaded || syncingLocalUnuploaded"
+            :type="pendingLocalPreparedOperation === 'delete' ? 'error' : 'primary'"
+            :loading="
+              uploadingLocalUnuploaded || syncingLocalUnuploaded || deletingLocalUnuploadedFiles
+            "
+            :disabled="
+              uploadingLocalUnuploaded || syncingLocalUnuploaded || deletingLocalUnuploadedFiles
+            "
             @click="confirmLocalActionDialog"
           >
             {{ localActionConfirmText }}
@@ -427,6 +450,7 @@ import AppendVideoDialog from "@renderer/components/AppendVideoDialog.vue";
 import {
   buildLocalActionGroups,
   removeCompletedLocalUploadFiles,
+  removeLocalUnuploadedFiles,
   type LocalProcessMode,
   type PendingLocalActionGroup,
   type PreparedLocalActionGroup,
@@ -670,6 +694,7 @@ const selectedLocalDuplicateFileKeys = ref<DataTableRowKey[]>([]);
 const deletingLocalUploadedFiles = ref(false);
 const deletingLocalInvalidMp4Files = ref(false);
 const deletingLocalDuplicateFiles = ref(false);
+const deletingLocalUnuploadedFiles = ref(false);
 type LocalUnuploadedSortKey =
   | "startTimeDesc"
   | "startTimeAsc"
@@ -752,7 +777,7 @@ type LocalActionFileRow = LocalUploadCandidateFile & {
   groupFileCount: number;
   busy: boolean;
 };
-type PendingLocalPreparedOperation = "upload" | "sync";
+type PendingLocalPreparedOperation = "upload" | "sync" | "delete";
 const localActionDialogVisible = ref(false);
 const pendingLocalUploadGroups = ref<PendingLocalActionGroup[]>([]);
 const pendingLocalPreparedOperation = ref<PendingLocalPreparedOperation>("upload");
@@ -823,6 +848,17 @@ const isLocalFileBusy = (
     return record.filePaths.some((item) => normalizeTrackedLocalPath(item) === normalizedPath);
   });
 };
+const isLocalFileProcessing = (row: LocalUnuploadedGroup, filePath: string) =>
+  (["upload", "sync"] as const).some((operation) => {
+    const rowStatus = operation === "upload" ? row.uploadStatus : row.syncStatus;
+    if (pendingLocalUploadStatuses.has(rowStatus || "")) return true;
+    const normalizedPath = normalizeTrackedLocalPath(filePath);
+    return getLocalOperationRecords(row, operation).some((record) => {
+      if (record.status && !pendingLocalUploadStatuses.has(record.status)) return false;
+      if (!record.filePaths?.length) return true;
+      return record.filePaths.some((item) => normalizeTrackedLocalPath(item) === normalizedPath);
+    });
+  });
 const canUploadLocalUnuploadedGroup = (row: LocalUnuploadedGroup) =>
   !!row.roomId &&
   row.hasWebhookUploadConfig &&
@@ -859,12 +895,8 @@ const renderLocalOperationStatus = (
   }
   return "";
 };
-const getEligibleLocalUnuploadedRows = () =>
-  localUnuploadedRows.value.filter(
-    (row) => canUploadLocalUnuploadedGroup(row) || canSyncLocalUnuploadedGroup(row),
-  );
 const selectAllLocalUnuploadedGroups = () => {
-  selectedLocalUploadGroupIds.value = getEligibleLocalUnuploadedRows().map((row) => row.id);
+  selectedLocalUploadGroupIds.value = localUnuploadedRows.value.map((row) => row.id);
 };
 const clearSelectedLocalUploadGroups = () => {
   selectedLocalUploadGroupIds.value = [];
@@ -879,7 +911,10 @@ const localActionFileRows = computed<LocalActionFileRow[]>(() =>
       groupTitle: item.row.title,
       groupStartTime: item.row.startTime,
       groupFileCount: item.row.fileCount,
-      busy: isLocalFileBusy(item.row, file.path, pendingLocalPreparedOperation.value),
+      busy:
+        pendingLocalPreparedOperation.value === "delete"
+          ? isLocalFileProcessing(item.row, file.path)
+          : isLocalFileBusy(item.row, file.path, pendingLocalPreparedOperation.value),
     })),
   ),
 );
@@ -892,17 +927,27 @@ const clearActionFiles = () => {
   selectedActionFileKeys.value = [];
 };
 const localActionDialogTitle = computed(() =>
-  pendingLocalPreparedOperation.value === "sync"
-    ? "选择同步文件和处理方式"
-    : "选择上传文件和处理方式",
+  pendingLocalPreparedOperation.value === "delete"
+    ? "选择要删除的本地未上传视频"
+    : pendingLocalPreparedOperation.value === "sync"
+      ? "选择同步文件和处理方式"
+      : "选择上传文件和处理方式",
 );
 const localActionConfirmText = computed(() =>
-  pendingLocalPreparedOperation.value === "sync" ? "加入同步流程" : "加入上传流程",
+  pendingLocalPreparedOperation.value === "delete"
+    ? "删除所选视频"
+    : pendingLocalPreparedOperation.value === "sync"
+      ? "加入同步流程"
+      : "加入上传流程",
 );
 const localActionPlanSummary = computed(() => {
   const selectedPaths = new Set(selectedActionFileKeys.value.map((item) => String(item)));
   const selectedFiles = localActionFileRows.value.filter((row) => selectedPaths.has(row.path));
   const selectedGroupCount = new Set(selectedFiles.map((row) => row.groupId)).size;
+  if (pendingLocalPreparedOperation.value === "delete") {
+    const totalSize = selectedFiles.reduce((sum, file) => sum + file.size, 0);
+    return `准备删除 ${selectedGroupCount} 期中的 ${selectedFiles.length} 个本地视频，共 ${formatFileSize(totalSize)}。`;
+  }
   const mergeGroupCount = pendingLocalUploadGroups.value.filter(
     (item) =>
       item.row.files.filter(
@@ -1300,35 +1345,41 @@ const openBiliArchive = (row: LocalUploadedFileMatch) => {
 
 const deleteLocalDetectedFiles = async (
   rows: LocalDetectedDeletionItem[],
-  kind: "uploaded" | "invalidMp4" | "duplicate",
+  kind: "uploaded" | "invalidMp4" | "duplicate" | "unuploaded",
 ) => {
   const deleting =
     kind === "uploaded"
       ? deletingLocalUploadedFiles.value
       : kind === "invalidMp4"
         ? deletingLocalInvalidMp4Files.value
-        : deletingLocalDuplicateFiles.value;
-  if (rows.length === 0 || deleting) return;
+        : kind === "duplicate"
+          ? deletingLocalDuplicateFiles.value
+          : deletingLocalUnuploadedFiles.value;
+  if (rows.length === 0 || deleting) return 0;
   const label =
     kind === "uploaded"
       ? "已上传残留文件"
       : kind === "invalidMp4"
         ? "无效 MP4 文件"
-        : "同场重复文件";
+        : kind === "duplicate"
+          ? "同场重复文件"
+          : "本地未上传视频";
   const [confirmed] = await confirm.warning({
     title: "确认删除",
     content: `确定删除 ${rows.length} 个${label}吗？此操作不可撤销。`,
     positiveText: "删除",
     negativeText: "取消",
   });
-  if (!confirmed) return;
+  if (!confirmed) return 0;
 
   if (kind === "uploaded") {
     deletingLocalUploadedFiles.value = true;
   } else if (kind === "invalidMp4") {
     deletingLocalInvalidMp4Files.value = true;
-  } else {
+  } else if (kind === "duplicate") {
     deletingLocalDuplicateFiles.value = true;
+  } else {
+    deletingLocalUnuploadedFiles.value = true;
   }
   const deletedPaths = new Set<string>();
   const deletedRows: LocalDetectedDeletionItem[] = [];
@@ -1340,11 +1391,7 @@ const deleteLocalDetectedFiles = async (
         await fileBrowserApi.removeFile(row.localPath);
         deletedPaths.add(row.localPath);
         deletedRows.push(row);
-        pushLocalDetectLog(
-          `已删除${
-            kind === "uploaded" ? "残留文件" : kind === "invalidMp4" ? "无效 MP4" : "同场重复文件"
-          }：${row.fileName}`,
-        );
+        pushLocalDetectLog(`已删除${label}：${row.fileName}`);
       } catch (error) {
         failed.push(`${row.fileName}：${error instanceof Error ? error.message : String(error)}`);
       }
@@ -1359,10 +1406,15 @@ const deleteLocalDetectedFiles = async (
         localUploadedFilesResult.value.invalidMp4Files = (
           localUploadedFilesResult.value.invalidMp4Files ?? []
         ).filter((row) => !deletedPaths.has(row.localPath));
-      } else {
+      } else if (kind === "duplicate") {
         localUploadedFilesResult.value.duplicateFiles = (
           localUploadedFilesResult.value.duplicateFiles ?? []
         ).filter((row) => !deletedPaths.has(row.localPath));
+      } else {
+        localUploadedFilesResult.value.unuploadedGroups = removeLocalUnuploadedFiles(
+          localUploadedFilesResult.value.unuploadedGroups,
+          Array.from(deletedPaths),
+        );
       }
     }
     if (kind === "uploaded") {
@@ -1373,8 +1425,18 @@ const deleteLocalDetectedFiles = async (
       selectedLocalInvalidMp4FileKeys.value = selectedLocalInvalidMp4FileKeys.value.filter(
         (key) => !deletedPaths.has(String(key)),
       );
-    } else {
+    } else if (kind === "duplicate") {
       selectedLocalDuplicateFileKeys.value = selectedLocalDuplicateFileKeys.value.filter(
+        (key) => !deletedPaths.has(String(key)),
+      );
+    } else {
+      const remainingGroupIds = new Set(
+        localUploadedFilesResult.value?.unuploadedGroups.map((row) => row.id) ?? [],
+      );
+      selectedLocalUploadGroupIds.value = selectedLocalUploadGroupIds.value.filter((key) =>
+        remainingGroupIds.has(String(key)),
+      );
+      selectedActionFileKeys.value = selectedActionFileKeys.value.filter(
         (key) => !deletedPaths.has(String(key)),
       );
     }
@@ -1420,10 +1482,13 @@ const deleteLocalDetectedFiles = async (
       deletingLocalUploadedFiles.value = false;
     } else if (kind === "invalidMp4") {
       deletingLocalInvalidMp4Files.value = false;
-    } else {
+    } else if (kind === "duplicate") {
       deletingLocalDuplicateFiles.value = false;
+    } else {
+      deletingLocalUnuploadedFiles.value = false;
     }
   }
+  return deletedPaths.size;
 };
 
 const deleteLocalUploadedFiles = async (rows: LocalUploadedFileMatch[]) => {
@@ -1436,6 +1501,20 @@ const deleteLocalInvalidMp4Files = async (rows: LocalInvalidMp4File[]) => {
 
 const deleteLocalDuplicateFiles = async (rows: LocalDuplicateVideoFile[]) => {
   await deleteLocalDetectedFiles(rows, "duplicate");
+};
+
+const deleteLocalUnuploadedVideos = async (rows: LocalActionFileRow[]) => {
+  return deleteLocalDetectedFiles(
+    rows.map((row) => ({
+      localPath: row.path,
+      fileName: row.fileName,
+      root: window.path.dirname(row.path),
+      size: row.size,
+      mtimeMs: row.mtimeMs,
+      reason: "用户从本地未上传列表删除",
+    })),
+    "unuploaded",
+  );
 };
 
 const deleteSelectedLocalUploadedFiles = async () => {
@@ -1908,18 +1987,27 @@ const openLocalFileActionDialog = (operation: PendingLocalPreparedOperation) => 
   const groups = localUnuploadedRows.value.filter(
     (row) =>
       selectedIds.has(row.id) &&
-      (operation === "upload"
-        ? canUploadLocalUnuploadedGroup(row)
-        : canSyncLocalUnuploadedGroup(row)),
+      (operation === "delete"
+        ? true
+        : operation === "upload"
+          ? canUploadLocalUnuploadedGroup(row)
+          : canSyncLocalUnuploadedGroup(row)),
   );
 
   if (groups.length === 0) {
     notice.warning({
-      title: operation === "upload" ? "没有可上传的分组" : "没有可同步的分组",
+      title:
+        operation === "delete"
+          ? "没有可删除的分组"
+          : operation === "upload"
+            ? "没有可上传的分组"
+            : "没有可同步的分组",
       content:
-        operation === "upload"
-          ? "请先选择已识别房间且已配置 webhook 上传账号的分组"
-          : "请先选择已识别房间且已配置 webhook 同步器的分组",
+        operation === "delete"
+          ? "请先选择包含本地视频的分组"
+          : operation === "upload"
+            ? "请先选择已识别房间且已配置 webhook 上传账号的分组"
+            : "请先选择已识别房间且已配置 webhook 同步器的分组",
       duration: 3000,
     });
     return;
@@ -1949,6 +2037,24 @@ const buildPreparedLocalActionGroups = () => {
 };
 
 const confirmLocalActionDialog = async () => {
+  if (pendingLocalPreparedOperation.value === "delete") {
+    const selectedPaths = new Set(selectedActionFileKeys.value.map((item) => String(item)));
+    const rows = localActionFileRows.value.filter(
+      (row) => selectedPaths.has(row.path) && !row.busy,
+    );
+    if (rows.length === 0) {
+      notice.warning({
+        title: "没有选择视频",
+        content: "请至少选择一个当前未在处理中的视频",
+        duration: 3000,
+      });
+      return;
+    }
+    const deletedCount = await deleteLocalUnuploadedVideos(rows);
+    if (deletedCount > 0) localActionDialogVisible.value = false;
+    return;
+  }
+
   const groups = buildPreparedLocalActionGroups();
   if (groups.length === 0) {
     notice.warning({
