@@ -196,16 +196,6 @@ export class WebhookHandler {
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
   }
 
-  private getPartAllManagedPaths(part: Part) {
-    return new Set([
-      this.normalizeManagedPath(part.filePath),
-      this.normalizeManagedPath(part.rawFilePath),
-      ...this.getPartCleanupPaths(part, part.filePath).map((item) =>
-        this.normalizeManagedPath(item),
-      ),
-    ]);
-  }
-
   private isPathInActiveLive(filePath: string) {
     return this.getManagedLivePathState(filePath) === "active";
   }
@@ -215,11 +205,28 @@ export class WebhookHandler {
     let uploaded = false;
     for (const live of this.liveData) {
       for (const part of live.parts) {
-        if (!this.getPartAllManagedPaths(part).has(normalizedPath)) continue;
+        const isHandledPath =
+          this.normalizeManagedPath(part.filePath) === normalizedPath ||
+          this.getPartCleanupPaths(part, part.filePath).some(
+            (managedPath) => this.normalizeManagedPath(managedPath) === normalizedPath,
+          );
+        const isRawPath = this.normalizeManagedPath(part.rawFilePath) === normalizedPath;
+        if (!isHandledPath && !isRawPath) continue;
 
-        if (live.software !== "local-upload") return "active";
-        if (part.uploadStatus === "pending" || part.uploadStatus === "uploading") return "active";
-        if (part.uploadStatus === "uploaded") uploaded = true;
+        if (part.recordStatus !== "handled" && part.recordStatus !== "error") return "active";
+        if (part.recordStatus === "error") continue;
+
+        if (isHandledPath) {
+          if (part.uploadStatus === "pending" || part.uploadStatus === "uploading") return "active";
+          if (part.uploadStatus === "uploaded") uploaded = true;
+        }
+
+        if (isRawPath && this.configManager.getConfig(live.roomId).uploadNoDanmu) {
+          if (part.rawUploadStatus === "pending" || part.rawUploadStatus === "uploading") {
+            return "active";
+          }
+          if (part.rawUploadStatus === "uploaded") uploaded = true;
+        }
       }
     }
     return uploaded ? "uploaded" : undefined;

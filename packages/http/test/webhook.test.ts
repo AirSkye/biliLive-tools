@@ -3832,6 +3832,66 @@ describe("Live", () => {
           ).rejects.toThrow("文件已在 webhook 上传流程中");
         });
 
+        it("本地补偿上传应跳过普通 webhook 中已完成的处理版文件", async () => {
+          const live = new Live({
+            platform: "bilibili",
+            software: "bili-recorder",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Live",
+            username: "User",
+          });
+          live.addPart({
+            filePath: "/path/to/source.flv",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            uploadStatus: "uploaded",
+            rawUploadStatus: "pending",
+            title: "Part 1",
+          });
+          webhookHandler.liveData.push(live);
+          // @ts-ignore
+          webhookHandler.configManager.getConfig = vi
+            .fn()
+            .mockReturnValue({ uploadNoDanmu: false });
+
+          expect(
+            // @ts-ignore
+            webhookHandler.getManagedLivePathState("/path/to/source.flv"),
+          ).toBe("uploaded");
+          expect(() =>
+            // @ts-ignore
+            webhookHandler.reserveLocalUploadPaths([{ path: "/path/to/source.flv" }]),
+          ).not.toThrow();
+        });
+
+        it("本地补偿上传应继续拦截仍在上传原视频的 webhook 文件", async () => {
+          const live = new Live({
+            platform: "bilibili",
+            software: "bili-recorder",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Live",
+            username: "User",
+          });
+          live.addPart({
+            filePath: "/path/to/source.flv",
+            rawFilePath: "/path/to/source.flv",
+            recordStatus: "handled",
+            uploadStatus: "uploaded",
+            rawUploadStatus: "uploading",
+            title: "Part 1",
+          });
+          webhookHandler.liveData.push(live);
+          // @ts-ignore
+          webhookHandler.configManager.getConfig = vi.fn().mockReturnValue({ uploadNoDanmu: true });
+
+          expect(
+            // @ts-ignore
+            webhookHandler.getManagedLivePathState("/path/to/source.flv"),
+          ).toBe("active");
+        });
+
         it("本地补偿上传应拒绝并发提交同一个文件", async () => {
           let resolveExists!: (value: boolean) => void;
           const existsPromise = new Promise<boolean>((resolve) => {
