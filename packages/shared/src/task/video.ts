@@ -1237,18 +1237,48 @@ export const checkMergeVideos = async (
 ): Promise<{
   warnings: string[];
   errors: string[];
+  invalidFiles: Array<{ path: string; error: string }>;
 }> => {
   if (inputFiles.length < 2) {
-    return { warnings: [], errors: [] };
+    return { warnings: [], errors: [], invalidFiles: [] };
   }
-  const videoMetas = await Promise.all(inputFiles.map((file) => readVideoMeta(file)));
+
+  const videoMetas: Array<Awaited<ReturnType<typeof readVideoMeta>> | undefined> = Array(
+    inputFiles.length,
+  ).fill(undefined);
+  const invalidFilesByIndex: Array<{ path: string; error: string } | undefined> = Array(
+    inputFiles.length,
+  ).fill(undefined);
+  await Promise.all(
+    inputFiles.map(async (file, index) => {
+      try {
+        videoMetas[index] = await readVideoMeta(file);
+      } catch (error) {
+        const message = String(error).trim();
+        invalidFilesByIndex[index] = { path: file, error: message };
+        log.error("checkMergeVideos, read video meta error", { file, error });
+      }
+    }),
+  );
+  const invalidFiles = invalidFilesByIndex.filter(
+    (item): item is { path: string; error: string } => !!item,
+  );
+
+  if (invalidFiles.length > 0) {
+    const errors = invalidFiles.map(
+      ({ path: filePath, error }) => `无法读取视频文件：${filePath}${error ? `\n${error}` : ""}`,
+    );
+    return { warnings: [], errors, invalidFiles };
+  }
+
+  const metas = videoMetas as Array<Awaited<ReturnType<typeof readVideoMeta>>>;
   const errors: string[] = [];
   const warnings: string[] = [];
 
-  const videoStream0 = videoMetas[0].streams.find((stream) => stream.codec_type === "video");
-  const audioStream0 = videoMetas[0].streams.find((stream) => stream.codec_type === "audio");
-  for (const meta of videoMetas) {
-    if (meta.format.format_name !== videoMetas[0].format.format_name) {
+  const videoStream0 = metas[0].streams.find((stream) => stream.codec_type === "video");
+  const audioStream0 = metas[0].streams.find((stream) => stream.codec_type === "audio");
+  for (const meta of metas) {
+    if (meta.format.format_name !== metas[0].format.format_name) {
       errors.push("输入视频容器不一致");
     }
     const videoStream = meta.streams.find((stream) => stream.codec_type === "video");
@@ -1277,6 +1307,7 @@ export const checkMergeVideos = async (
   return {
     warnings,
     errors,
+    invalidFiles,
   };
 };
 

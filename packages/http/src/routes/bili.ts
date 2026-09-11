@@ -21,6 +21,10 @@ import type { BiliupConfig, PartTitleFormatOptions } from "@biliLive-tools/types
 import { appConfig, config as globalConfig, handler } from "../index.js";
 import { PathResolver } from "../services/webhook/PathResolver.js";
 import { RecoverableJsonStore } from "../utils/recoverableJsonStore.js";
+import {
+  archiveTitleMatchesSearchKeyword,
+  shouldUseSearchOnlyRemoteArchives,
+} from "../services/localDetection.js";
 import type { LocalUploadOptions } from "../services/webhook/webhook.js";
 import type { LiveHistory } from "@biliLive-tools/shared/db/model/recordHistory.js";
 import type { Streamer } from "@biliLive-tools/shared/db/model/streamer.js";
@@ -1065,9 +1069,13 @@ const mergeArchiveItem = (current: any, incoming: any) => {
   return merged;
 };
 
-const buildArchiveSearchKeywords = (localFiles: LocalVideoFile[]) => {
+const buildArchiveSearchKeywords = (
+  localFiles: LocalVideoFile[],
+  options: { includeStreamerKeywords?: boolean } = {},
+) => {
   const titleKeywords = new Map<string, ArchiveSearchKeyword>();
   const userKeywords = new Map<string, ArchiveSearchKeyword>();
+  const includeStreamerKeywords = options.includeStreamerKeywords ?? true;
   const recordLookup = buildRecordLookup();
   const addKeyword = (
     map: Map<string, ArchiveSearchKeyword>,
@@ -1087,7 +1095,9 @@ const buildArchiveSearchKeywords = (localFiles: LocalVideoFile[]) => {
     const record = findRecordByLocalFile(localFile, recordLookup);
     addKeyword(titleKeywords, "title", record?.title || metadata.title, 4);
     addKeyword(titleKeywords, "title", record?.video_filename, 4);
-    addKeyword(userKeywords, "streamer", record?.streamer?.name || metadata.username, 2);
+    if (includeStreamerKeywords) {
+      addKeyword(userKeywords, "streamer", record?.streamer?.name || metadata.username, 2);
+    }
   }
   const keywords: ArchiveSearchKeyword[] = [];
   const appendKeyword = (keyword: ArchiveSearchKeyword) => {
@@ -1205,11 +1215,36 @@ const fetchPublicArchiveDetail = async (archive: { aid?: number; bvid?: string }
   return data.data;
 };
 
+const WEBHOOK_TEMP_DIRECTORY_NAME = "biliLive-tools-webhook-temp";
+
+const findWebhookTemporaryScanRoots = async () => {
+  const volumeRoots: string[] = [];
+  if (process.platform === "win32") {
+    for (let code = 67; code <= 90; code++) {
+      volumeRoots.push(`${String.fromCharCode(code)}:\\`);
+    }
+  } else {
+    volumeRoots.push(path.parse(process.cwd()).root);
+  }
+
+  const roots: string[] = [];
+  for (const volumeRoot of volumeRoots) {
+    const candidate = path.join(volumeRoot, WEBHOOK_TEMP_DIRECTORY_NAME);
+    const stat = await fs.stat(candidate).catch(() => null);
+    if (stat?.isDirectory()) roots.push(candidate);
+  }
+  return roots;
+};
+
 const resolveScanRoots = async (rootPath?: string) => {
   const config = appConfig.getAll();
-  const rawRoots = rootPath
+  const configuredRoots = rootPath
     ? [rootPath]
     : [config?.webhook?.recoderFolder, config?.recorder?.savePath];
+  // Temporary outputs are final video candidates when compression was migrated
+  // to another volume because the recording disk was short on space.
+  const temporaryRoots = rootPath ? [] : await findWebhookTemporaryScanRoots();
+  const rawRoots = [...configuredRoots, ...temporaryRoots];
   const roots: string[] = [];
   const errors: string[] = [];
   const seen = new Set<string>();
@@ -1232,7 +1267,7 @@ const resolveScanRoots = async (rootPath?: string) => {
     roots.push(resolved);
   }
 
-  return { roots, errors };
+  return { roots, errors, temporaryRoots };
 };
 
 const scanVideoFiles = async (roots: string[], progress?: LocalDetectProgressReporter) => {
@@ -1603,6 +1638,7 @@ const collectRemoteVideoParts = async (
   detailIntervalMs = DEFAULT_DETAIL_INTERVAL_MS,
   searchKeywords: ArchiveSearchKeyword[] = [],
   progress?: LocalDetectProgressReporter,
+  options: { searchOnly?: boolean } = {},
 ) => {
   const archives = new Map<number, RemoteArchiveItem>();
   const errors: string[] = [];
@@ -1644,6 +1680,17 @@ const collectRemoteVideoParts = async (
   };
 
   const collectPagedArchives = async () => {
+    if (options.searchOnly) {
+      pushLog("已选择主播筛选，跳过全量稿件列表，仅使用本地文件关键词搜索", {
+        stage: "archives",
+        stageLabel: "读取稿件列表",
+        total: 0,
+        processed: 0,
+        current: "已跳过全量稿件列表",
+      });
+      return;
+    }
+
     for (let pn = 1; pn <= pages; pn++) {
       progress?.({
         stage: "archives",
@@ -1683,15 +1730,30 @@ const collectRemoteVideoParts = async (
   };
 
   const collectSearchArchives = async () => {
-    if (searchKeywords.length === 0) return;
-    const titleCount = searchKeywords.filter((item) => item.type === "title").length;
-    const streamerCount = searchKeywords.filter((item) => item.type === "streamer").length;
+    const keywords = options.searchOnly
+      ? searchKeywords.filter((item) => item.type === "title")
+      : searchKeywords;
+    if (keywords.length === 0) {
+      if (options.searchOnly) {
+        pushLog("未提取到本地标题关键词，已跳过远端稿件详情请求", {
+          stage: "search",
+          stageLabel: "搜索稿件",
+          total: 0,
+          processed: 0,
+          current: "无可用标题关键词",
+        });
+      }
+      return;
+    }
+    const titleCount = keywords.filter((item) => item.type === "title").length;
+    const streamerCount = keywords.filter((item) => item.type === "streamer").length;
+    const searchScope = options.searchOnly ? "本地标题" : "本地标题/主播";
     pushLog(
-      `开始按本地标题/主播搜索稿件：标题 ${titleCount} 个，主播 ${streamerCount} 个，并发 ${ARCHIVE_SEARCH_CONCURRENCY}`,
+      `开始按${searchScope}搜索稿件：标题 ${titleCount} 个，主播 ${streamerCount} 个，并发 ${ARCHIVE_SEARCH_CONCURRENCY}`,
       {
         stage: "search",
         stageLabel: "搜索稿件",
-        total: searchKeywords.length,
+        total: keywords.length,
         processed: 0,
         current: "等待搜索关键词",
       },
@@ -1701,15 +1763,15 @@ const collectRemoteVideoParts = async (
       keyword: ArchiveSearchKeyword;
       pageItems?: any[];
       error?: unknown;
-    }> = new Array(searchKeywords.length);
+    }> = new Array(keywords.length);
     let completedSearchCount = 0;
-    await runLimited(searchKeywords, ARCHIVE_SEARCH_CONCURRENCY, async (keyword, index) => {
+    await runLimited(keywords, ARCHIVE_SEARCH_CONCURRENCY, async (keyword, index) => {
       const label = keyword.type === "streamer" ? "主播" : "标题";
       let finishMessage = "";
       progress?.({
         stage: "search",
         stageLabel: "搜索稿件",
-        total: searchKeywords.length,
+        total: keywords.length,
         processed: completedSearchCount,
         current: `${label}：${keyword.keyword}`,
         message: `正在搜索${label}“${keyword.keyword}”`,
@@ -1733,12 +1795,12 @@ const collectRemoteVideoParts = async (
       const searchProgressPatch: LocalDetectProgressPatch = {
         stage: "search",
         stageLabel: "搜索稿件",
-        total: searchKeywords.length,
+        total: keywords.length,
         processed: completedSearchCount,
         current: `${label}：${keyword.keyword}`,
         message:
           finishMessage ||
-          `搜索进度 ${formatProgressCount(completedSearchCount, searchKeywords.length)}：${label}“${keyword.keyword}”`,
+          `搜索进度 ${formatProgressCount(completedSearchCount, keywords.length)}：${label}“${keyword.keyword}”`,
       };
       if (finishMessage) searchProgressPatch.log = finishMessage;
       progress?.(searchProgressPatch);
@@ -1753,8 +1815,16 @@ const collectRemoteVideoParts = async (
         continue;
       }
       const pageItems = result.pageItems ?? [];
-      logs.push(`搜索${label}“${result.keyword.keyword}”：${pageItems.length} 条`);
-      for (const item of pageItems) {
+      const filteredPageItems =
+        result.keyword.type === "title"
+          ? pageItems.filter((item) =>
+              archiveTitleMatchesSearchKeyword(item?.Archive?.title, result.keyword),
+            )
+          : pageItems;
+      logs.push(
+        `搜索${label}“${result.keyword.keyword}”：返回 ${pageItems.length} 条，标题过滤后保留 ${filteredPageItems.length} 条`,
+      );
+      for (const item of filteredPageItems) {
         addArchive(item, `搜索${label}：${result.keyword.keyword}`, result.keyword);
       }
     }
@@ -2861,6 +2931,15 @@ const runLocalUploadedFilesDetection = async (
     processed: 0,
     current: rootResult.roots.join("；") || "未找到可扫描目录",
   });
+  if (rootResult.temporaryRoots.length > 0) {
+    pushLog(`自动加入迁移临时目录：${rootResult.temporaryRoots.join("；")}`, {
+      stage: "scan",
+      stageLabel: "扫描本地视频",
+      total: rootResult.roots.length,
+      processed: 0,
+      current: rootResult.temporaryRoots.join("；"),
+    });
+  }
   const scanResult = await scanVideoFiles(rootResult.roots, progress);
   pushLog(
     `本地视频扫描完成：发现 ${scanResult.discoveredVideoCount} 个视频文件，进入匹配 ${scanResult.files.length} 个`,
@@ -2924,14 +3003,22 @@ const runLocalUploadedFilesDetection = async (
     });
   }
 
-  const searchKeywords = buildArchiveSearchKeywords(localFiles);
-  pushLog(`搜索关键词生成完成：${searchKeywords.length} 个，将按本地标题和主播名搜索投稿中心`, {
-    stage: "search",
-    stageLabel: "搜索稿件",
-    total: searchKeywords.length,
-    processed: 0,
-    current: "搜索关键词",
+  const searchOnlyRemoteArchives = shouldUseSearchOnlyRemoteArchives(selectedStreamers.length);
+  const searchKeywords = buildArchiveSearchKeywords(localFiles, {
+    includeStreamerKeywords: !searchOnlyRemoteArchives,
   });
+  pushLog(
+    `搜索关键词生成完成：${searchKeywords.length} 个，将按${
+      searchOnlyRemoteArchives ? "本地标题" : "本地标题和主播名"
+    }搜索投稿中心${searchOnlyRemoteArchives ? "，已跳过全量稿件列表" : ""}`,
+    {
+      stage: "search",
+      stageLabel: "搜索稿件",
+      total: searchKeywords.length,
+      processed: 0,
+      current: "搜索关键词",
+    },
+  );
   const remoteResult = await collectRemoteVideoParts(
     uid,
     options.pages,
@@ -2940,6 +3027,7 @@ const runLocalUploadedFilesDetection = async (
     options.detailIntervalMs,
     searchKeywords,
     progress,
+    { searchOnly: searchOnlyRemoteArchives },
   );
 
   const localMatchHints = buildLocalMatchHints(localFiles);
@@ -3420,7 +3508,9 @@ const syncLocalUnuploadedFiles = async (group: {
   burnFilePaths?: string[];
   uploadRawWhenNoDanmu?: boolean;
   mergeSegments?: boolean;
+  mergeAcrossGroups?: boolean;
   mergeFilePaths?: string[];
+  requireMergedDanmu?: boolean;
   deleteSourceAfterSync?: boolean;
   files: LocalUploadCandidateFile[];
 }) => {
@@ -3470,7 +3560,9 @@ const syncLocalUnuploadedFiles = async (group: {
       burnFilePaths: group.burnFilePaths,
       uploadRawWhenNoDanmu: group.uploadRawWhenNoDanmu ?? true,
       mergeSegments: group.mergeSegments ?? false,
+      mergeAcrossGroups: group.mergeAcrossGroups ?? false,
       mergeFilePaths: group.mergeFilePaths,
+      requireMergedDanmu: group.requireMergedDanmu ?? false,
       files: group.files,
     });
 
@@ -3545,7 +3637,9 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
       burnFilePaths?: string[];
       uploadRawWhenNoDanmu?: boolean;
       mergeSegments?: boolean;
+      mergeAcrossGroups?: boolean;
       mergeFilePaths?: string[];
+      requireMergedDanmu?: boolean;
       deleteSourceAfterSync?: boolean;
       files?: LocalUploadCandidateFile[];
     }>;
@@ -3639,7 +3733,9 @@ router.post("/syncLocalUnuploaded", async (ctx) => {
           uploadRawWhenNoDanmu:
             group.uploadRawWhenNoDanmu ?? data.options?.uploadRawWhenNoDanmu ?? true,
           mergeSegments: group.mergeSegments ?? data.options?.mergeSegments ?? false,
+          mergeAcrossGroups: group.mergeAcrossGroups ?? false,
           mergeFilePaths: group.mergeFilePaths,
+          requireMergedDanmu: group.requireMergedDanmu ?? false,
           deleteSourceAfterSync:
             group.deleteSourceAfterSync ?? data.options?.deleteSourceAfterSync ?? false,
           files: group.files!,
@@ -3685,7 +3781,9 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
         | "burnFilePaths"
         | "uploadRawWhenNoDanmu"
         | "mergeSegments"
+        | "mergeAcrossGroups"
         | "mergeFilePaths"
+        | "requireMergedDanmu"
       > & {
         uploadKey?: string;
         uploadMode?: "auto" | "new" | "append";
@@ -3774,7 +3872,9 @@ router.post("/uploadLocalUnuploaded", async (ctx) => {
       uploadRawWhenNoDanmu:
         group.uploadRawWhenNoDanmu ?? data.options?.uploadRawWhenNoDanmu ?? true,
       mergeSegments: group.mergeSegments ?? data.options?.mergeSegments ?? false,
+      mergeAcrossGroups: group.mergeAcrossGroups ?? false,
       mergeFilePaths: group.mergeFilePaths,
+      requireMergedDanmu: group.requireMergedDanmu ?? false,
       files: group.files,
     };
 

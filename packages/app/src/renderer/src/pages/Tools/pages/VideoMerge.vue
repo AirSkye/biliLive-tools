@@ -66,6 +66,10 @@ defineOptions({
   name: "VideoMerge",
 });
 
+type MergeVideoCheckResult = Awaited<ReturnType<typeof taskApi.checkMergeVideos>> & {
+  invalidFiles?: Array<{ path: string; error: string }>;
+};
+
 const notice = useNotification();
 const { appConfig } = storeToRefs(useAppConfig());
 
@@ -130,24 +134,55 @@ const convert = async () => {
     });
     return;
   }
-  if (options.mergeXml) {
-    // 如果开启合并弹幕，那么所有的视频都要有对应的弹幕文件
-    const hasDanmaku = fileList.value.every((item) => item.danmakuPath);
-    if (!hasDanmaku) {
+  let selectedFiles = [...fileList.value];
+  let result = (await taskApi.checkMergeVideos(
+    selectedFiles.map((item) => item.videoPath),
+  )) as MergeVideoCheckResult;
+  if ((result.invalidFiles?.length ?? 0) > 0) {
+    const invalidFiles = result.invalidFiles ?? [];
+    const [shouldContinue] = await confirm.warning({
+      title: "存在无法读取的视频文件",
+      content: `${invalidFiles
+        .map((item) => `${item.path}${item.error ? `\n${item.error}` : ""}`)
+        .join("\n\n")}\n\n是否剔除损坏文件并继续合并？`,
+      positiveText: "剔除损坏文件并继续",
+      negativeText: "取消",
+    });
+    if (!shouldContinue) return;
+
+    const normalizePath = (filePath: string) => filePath.replace(/\\/g, "/").toLowerCase();
+    const invalidPaths = new Set(invalidFiles.map((item) => normalizePath(item.path)));
+    selectedFiles = selectedFiles.filter(
+      (item) => !invalidPaths.has(normalizePath(item.videoPath)),
+    );
+    if (selectedFiles.length < 2) {
       notice.error({
-        title: `所有视频文件必须全部选择弹幕文件`,
+        title: "剔除损坏文件后无法合并",
+        content: "至少需要保留两个可读取的视频文件",
+        duration: 4000,
+      });
+      return;
+    }
+    fileList.value = selectedFiles;
+    result = (await taskApi.checkMergeVideos(
+      selectedFiles.map((item) => item.videoPath),
+    )) as MergeVideoCheckResult;
+    if ((result.invalidFiles?.length ?? 0) > 0) {
+      notice.error({
+        title: "剩余视频仍有无法读取的文件",
+        content: (result.invalidFiles ?? [])
+          .map((item) => `${item.path}${item.error ? `\n${item.error}` : ""}`)
+          .join("\n\n"),
+        duration: 6000,
       });
       return;
     }
   }
-
-  const result = await taskApi.checkMergeVideos(fileList.value.map((item) => item.videoPath));
   if (result.errors.length > 0 || result.warnings.length > 0) {
     const list = result.errors
       .map((item) => `${item}`)
       .join("\n")
       .concat(result.warnings.map((item) => `${item}`).join("\n"));
-
     const [status] = await confirm.warning({
       title: "继续合并很有可能出现问题，是否继续？",
       content: `${list}`,
@@ -158,8 +193,18 @@ const convert = async () => {
   let videoOutput: string | undefined = undefined;
   let xmlOutput: string | undefined = undefined;
 
+  const danmakuFiles = options.mergeXml
+    ? selectedFiles.filter((item) => !!item.danmakuPath)
+    : [];
+  if (options.mergeXml && danmakuFiles.length === 0) {
+    notice.warning({
+      title: "未找到可用弹幕文件，将只合并视频",
+      duration: 3000,
+    });
+  }
+
   if (!options.saveOriginPath) {
-    const { dir, name } = formatFile(fileList.value[0].videoPath);
+    const { dir, name } = formatFile(selectedFiles[0].videoPath);
     const filePath = window.path.join(dir, `${name}-合并.mp4`);
     const file = await showSaveDialog({
       defaultPath: filePath,
@@ -169,8 +214,8 @@ const convert = async () => {
     }
     videoOutput = file;
 
-    if (options.mergeXml) {
-      const { dir, name } = formatFile(fileList.value[0].danmakuPath!);
+    if (danmakuFiles.length > 0) {
+      const { dir, name } = formatFile(danmakuFiles[0].danmakuPath!);
       const filePath = window.path.join(dir, `${name}-合并.xml`);
       const file = await showSaveDialog({
         defaultPath: filePath,
@@ -184,7 +229,7 @@ const convert = async () => {
 
   try {
     taskApi.mergeVideos(
-      fileList.value.map((item) => item.videoPath),
+      selectedFiles.map((item) => item.videoPath),
       { output: videoOutput, ...options },
     );
     notice.warning({
@@ -192,10 +237,9 @@ const convert = async () => {
       duration: 1000,
     });
 
-    if (options.mergeXml) {
+    if (danmakuFiles.length > 0) {
       danmaApi
-        // @ts-expect-error
-        .mergeXml(fileList.value, { output: xmlOutput, saveMeta: options.keepFirstVideoMeta })
+        .mergeXml(selectedFiles, { output: xmlOutput, saveMeta: options.keepFirstVideoMeta })
         .then(() => {
           notice.success({
             title: `弹幕合并成功`,

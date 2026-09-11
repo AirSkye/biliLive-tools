@@ -9,6 +9,7 @@ import { DEFAULT_BILIUP_CONFIG } from "@biliLive-tools/shared/presets/videoPrese
 import * as utils from "@biliLive-tools/shared/utils/index.js";
 import * as syncTask from "@biliLive-tools/shared/task/sync.js";
 import * as videoTask from "@biliLive-tools/shared/task/video.js";
+import * as danmuTask from "@biliLive-tools/shared/task/danmu.js";
 import biliApi from "@biliLive-tools/shared/task/bili.js";
 
 import type { Options } from "../src/types/webhook.js";
@@ -88,20 +89,23 @@ describe("WebhookHandler", () => {
 
     it("merges selected FLV files and keeps MP4 as a separate part", async () => {
       (webhookHandler as any).resolveLocalDanmuPath = vi.fn().mockResolvedValue(undefined);
-      vi.spyOn(webhookHandler as any, "buildMergedLocalUploadPart").mockResolvedValue({
-        path: "C:\\recordings\\merged.mp4",
-        sourcePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
-        title: "merged",
-        startTime: 1000,
-        endTime: 2500,
-        cleanupPaths: [],
-        temporaryPaths: [],
-        warnings: [],
-      });
+      const mergeSpy = vi
+        .spyOn(webhookHandler as any, "buildMergedLocalUploadPart")
+        .mockResolvedValue({
+          path: "C:\\recordings\\merged.mp4",
+          sourcePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
+          title: "merged",
+          startTime: 1000,
+          endTime: 2500,
+          cleanupPaths: [],
+          temporaryPaths: [],
+          warnings: [],
+        });
 
       const parts = await (webhookHandler as any).buildLocalUploadParts({
         roomId: "100",
         mergeSegments: true,
+        requireMergedDanmu: true,
         mergeFilePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
         files: [
           localFile("C:\\recordings\\a.flv", 1),
@@ -110,9 +114,106 @@ describe("WebhookHandler", () => {
         ],
       });
 
+      expect(mergeSpy).toHaveBeenCalledWith(
+        [
+          expect.objectContaining({ path: "C:\\recordings\\a.flv" }),
+          expect.objectContaining({ path: "C:\\recordings\\b.flv" }),
+        ],
+        { requireMergedDanmu: true },
+      );
       expect(parts).toHaveLength(2);
       expect(parts[0].sourcePaths).toEqual(["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"]);
       expect(parts[1].sourcePaths).toEqual(["C:\\recordings\\ready.mp4"]);
+    });
+
+    it("passes strict merged danmaku mode to merged local parts", async () => {
+      const mergeSpy = vi
+        .spyOn(webhookHandler as any, "buildMergedLocalUploadPart")
+        .mockResolvedValue({
+          path: "C:\\recordings\\merged.mp4",
+          sourcePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
+          title: "merged",
+          startTime: 1000,
+          endTime: 2500,
+          cleanupPaths: [],
+          temporaryPaths: [],
+          warnings: [],
+        });
+
+      await (webhookHandler as any).buildLocalUploadParts({
+        roomId: "100",
+        mergeSegments: true,
+        requireMergedDanmu: true,
+        files: [localFile("C:\\recordings\\a.flv", 1), localFile("C:\\recordings\\b.flv", 2)],
+      });
+
+      expect(mergeSpy).toHaveBeenCalledWith(expect.any(Array), { requireMergedDanmu: true });
+    });
+
+    it("rejects a cross-group request that leaves selected files outside the merge", async () => {
+      await expect(
+        (webhookHandler as any).buildLocalUploadParts({
+          roomId: "100",
+          mergeSegments: true,
+          mergeAcrossGroups: true,
+          mergeFilePaths: ["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"],
+          files: [
+            localFile("C:\\recordings\\a.flv", 1),
+            localFile("C:\\recordings\\b.flv", 2),
+            localFile("C:\\recordings\\c.flv", 3),
+          ],
+        }),
+      ).rejects.toThrow("必须全部合并");
+    });
+
+    it("keeps merging when the merged-danmaku request has no XML files", async () => {
+      (webhookHandler as any).resolveLocalDanmuPath = vi.fn().mockResolvedValue(undefined);
+      const checkSpy = vi.spyOn(videoTask, "checkMergeVideos").mockResolvedValue({
+        warnings: [],
+        errors: [],
+        invalidFiles: [],
+      });
+      const mergeSpy = vi.spyOn(videoTask, "mergeVideosToFile").mockResolvedValue({} as any);
+      const waitSpy = vi
+        .spyOn(webhookHandler as any, "waitForTaskOutput")
+        .mockResolvedValue("C:\\recordings\\merged.mp4");
+      const danmuSpy = vi.spyOn(danmuTask, "mergeXml");
+
+      const result = await (webhookHandler as any).buildMergedLocalUploadPart(
+        [localFile("C:\\recordings\\a.flv", 1), localFile("C:\\recordings\\b.flv", 2)],
+        { requireMergedDanmu: true },
+      );
+
+      expect(checkSpy).toHaveBeenCalledOnce();
+      expect(mergeSpy).toHaveBeenCalledOnce();
+      expect(danmuSpy).not.toHaveBeenCalled();
+      expect(result.path).toBe("C:\\recordings\\merged.mp4");
+      waitSpy.mockRestore();
+      danmuSpy.mockRestore();
+      mergeSpy.mockRestore();
+      checkSpy.mockRestore();
+    });
+
+    it("reports unreadable merge inputs without creating a merge task", async () => {
+      (webhookHandler as any).resolveLocalDanmuPath = vi
+        .fn()
+        .mockResolvedValue("C:\\recordings\\danmu.xml");
+      const checkSpy = vi.spyOn(videoTask, "checkMergeVideos").mockResolvedValue({
+        warnings: [],
+        errors: ["无法读取视频文件：C:\\recordings\\broken.flv\\nEnd of file"],
+        invalidFiles: [{ path: "C:\\recordings\\broken.flv", error: "End of file" }],
+      });
+      const mergeSpy = vi.spyOn(videoTask, "mergeVideosToFile");
+
+      await expect(
+        (webhookHandler as any).buildMergedLocalUploadPart([
+          localFile("C:\\recordings\\broken.flv", 1),
+          localFile("C:\\recordings\\ok.flv", 2),
+        ]),
+      ).rejects.toThrow("broken.flv");
+      expect(mergeSpy).not.toHaveBeenCalled();
+      checkSpy.mockRestore();
+      mergeSpy.mockRestore();
     });
 
     it("burns only parts whose source files are selected", () => {
@@ -3830,6 +3931,62 @@ describe("Live", () => {
               files: [{ path: "/path/to/source.flv" }],
             }),
           ).rejects.toThrow("文件已在 webhook 上传流程中");
+        });
+
+        it("本地补偿上传不应被失败的 prehandled webhook 残留状态阻塞", () => {
+          const live = new Live({
+            platform: "bilibili",
+            software: "bili-recorder",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Live",
+            username: "User",
+          });
+          live.addPart({
+            filePath: "E:\\lbj\\1814378060-user\\failed.flv",
+            rawFilePath: "E:\\lbj\\1814378060-user\\failed.flv",
+            recordStatus: "prehandled",
+            uploadStatus: "error",
+            rawUploadStatus: "error",
+            title: "Failed part",
+          });
+          webhookHandler.liveData.push(live);
+
+          expect(
+            // @ts-ignore
+            webhookHandler.getManagedLivePathState("E:\\lbj\\1814378060-user\\failed.flv"),
+          ).toBeUndefined();
+          expect(() =>
+            // @ts-ignore
+            webhookHandler.reserveLocalUploadPaths([
+              { path: "E:\\lbj\\1814378060-user\\failed.flv" },
+            ]),
+          ).not.toThrow();
+        });
+
+        it("本地补偿上传仍应拦截 prehandled 中待上传的 webhook 文件", () => {
+          const live = new Live({
+            platform: "bilibili",
+            software: "bili-recorder",
+            roomId: "123",
+            startTime: Date.now(),
+            title: "Live",
+            username: "User",
+          });
+          live.addPart({
+            filePath: "/path/to/pending.flv",
+            rawFilePath: "/path/to/pending.flv",
+            recordStatus: "prehandled",
+            uploadStatus: "pending",
+            rawUploadStatus: "error",
+            title: "Pending part",
+          });
+          webhookHandler.liveData.push(live);
+
+          expect(
+            // @ts-ignore
+            webhookHandler.getManagedLivePathState("/path/to/pending.flv"),
+          ).toBe("active");
         });
 
         it("本地补偿上传应跳过普通 webhook 中已完成的处理版文件", async () => {

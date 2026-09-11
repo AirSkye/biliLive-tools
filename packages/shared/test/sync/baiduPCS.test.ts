@@ -67,6 +67,37 @@ describe("BaiduPCS", () => {
     });
   });
 
+  describe("remote metadata", () => {
+    it("treats a successful meta command containing a missing-path message as absent", async () => {
+      const baiduPCS = new BaiduPCS();
+      vi.spyOn(baiduPCS as any, "executeCommand").mockResolvedValue(
+        "文件不存在: /录播/test.flv",
+      );
+
+      await expect(baiduPCS.getFileMeta("/录播/test.flv")).rejects.toThrow("远端文件不存在");
+    });
+
+    it("parses metadata labels separated by a colon", async () => {
+      const baiduPCS = new BaiduPCS();
+      vi.spyOn(baiduPCS as any, "executeCommand").mockResolvedValue(
+        [
+          "类型: 文件",
+          "文件路径: /录播/test.flv",
+          "文件名称: test.flv",
+          "文件大小: 1,024, 1KB",
+          "fs_id: 123",
+        ].join("\n"),
+      );
+
+      await expect(baiduPCS.getFileMeta("/录播/test.flv")).resolves.toMatchObject({
+        path: "/录播/test.flv",
+        filename: "test.flv",
+        size: 1024,
+        fsId: 123,
+      });
+    });
+  });
+
   describe("uploadFile remote deduplication", () => {
     const localFilePath = "C:/recordings/test.flv";
 

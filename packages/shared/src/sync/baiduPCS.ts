@@ -74,7 +74,9 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
   private uploadCmd: ChildProcess | null = null;
 
   private isRemotePathMissingError(error: unknown): boolean {
-    return /not found|not exist|no such file|不存在|未找到/i.test(String(error));
+    return /not found|not exist|no such file|file does not exist|文件不存在|路径不存在|目标文件不存在|不存在|未找到/i.test(
+      String(error),
+    );
   }
 
   private async getExistingRemoteFileMeta(remoteFilePath: string) {
@@ -161,7 +163,8 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
             this.logger.info(`命令执行成功: ${args.join(" ")}`);
           }
           this.cmd = null;
-          resolve(stdout);
+          // meta may report a missing path on stderr while still exiting with code 0.
+          resolve([stdout.trim(), stderr.trim()].filter(Boolean).join("\n"));
         } else {
           const commandOutput = [stderr.trim(), stdout.trim()].filter(Boolean).join("\n");
           const errorMsg = uploadFailed
@@ -377,22 +380,26 @@ export class BaiduPCS extends TypedEmitter<BaiduPCSEvents> {
   async getFileMeta(remotePath: string): Promise<BaiduPCSFileMeta> {
     const data = await this.executeCommand(["meta", remotePath]);
 
+    if (this.isRemotePathMissingError(data)) {
+      throw new Error(`远端文件不存在: ${remotePath}`);
+    }
+
     // 使用正则表达式解析输出
-    const typeMatch = data.match(/类型\s+(.+)/);
-    const pathMatch = data.match(/文件路径\s+(.+)/);
-    const filenameMatch = data.match(/文件名称\s+(.+)/);
-    const sizeMatch = data.match(/文件大小\s+(\d+),\s+([\d.]+[KMG]?B)/);
-    const md5Match = data.match(/md5 \(可能不正确\)\s+([a-f0-9]{32})/i);
-    const appIdMatch = data.match(/app_id\s+(\d+)/);
-    const fsIdMatch = data.match(/fs_id\s+(\d+)/);
-    const createTimeMatch = data.match(/创建日期\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/);
-    const modifyTimeMatch = data.match(/修改日期\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/);
+    const typeMatch = data.match(/类型\s*[:：]?\s*(.+)/);
+    const pathMatch = data.match(/文件路径\s*[:：]?\s*(.+)/);
+    const filenameMatch = data.match(/文件名称\s*[:：]?\s*(.+)/);
+    const sizeMatch = data.match(/文件大小\s*[:：]?\s*(\d[\d,]*)\s*,\s*([\d.]+[KMG]?B)/);
+    const md5Match = data.match(/md5\s*\(可能不正确\)\s*[:：]?\s*([a-f0-9]{32})/i);
+    const appIdMatch = data.match(/app_id\s*[:：]?\s*(\d+)/);
+    const fsIdMatch = data.match(/fs_id\s*[:：]?\s*(\d+)/);
+    const createTimeMatch = data.match(/创建日期\s*[:：]?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/);
+    const modifyTimeMatch = data.match(/修改日期\s*[:：]?\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})/);
 
     return {
       type: typeMatch?.[1]?.trim(),
       path: pathMatch?.[1]?.trim() || "",
       filename: filenameMatch?.[1]?.trim() || "",
-      size: parseInt(sizeMatch?.[1] || "0", 10) || 0,
+      size: parseInt(sizeMatch?.[1]?.replace(/,/g, "") || "0", 10) || 0,
       sizeReadable: sizeMatch?.[2]?.trim() || "",
       md5: md5Match?.[1]?.trim() || "",
       appId: parseInt(appIdMatch?.[1] || "0", 10),

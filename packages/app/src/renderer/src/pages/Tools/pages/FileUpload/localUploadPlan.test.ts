@@ -5,6 +5,7 @@ import {
   buildLocalActionGroups,
   removeCompletedLocalUploadFiles,
   removeLocalUnuploadedFiles,
+  removeInvalidLocalActionFiles,
   type LocalProcessMode,
 } from "./localUploadPlan";
 
@@ -127,6 +128,135 @@ describe("local upload plan", () => {
     expect(result[0].mergeFilePaths).toEqual(["first-a.flv", "first-b.flv"]);
     expect(result[1].mergeFilePaths).toEqual(["second-a.flv", "second-b.flv"]);
     expect(result.every((item) => item.mergeSegments && item.burnDanmu)).toBe(true);
+    expect(result.every((item) => !item.requireMergedDanmu)).toBe(true);
+  });
+
+  it("merges selected files across recordings in chronological order", () => {
+    const older = group(["older-a.flv", "older-b.flv"], "older");
+    older.files[0].startTime = 1_000;
+    older.files[1].startTime = 2_000;
+    const newer = group(["newer-a.flv", "newer-b.flv"], "newer");
+    newer.files[0].startTime = 3_000;
+    newer.files[1].startTime = 4_000;
+    for (const item of [...older.files, ...newer.files]) {
+      item.xmlDanmuPath = `${item.path}.xml`;
+    }
+
+    const result = buildLocalActionGroups({
+      groups: [
+        { row: newer, uploadRawWhenNoDanmu: true },
+        { row: older, uploadRawWhenNoDanmu: true },
+      ],
+      selectedFilePaths: ["newer-b.flv", "older-b.flv", "newer-a.flv", "older-a.flv"],
+      mode: "burnMerge",
+      deleteSourceAfterSync: false,
+      mergeAcrossGroups: true,
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].files.map((item) => item.path)).toEqual([
+      "older-a.flv",
+      "older-b.flv",
+      "newer-a.flv",
+      "newer-b.flv",
+    ]);
+    expect(result[0].mergeFilePaths).toEqual(result[0].files.map((item) => item.path));
+    expect(result[0].mergeSegments).toBe(true);
+    expect(result[0].uploadMode).toBe("new");
+    expect(result[0].requireMergedDanmu).toBe(true);
+    expect(result[0].mergeAcrossGroups).toBe(true);
+  });
+
+  it("rejects cross-recording merges from different rooms", () => {
+    const first = group(["first.flv"], "first");
+    const second = group(["second.flv"], "second");
+    second.roomId = "200";
+
+    expect(() =>
+      buildLocalActionGroups({
+        groups: [
+          { row: first, uploadRawWhenNoDanmu: true },
+          { row: second, uploadRawWhenNoDanmu: true },
+        ],
+        selectedFilePaths: ["first.flv", "second.flv"],
+        mode: "merge",
+        deleteSourceAfterSync: false,
+        mergeAcrossGroups: true,
+      }),
+    ).toThrow("同一个房间");
+  });
+
+  it("keeps cross-recording burn merges when an XML file is missing", () => {
+    const first = group(["first.flv"], "first");
+    const second = group(["second.flv"], "second");
+
+    const result = buildLocalActionGroups({
+      groups: [
+        { row: first, uploadRawWhenNoDanmu: true },
+        { row: second, uploadRawWhenNoDanmu: true },
+      ],
+      selectedFilePaths: ["first.flv", "second.flv"],
+      mode: "burnMerge",
+      deleteSourceAfterSync: false,
+      mergeAcrossGroups: true,
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].mergeFilePaths).toEqual(["first.flv", "second.flv"]);
+    expect(result[0].mergeSegments).toBe(true);
+    expect(result[0].burnDanmu).toBe(true);
+  });
+
+  it("rejects cross-recording merges that include an already processed MP4", () => {
+    const first = group(["first.flv"], "first");
+    const second = group(["processed.mp4"], "second");
+
+    expect(() =>
+      buildLocalActionGroups({
+        groups: [
+          { row: first, uploadRawWhenNoDanmu: true },
+          { row: second, uploadRawWhenNoDanmu: true },
+        ],
+        selectedFilePaths: ["first.flv", "processed.mp4"],
+        mode: "merge",
+        deleteSourceAfterSync: false,
+        mergeAcrossGroups: true,
+      }),
+    ).toThrow("全部为 FLV");
+  });
+
+  it("removes damaged merge inputs and rebuilds the remaining plan", () => {
+    const source = group(["first.flv", "damaged.flv", "last.flv"]);
+    const prepared = buildLocalActionGroups({
+      groups: [{ row: source, uploadRawWhenNoDanmu: true }],
+      selectedFilePaths: ["first.flv", "damaged.flv", "last.flv"],
+      mode: "burnMerge",
+      deleteSourceAfterSync: false,
+    });
+
+    const result = removeInvalidLocalActionFiles(prepared, ["DAMAGED.FLV"]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0].files.map((item) => item.path)).toEqual(["first.flv", "last.flv"]);
+    expect(result[0].mergeFilePaths).toEqual(["first.flv", "last.flv"]);
+    expect(result[0].burnFilePaths).toEqual(["first.flv", "last.flv"]);
+    expect(result[0].mergeSegments).toBe(true);
+  });
+
+  it("falls back to separate upload parts when only one merge input remains", () => {
+    const source = group(["first.flv", "damaged.flv"]);
+    const prepared = buildLocalActionGroups({
+      groups: [{ row: source, uploadRawWhenNoDanmu: true }],
+      selectedFilePaths: ["first.flv", "damaged.flv"],
+      mode: "merge",
+      deleteSourceAfterSync: false,
+    });
+
+    const result = removeInvalidLocalActionFiles(prepared, ["damaged.flv"]);
+
+    expect(result[0].files.map((item) => item.path)).toEqual(["first.flv"]);
+    expect(result[0].mergeSegments).toBe(false);
+    expect(result[0].mergeFilePaths).toEqual([]);
   });
 
   it("removes only completed upload files and keeps the remaining recording", () => {

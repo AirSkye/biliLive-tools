@@ -514,7 +514,7 @@ export function generateMergedXmlContent(
  * 根据视频合并xml弹幕
  */
 export const mergeXml = async (
-  inputFiles: { videoPath: string; danmakuPath: string }[],
+  inputFiles: { videoPath: string; danmakuPath?: string }[],
   options: {
     output?: string;
     saveMeta?: boolean;
@@ -529,7 +529,8 @@ export const mergeXml = async (
   if (options.output) {
     outputPath = options.output;
   } else {
-    const { dir, name } = parse(inputFiles[0].danmakuPath);
+    const sourcePath = inputFiles[0].danmakuPath || inputFiles[0].videoPath;
+    const { dir, name } = parse(sourcePath);
     const filePath = join(dir, `${name}-合并.xml`);
     outputPath = await getUnusedFileName(filePath);
   }
@@ -539,7 +540,8 @@ export const mergeXml = async (
     await trashItem(outputPath);
   }
 
-  // 读取视频时长和累计时长
+  // 读取视频时长和累计时长。没有 XML 的视频也要占用时长，
+  // 否则后续视频的弹幕偏移会因为缺少片段而提前。
   let cumulativeDuration = 0;
   const videoData: VideoDataItem[] = [];
 
@@ -548,18 +550,29 @@ export const mergeXml = async (
     const meta = await readVideoMeta(file.videoPath);
     const duration = meta.format.duration || 0;
 
-    // 解析XML文件
-    const { jObj, danmuku, sc, guard, gift } = await parseXmlFile(file.danmakuPath, true);
+    let jObj: any = {};
+    let danmuku: DanmuItem[] = [];
+    let sc: CommonItem[] = [];
+    let guard: CommonItem[] = [];
+    let gift: CommonItem[] = [];
+    if (file.danmakuPath) {
+      const parsed = await parseXmlFile(file.danmakuPath, true);
+      jObj = parsed.jObj;
+      danmuku = parsed.danmuku || [];
+      sc = parsed.sc || [];
+      guard = parsed.guard || [];
+      gift = parsed.gift || [];
+    }
 
     videoData.push({
-      path: file.danmakuPath,
+      path: file.danmakuPath || file.videoPath,
       videoDuration: duration,
       startOffset: cumulativeDuration,
       meta: jObj.i?.metadata || {},
-      danmuku: danmuku || [],
-      sc: sc || [],
-      guard: guard || [],
-      gift: gift || [],
+      danmuku,
+      sc,
+      guard,
+      gift,
     });
 
     cumulativeDuration += duration;

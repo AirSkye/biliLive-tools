@@ -76,6 +76,7 @@ export type LocalUploadFileInput = {
   title?: string;
   startTime?: number;
   endTime?: number;
+  mtimeMs?: number;
   danmuPath?: string;
   xmlDanmuPath?: string;
 };
@@ -92,7 +93,9 @@ export type LocalUploadOptions = {
   burnFilePaths?: string[];
   uploadRawWhenNoDanmu?: boolean;
   mergeSegments?: boolean;
+  mergeAcrossGroups?: boolean;
   mergeFilePaths?: string[];
+  requireMergedDanmu?: boolean;
   files: LocalUploadFileInput[];
 };
 
@@ -184,10 +187,12 @@ export class WebhookHandler {
 
   private sortLocalUploadFiles(files: LocalUploadFileInput[]) {
     return [...files].sort((left, right) => {
-      const leftTime = left.startTime ?? 0;
-      const rightTime = right.startTime ?? 0;
+      const leftTime = left.startTime ?? left.mtimeMs ?? 0;
+      const rightTime = right.startTime ?? right.mtimeMs ?? 0;
       if (leftTime !== rightTime) return leftTime - rightTime;
-      return left.path.localeCompare(right.path);
+      return this.normalizeManagedPath(left.path).localeCompare(
+        this.normalizeManagedPath(right.path),
+      );
     });
   }
 
@@ -213,7 +218,10 @@ export class WebhookHandler {
         const isRawPath = this.normalizeManagedPath(part.rawFilePath) === normalizedPath;
         if (!isHandledPath && !isRawPath) continue;
 
-        if (part.recordStatus !== "handled" && part.recordStatus !== "error") return "active";
+        // A failed conversion can leave an old part in "recorded" or "prehandled".
+        // Its upload statuses are already "error" and no task is running, so it must
+        // not permanently block a user-initiated retry of the same local file.
+        if (part.recordStatus === "recording") return "active";
         if (part.recordStatus === "error") continue;
 
         if (isHandledPath) {
@@ -589,47 +597,86 @@ export class WebhookHandler {
 
   private async buildMergedLocalUploadPart(
     files: LocalUploadFileInput[],
+    options: { requireMergedDanmu?: boolean } = {},
   ): Promise<PreparedLocalUploadPart> {
     const sortedFiles = this.sortLocalUploadFiles(files);
     const inputFiles = sortedFiles.map((item) => item.path);
     const firstFile = path.parse(inputFiles[0]);
     const output = await getUnusedFileName(path.join(firstFile.dir, `${firstFile.name}-合并.mp4`));
+
+    const warnings: string[] = [];
+    const xmlInputs: { videoPath: string; danmakuPath?: string }[] = [];
+    const missingXmlFiles: Array<{ path: string; reason: string }> = [];
+    for (const file of sortedFiles) {
+      const xmlPath = await this.resolveLocalDanmuPath(file, true);
+      if (!xmlPath) {
+        missingXmlFiles.push({ path: file.path, reason: "未找到对应的 XML 弹幕" });
+        xmlInputs.push({ videoPath: file.path });
+        continue;
+      }
+      if (!(await fs.pathExists(xmlPath)) || (await isEmptyDanmu(xmlPath))) {
+        missingXmlFiles.push({
+          path: file.path,
+          reason: (await fs.pathExists(xmlPath)) ? "XML 弹幕为空" : "XML 弹幕文件不存在",
+        });
+        xmlInputs.push({ videoPath: file.path });
+        continue;
+      }
+      xmlInputs.push({ videoPath: file.path, danmakuPath: xmlPath });
+    }
+
     const checkResult = await checkMergeVideos(inputFiles);
-    const warnings = [...checkResult.warnings];
+    if (checkResult.invalidFiles.length > 0) {
+      const invalidMessages = checkResult.invalidFiles.map(
+        ({ path: filePath, error }) => `${filePath}${error ? `\n${error}` : ""}`,
+      );
+      throw new Error(`合并前检查失败：\n${invalidMessages.join("\n\n")}`);
+    }
+
+    warnings.push(...checkResult.warnings);
     if (checkResult.errors.length > 0) {
       warnings.push(
         `检测到编码或分辨率不一致，已切换为兼容转码合并：${checkResult.errors.join("；")}`,
       );
     }
-
-    const task = await mergeVideosToFile(inputFiles, {
-      output,
-      removeOrigin: false,
-      saveOriginPath: false,
-      keepFirstVideoMeta: true,
-      transcode: checkResult.errors.length > 0,
-    });
-    const mergedVideo = await this.waitForTaskOutput(task);
-
-    let mergedDanmu: string | undefined;
-    const xmlInputs: { videoPath: string; danmakuPath: string }[] = [];
-    for (const file of sortedFiles) {
-      const xmlPath = await this.resolveLocalDanmuPath(file, true);
-      if (!xmlPath) {
-        warnings.push(
-          `未找到 ${path.basename(file.path)} 对应的 XML 弹幕，合并后将无法压制合并弹幕`,
-        );
-        xmlInputs.length = 0;
-        break;
-      }
-      xmlInputs.push({ videoPath: file.path, danmakuPath: xmlPath });
+    if (missingXmlFiles.length > 0) {
+      warnings.push(
+        `${missingXmlFiles
+          .map(({ path: filePath, reason }) => `${path.basename(filePath)}：${reason}`)
+          .join("；")}，将跳过这些片段的弹幕并保留其视频时长`,
+      );
     }
 
-    if (xmlInputs.length === sortedFiles.length) {
-      mergedDanmu = await mergeXml(xmlInputs, {
-        output: replaceExtName(mergedVideo, ".xml"),
-        saveMeta: true,
+    let mergedVideo: string;
+    try {
+      const task = await mergeVideosToFile(inputFiles, {
+        output,
+        removeOrigin: false,
+        saveOriginPath: false,
+        keepFirstVideoMeta: true,
+        transcode: checkResult.errors.length > 0,
       });
+      mergedVideo = await this.waitForTaskOutput(task);
+    } catch (error) {
+      await fs.remove(output).catch(() => undefined);
+      throw new Error(`合并视频失败：${String(error)}`);
+    }
+
+    let mergedDanmu: string | undefined;
+    const mergedDanmuPath = replaceExtName(mergedVideo, ".xml");
+    if (xmlInputs.some((item) => item.danmakuPath)) {
+      try {
+        mergedDanmu = await mergeXml(xmlInputs, {
+          output: mergedDanmuPath,
+          saveMeta: true,
+        });
+      } catch (error) {
+        await Promise.all([
+          fs.remove(mergedVideo).catch(() => undefined),
+          fs.remove(mergedDanmuPath).catch(() => undefined),
+        ]);
+        throw new Error(`合并 XML 弹幕失败：${String(error)}`);
+      }
     }
 
     return {
@@ -640,7 +687,7 @@ export class WebhookHandler {
       endTime: sortedFiles[sortedFiles.length - 1].endTime,
       danmuPath: mergedDanmu,
       xmlDanmuPath: mergedDanmu,
-      cleanupPaths: inputFiles,
+      cleanupPaths: [...inputFiles, ...(mergedDanmu ? [mergedDanmu] : [])],
       temporaryPaths: [mergedVideo, ...(mergedDanmu ? [mergedDanmu] : [])],
       warnings,
     };
@@ -657,14 +704,24 @@ export class WebhookHandler {
     const mergeFiles = selectedMergePaths
       ? sortedFiles.filter((file) => selectedMergePaths.has(this.normalizeManagedPath(file.path)))
       : sortedFiles;
-    const shouldMerge =
-      options.mergeSegments &&
-      mergeFiles.length > 1 &&
-      mergeFiles.every((file) => path.extname(file.path).toLowerCase() === ".flv");
+    const allMergeFilesAreFlv = mergeFiles.every(
+      (file) => path.extname(file.path).toLowerCase() === ".flv",
+    );
+    if (
+      options.mergeAcrossGroups &&
+      (!options.mergeSegments || mergeFiles.length !== sortedFiles.length || !allMergeFilesAreFlv)
+    ) {
+      throw new Error("跨分组合并要求所有选中文件都是原始 FLV，并且必须全部合并");
+    }
+    const shouldMerge = options.mergeSegments && mergeFiles.length > 1 && allMergeFilesAreFlv;
 
     const parts: PreparedLocalUploadPart[] = [];
     if (shouldMerge) {
-      parts.push(await this.buildMergedLocalUploadPart(mergeFiles));
+      parts.push(
+        await this.buildMergedLocalUploadPart(mergeFiles, {
+          requireMergedDanmu: options.requireMergedDanmu,
+        }),
+      );
     }
 
     const remainingFiles = shouldMerge
@@ -1289,6 +1346,10 @@ export class WebhookHandler {
       return { conversionSuccessful: true, danmuConversionSuccessful: true };
     } catch (error) {
       log.error(error);
+      // The conversion has finished unsuccessfully. Do not leave this part in
+      // "prehandled", otherwise it is treated as an active webhook job forever
+      // even after the associated task has failed or disappeared.
+      context.part.recordStatus = "handled";
       context.part.uploadStatus = "error";
       return { conversionSuccessful: false, danmuConversionSuccessful: false };
     }

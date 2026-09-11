@@ -13,10 +13,10 @@ const router = new Router({
 
 router.post("/mergeXml", async (ctx) => {
   const { inputFiles, options } = ctx.request.body as {
-    inputFiles: { videoPath: string; danmakuPath: string }[];
+    inputFiles: { videoPath: string; danmakuPath?: string }[];
     options: {
       output?: string;
-      saveOriginPath: boolean;
+      saveOriginPath?: boolean;
       saveMeta?: boolean;
     };
   };

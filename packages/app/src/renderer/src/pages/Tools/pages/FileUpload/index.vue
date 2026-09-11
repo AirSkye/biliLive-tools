@@ -404,6 +404,14 @@
           <n-radio-button value="burn">压制</n-radio-button>
           <n-radio-button value="burnMerge">压制并合并</n-radio-button>
         </n-radio-group>
+        <n-checkbox
+          v-if="canShowMergeAcrossGroups"
+          v-model:checked="mergeAcrossGroups"
+          :disabled="!canMergeAcrossGroups"
+          :title="mergeAcrossGroupsTitle"
+        >
+          跨分组合并为一个视频（新建稿件）
+        </n-checkbox>
       </div>
       <n-alert type="info" :bordered="false" style="margin-bottom: 10px">
         {{ localActionPlanSummary }}
@@ -451,13 +459,14 @@ import {
   buildLocalActionGroups,
   removeCompletedLocalUploadFiles,
   removeLocalUnuploadedFiles,
+  removeInvalidLocalActionFiles,
   type LocalProcessMode,
   type PendingLocalActionGroup,
   type PreparedLocalActionGroup,
 } from "./localUploadPlan";
 import { useBili, useConfirm } from "@renderer/hooks";
 import { useUserInfoStore, useAppConfig } from "@renderer/stores";
-import { biliApi, fileBrowserApi } from "@renderer/apis";
+import { biliApi, fileBrowserApi, taskApi } from "@renderer/apis";
 import hotkeys from "hotkeys-js";
 
 import { deepRaw } from "@renderer/utils";
@@ -768,6 +777,9 @@ const localUploadOptions = reactive({
   uploadRawWhenNoDanmu: true,
   deleteSourceAfterSync: false,
 });
+type LocalMergeCheckResult = Awaited<ReturnType<typeof taskApi.checkMergeVideos>> & {
+  invalidFiles?: Array<{ path: string; error: string }>;
+};
 type LocalActionFileRow = LocalUploadCandidateFile & {
   groupId: string;
   username?: string;
@@ -782,7 +794,11 @@ const localActionDialogVisible = ref(false);
 const pendingLocalUploadGroups = ref<PendingLocalActionGroup[]>([]);
 const pendingLocalPreparedOperation = ref<PendingLocalPreparedOperation>("upload");
 const pendingLocalProcessMode = ref<LocalProcessMode>("direct");
+const mergeAcrossGroups = ref(false);
 const selectedActionFileKeys = ref<DataTableRowKey[]>([]);
+watch(pendingLocalProcessMode, (mode) => {
+  if (mode !== "merge" && mode !== "burnMerge") mergeAcrossGroups.value = false;
+});
 const getLocalUploadedRowKey = (row: LocalUploadedFileMatch) => row.localPath;
 const getLocalInvalidMp4RowKey = (row: LocalInvalidMp4File) => row.localPath;
 const getLocalDuplicateRowKey = (row: LocalDuplicateVideoFile) => row.localPath;
@@ -926,6 +942,66 @@ const selectAllActionFiles = () => {
 const clearActionFiles = () => {
   selectedActionFileKeys.value = [];
 };
+const selectedLocalActionFiles = computed(() => {
+  const selectedPaths = new Set(selectedActionFileKeys.value.map((item) => String(item)));
+  return localActionFileRows.value.filter((row) => selectedPaths.has(row.path));
+});
+const selectedLocalActionGroupCount = computed(
+  () => new Set(selectedLocalActionFiles.value.map((row) => row.groupId)).size,
+);
+const wantsLocalMerge = computed(
+  () => pendingLocalProcessMode.value === "merge" || pendingLocalProcessMode.value === "burnMerge",
+);
+const canShowMergeAcrossGroups = computed(
+  () =>
+    pendingLocalPreparedOperation.value !== "delete" &&
+    wantsLocalMerge.value &&
+    selectedLocalActionGroupCount.value > 1,
+);
+const canMergeAcrossGroups = computed(() => {
+  if (!canShowMergeAcrossGroups.value || selectedLocalActionFiles.value.length < 2) return false;
+  const roomIds = new Set(selectedLocalActionFiles.value.map((row) => row.roomId).filter(Boolean));
+  return (
+    roomIds.size === 1 &&
+    selectedLocalActionFiles.value.every(
+      (row) => !!row.roomId && row.path.toLowerCase().endsWith(".flv") && !row.busy,
+    )
+  );
+});
+watch(canMergeAcrossGroups, (allowed) => {
+  if (!allowed) mergeAcrossGroups.value = false;
+});
+const mergeAcrossGroupsTitle = computed(() => {
+  if (
+    canMergeAcrossGroups.value &&
+    pendingLocalProcessMode.value === "burnMerge" &&
+    selectedLocalActionFiles.value.some((row) => !row.xmlDanmuPath)
+  ) {
+    return "部分视频没有 XML 弹幕，仍会合并视频；对应片段将跳过弹幕压制";
+  }
+  if (canMergeAcrossGroups.value) {
+    return "所选分组将按录制开始时间合并为一个视频，并新建一个稿件";
+  }
+  if (selectedLocalActionFiles.value.some((row) => !row.roomId)) {
+    return "跨分组合并要求每个分组都能识别到同一个房间";
+  }
+  if (new Set(selectedLocalActionFiles.value.map((row) => row.roomId)).size > 1) {
+    return "跨分组合并要求所选分组属于同一个房间";
+  }
+  if (selectedLocalActionFiles.value.some((row) => !row.path.toLowerCase().endsWith(".flv"))) {
+    return "跨分组合并目前只支持全部为原始 FLV 的视频";
+  }
+  if (
+    pendingLocalProcessMode.value === "burnMerge" &&
+    selectedLocalActionFiles.value.some((row) => !row.xmlDanmuPath)
+  ) {
+    return "部分视频没有 XML 弹幕，仍会合并视频；对应片段将跳过弹幕压制";
+  }
+  if (selectedLocalActionFiles.value.some((row) => row.busy)) {
+    return "跨分组合并不能包含正在处理中的视频";
+  }
+  return "跨分组合并至少需要选择两个视频";
+});
 const localActionDialogTitle = computed(() =>
   pendingLocalPreparedOperation.value === "delete"
     ? "选择要删除的本地未上传视频"
@@ -959,8 +1035,23 @@ const localActionPlanSummary = computed(() => {
   const wantsMerge =
     pendingLocalProcessMode.value === "merge" || pendingLocalProcessMode.value === "burnMerge";
   const actions = [wantsBurn ? `压制 ${selectedFiles.length} 个视频` : "不压制"];
-  if (wantsMerge) actions.push(`可合并 ${mergeGroupCount} 期`);
-  else actions.push("不合并");
+  if (wantsMerge) {
+    if (mergeAcrossGroups.value && canMergeAcrossGroups.value) {
+      actions.push(`跨 ${selectedGroupCount} 期合并为 1 个视频`);
+    } else if (mergeAcrossGroups.value) {
+      actions.push("跨组合并条件未满足");
+    } else {
+      actions.push(`各分组内可合并 ${mergeGroupCount} 期`);
+    }
+    if (
+      pendingLocalProcessMode.value === "burnMerge" &&
+      selectedFiles.some((file) => !file.xmlDanmuPath)
+    ) {
+      actions.push("缺失 XML 的片段仍会合并视频，但不压制该片段弹幕");
+    }
+  } else {
+    actions.push("不合并");
+  }
   return `本次处理 ${selectedGroupCount} 期、${selectedFiles.length} 个视频；${actions.join("，")}。合并不足两段时按单文件处理。`;
 });
 
@@ -2015,6 +2106,7 @@ const openLocalFileActionDialog = (operation: PendingLocalPreparedOperation) => 
 
   pendingLocalPreparedOperation.value = operation;
   pendingLocalProcessMode.value = "direct";
+  mergeAcrossGroups.value = false;
   pendingLocalUploadGroups.value = groups.map((row) => ({
     row,
     uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
@@ -2033,6 +2125,7 @@ const buildPreparedLocalActionGroups = () => {
     selectedFilePaths: selectedActionFileKeys.value.map((item) => String(item)),
     mode: pendingLocalProcessMode.value,
     deleteSourceAfterSync: localUploadOptions.deleteSourceAfterSync,
+    mergeAcrossGroups: mergeAcrossGroups.value,
   });
 };
 
@@ -2055,12 +2148,82 @@ const confirmLocalActionDialog = async () => {
     return;
   }
 
-  const groups = buildPreparedLocalActionGroups();
+  let groups: PreparedLocalActionGroup[];
+  try {
+    groups = buildPreparedLocalActionGroups();
+  } catch (error) {
+    notice.error({
+      title: "处理参数不合法",
+      content: error instanceof Error ? error.message : String(error),
+      duration: 4000,
+    });
+    return;
+  }
   if (groups.length === 0) {
     notice.warning({
       title: "没有选择视频",
       content: "请至少选择一个未在其他任务中处理的视频",
       duration: 3000,
+    });
+    return;
+  }
+  const checkMergeGroups = async (items: PreparedLocalActionGroup[]) => {
+    const mergeGroups = items.filter(
+      (item) => item.mergeSegments && item.mergeFilePaths.length > 1,
+    );
+    const checks = await Promise.all(
+      mergeGroups.map(async (item) => ({
+        title: item.title,
+        result: (await taskApi.checkMergeVideos(item.mergeFilePaths)) as LocalMergeCheckResult,
+      })),
+    );
+    return checks.flatMap(({ title, result }) =>
+      (result.invalidFiles ?? []).map((item) => ({ ...item, title })),
+    );
+  };
+
+  try {
+    const invalidFiles = await checkMergeGroups(groups);
+    if (invalidFiles.length > 0) {
+      const [shouldContinue] = await confirm.warning({
+        title: "存在无法读取的视频文件",
+        content: `${invalidFiles
+          .map((item) => `${item.title}\n${item.path}${item.error ? `\n${item.error}` : ""}`)
+          .join("\n\n")}\n\n是否剔除损坏文件并继续？`,
+        positiveText: "剔除损坏文件并继续",
+        negativeText: "取消",
+      });
+      if (!shouldContinue) return;
+
+      groups = removeInvalidLocalActionFiles(
+        groups,
+        invalidFiles.map((item) => item.path),
+      );
+      if (groups.length === 0) {
+        notice.error({
+          title: "剔除损坏文件后没有可处理的视频",
+          duration: 4000,
+        });
+        return;
+      }
+
+      const remainingInvalidFiles = await checkMergeGroups(groups);
+      if (remainingInvalidFiles.length > 0) {
+        notice.error({
+          title: "剩余视频仍有无法读取的文件",
+          content: remainingInvalidFiles
+            .map((item) => `${item.title}\n${item.path}${item.error ? `\n${item.error}` : ""}`)
+            .join("\n\n"),
+          duration: 7000,
+        });
+        return;
+      }
+    }
+  } catch (error) {
+    notice.error({
+      title: "合并前检查失败，未加入处理队列",
+      content: error instanceof Error ? error.message : String(error),
+      duration: 5000,
     });
     return;
   }
@@ -2079,7 +2242,7 @@ const submitPreparedLocalUploadGroups = async (groups: PreparedLocalActionGroup[
       options: {
         burnDanmu: groups.some((item) => item.burnDanmu),
         uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
-        mergeSegments: false,
+        mergeSegments: groups.some((item) => item.mergeSegments),
       },
     });
     const queuedCount = result.items.filter((item) => item.status === "queued").length;
@@ -2116,7 +2279,7 @@ const submitPreparedLocalUploadGroups = async (groups: PreparedLocalActionGroup[
     const noticeTitle = queuedCount > 0 ? "已加入上传流程" : "没有新增上传任务";
     const noticeContent =
       queuedCount > 0
-        ? `已加入 ${queuedCount} 个分组${
+        ? `已加入 ${queuedCount} 个处理任务${
             skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
           }，${groups.some((item) => item.burnDanmu) ? "压制后上传" : "直接上传"}任务会在队列中执行`
         : `选中分组已有 ${skippedDuplicateCount} 个上传记录，已刷新状态`;
@@ -2148,7 +2311,7 @@ const submitPreparedLocalSyncGroups = async (groups: PreparedLocalActionGroup[])
       options: {
         burnDanmu: groups.some((item) => item.burnDanmu),
         uploadRawWhenNoDanmu: localUploadOptions.uploadRawWhenNoDanmu,
-        mergeSegments: false,
+        mergeSegments: groups.some((item) => item.mergeSegments),
         deleteSourceAfterSync: localUploadOptions.deleteSourceAfterSync,
       },
     });
@@ -2186,7 +2349,7 @@ const submitPreparedLocalSyncGroups = async (groups: PreparedLocalActionGroup[])
     const noticeTitle = queuedCount > 0 ? "已加入同步流程" : "没有新增同步任务";
     const noticeContent =
       queuedCount > 0
-        ? `已加入 ${queuedCount} 个分组${
+        ? `已加入 ${queuedCount} 个处理任务${
             skippedDuplicateCount ? `，跳过重复 ${skippedDuplicateCount} 个` : ""
           }，会按 webhook 同步器配置${
             groups.some((item) => item.burnDanmu) ? "压制后同步到网盘" : "同步到网盘"

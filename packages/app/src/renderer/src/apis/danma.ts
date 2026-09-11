@@ -10,10 +10,10 @@ export interface ArtplayerDanmuItem {
 }
 
 export const mergeXml = async (
-  inputFiles: { videoPath: string; danmakuPath: string }[],
+  inputFiles: { videoPath: string; danmakuPath?: string }[],
   options: {
     output?: string;
-    saveOriginPath: boolean;
+    saveOriginPath?: boolean;
     saveMeta?: boolean;
   },
 ) => {
