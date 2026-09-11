@@ -114,19 +114,16 @@ describe("WebhookHandler", () => {
         ],
       });
 
-      expect(mergeSpy).toHaveBeenCalledWith(
-        [
-          expect.objectContaining({ path: "C:\\recordings\\a.flv" }),
-          expect.objectContaining({ path: "C:\\recordings\\b.flv" }),
-        ],
-        { requireMergedDanmu: true },
-      );
+      expect(mergeSpy).toHaveBeenCalledWith([
+        expect.objectContaining({ path: "C:\\recordings\\a.flv" }),
+        expect.objectContaining({ path: "C:\\recordings\\b.flv" }),
+      ]);
       expect(parts).toHaveLength(2);
       expect(parts[0].sourcePaths).toEqual(["C:\\recordings\\a.flv", "C:\\recordings\\b.flv"]);
       expect(parts[1].sourcePaths).toEqual(["C:\\recordings\\ready.mp4"]);
     });
 
-    it("passes strict merged danmaku mode to merged local parts", async () => {
+    it("does not require XML files when building merged local parts", async () => {
       const mergeSpy = vi
         .spyOn(webhookHandler as any, "buildMergedLocalUploadPart")
         .mockResolvedValue({
@@ -143,11 +140,10 @@ describe("WebhookHandler", () => {
       await (webhookHandler as any).buildLocalUploadParts({
         roomId: "100",
         mergeSegments: true,
-        requireMergedDanmu: true,
         files: [localFile("C:\\recordings\\a.flv", 1), localFile("C:\\recordings\\b.flv", 2)],
       });
 
-      expect(mergeSpy).toHaveBeenCalledWith(expect.any(Array), { requireMergedDanmu: true });
+      expect(mergeSpy).toHaveBeenCalledWith(expect.any(Array));
     });
 
     it("rejects a cross-group request that leaves selected files outside the merge", async () => {
@@ -179,10 +175,10 @@ describe("WebhookHandler", () => {
         .mockResolvedValue("C:\\recordings\\merged.mp4");
       const danmuSpy = vi.spyOn(danmuTask, "mergeXml");
 
-      const result = await (webhookHandler as any).buildMergedLocalUploadPart(
-        [localFile("C:\\recordings\\a.flv", 1), localFile("C:\\recordings\\b.flv", 2)],
-        { requireMergedDanmu: true },
-      );
+      const result = await (webhookHandler as any).buildMergedLocalUploadPart([
+        localFile("C:\\recordings\\a.flv", 1),
+        localFile("C:\\recordings\\b.flv", 2),
+      ]);
 
       expect(checkSpy).toHaveBeenCalledOnce();
       expect(mergeSpy).toHaveBeenCalledOnce();

@@ -597,7 +597,6 @@ export class WebhookHandler {
 
   private async buildMergedLocalUploadPart(
     files: LocalUploadFileInput[],
-    options: { requireMergedDanmu?: boolean } = {},
   ): Promise<PreparedLocalUploadPart> {
     const sortedFiles = this.sortLocalUploadFiles(files);
     const inputFiles = sortedFiles.map((item) => item.path);
@@ -717,11 +716,7 @@ export class WebhookHandler {
 
     const parts: PreparedLocalUploadPart[] = [];
     if (shouldMerge) {
-      parts.push(
-        await this.buildMergedLocalUploadPart(mergeFiles, {
-          requireMergedDanmu: options.requireMergedDanmu,
-        }),
-      );
+      parts.push(await this.buildMergedLocalUploadPart(mergeFiles));
     }
 
     const remainingFiles = shouldMerge
